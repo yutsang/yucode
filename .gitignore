@@ -1,0 +1,48 @@
+# Secrets / credentials
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+credentials.json
+Claude Code Coding Agent*.md
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+*.whl
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Project runtime data
+.yucode/sessions/
+.yucode/metrics/
+.yucode/audit/
+.yucode/archives/
+.yucode/settings.yml
+.yucode/settings.json
+.yucode/settings.local.yml
+.yucode/settings.local.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Testing
+.pytest_cache/
+htmlcov/
+.coverage
+.mypy_cache/
+.ruff_cache/
+
+# Reference / vendored (not part of this package)
+claw-code-main/

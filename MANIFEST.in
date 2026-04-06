@@ -1,0 +1,7 @@
+include coding_agent/config/config.yml
+include README.md
+include CHANGELOG.md
+include .env.example
+recursive-exclude .yucode *
+recursive-exclude coding_agent/__pycache__ *
+recursive-exclude tests __pycache__ *

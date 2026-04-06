@@ -1,0 +1,58 @@
+provider:
+  name: deepseek
+  type: openai_compatible
+  base_url: "https://api.deepseek.com"
+  api_key: ""
+  model: deepseek-chat
+  chat_path: /chat/completions
+  stream: true
+  temperature: 0.0
+  extra_headers: {}
+  extra_body: {}
+runtime:
+  permission_mode: workspace-write
+  max_iterations: 32
+  max_worker_steps: 20
+  orchestration_mode: auto
+  parallel_workers: false
+  max_tool_calls: 80
+  dedup_tool_threshold: 3
+  auto_save_session: true
+  auto_resume_latest: true
+  compact_preserve_recent: 4
+  compact_token_threshold: 10000
+  compact_strategy: heuristic
+  error_strategy: resilient
+  shell_timeout_seconds: 30
+  include_git_context: true
+  config_dump_in_prompt: true
+tools:
+  allowed: []
+  disabled: []
+mcp:
+  servers: []
+vscode:
+  auto_start_backend: true
+  python_command: ""
+  startup_timeout_seconds: 15
+hooks:
+  pre_tool_use: []
+  post_tool_use: []
+  pre_compact: []
+  post_compact: []
+plugins:
+  enabled_plugins: []
+  extra_dirs: []
+sandbox:
+  enabled: null
+  namespace_restrictions: null
+  network_isolation: null
+  filesystem_mode: workspace-only
+  allowed_mounts: []
+logging:
+  level: INFO
+  format: text
+  file: ""
+audit:
+  enabled: true
+instruction_files: []
