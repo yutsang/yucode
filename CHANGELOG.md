@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.1] - 2026-04-07
+
+### Added
+- Registry-backed Task, Worker, Team/Cron, and LSP runtime modules to close major claw-code parity gaps
+- Lane event, stale-branch, task packet, policy engine, green contract, branch lock, recovery recipe, and summary compression support
+- Release automation via GitHub Actions and a `Containerfile` for reproducible packaging
+- Behavioral parity coverage in `tests/test_parity_harness.py`
+
+### Changed
+- Expanded CLI parity with `doctor`, `system-prompt`, `version`, and broader `--output-format json` support
+- Hardened MCP lifecycle handling with reconnection attempts, timeout handling, resource reads, and discovery reporting
+- Tightened permission handling with explicit prompt-mode gating, rule evaluation, hook overrides, and workspace-scoped tool enforcement
+- Updated CI so lint, tests, packaging, and doctor checks pass on clean runners
+
+### Fixed
+- Corrected prompt-mode permission behavior so approval flows no longer auto-allow dangerous tools
+- Fixed the doctor workflow to bootstrap a clean CI workspace without requiring real user credentials
+- Cleaned release/build behavior so generated artifacts stay out of the repo root and packaging remains reproducible
+
 ## [0.2.0] - 2026-04-05
 
 ### Added
