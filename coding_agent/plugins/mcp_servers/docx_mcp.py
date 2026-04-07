@@ -16,8 +16,8 @@ def _require_docx():
     try:
         import docx  # noqa: F401
         return docx
-    except ImportError:
-        raise RuntimeError("python-docx is required: pip install python-docx>=1.1")
+    except ImportError as exc:
+        raise RuntimeError("python-docx is required: pip install python-docx>=1.1") from exc
 
 
 def handle_read_paragraphs(args: dict[str, Any]) -> Any:

@@ -16,7 +16,6 @@ import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 
 class InputKind(enum.Enum):
@@ -184,7 +183,7 @@ def list_instruction_files(workspace: Path) -> list[Path]:
 
 def run_git_log(workspace: Path, count: int = 10) -> str:
     result = subprocess.run(
-        ["git", "log", f"--oneline", f"-{count}", "--decorate"],
+        ["git", "log", "--oneline", f"-{count}", "--decorate"],
         capture_output=True, text=True, cwd=str(workspace),
     )
     return result.stdout.strip() or "(no commits)"
@@ -262,7 +261,7 @@ def run_git_worktree(workspace: Path, action: str = "list") -> str:
         )
         return (result.stdout + result.stderr).strip()
 
-    return f"Usage: /worktree [list|add <branch>|remove <path>]"
+    return "Usage: /worktree [list|add <branch>|remove <path>]"
 
 
 def export_session(workspace: Path, messages: list, fmt: str = "md") -> str:

@@ -7,7 +7,6 @@ Run:  python -m coding_agent.plugins.mcp_servers.excel_mcp
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from ._protocol import McpStdioServer
@@ -17,8 +16,8 @@ def _require_openpyxl():
     try:
         import openpyxl  # noqa: F401
         return openpyxl
-    except ImportError:
-        raise RuntimeError("openpyxl is required: pip install openpyxl>=3.1")
+    except ImportError as exc:
+        raise RuntimeError("openpyxl is required: pip install openpyxl>=3.1") from exc
 
 
 def handle_list_sheets(args: dict[str, Any]) -> Any:

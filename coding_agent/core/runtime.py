@@ -1,38 +1,68 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import os
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
-from ..memory.compact import CompactionConfig, CompactionResult, compact_session, estimate_session_tokens, should_compact
 from ..config import AppConfig, load_app_config
 from ..hooks import HookConfig, HookRunner, merge_hook_feedback
-from ..plugins.mcp import McpManager
-from ..security.permissions import PermissionPolicy, PermissionPrompter
-from ..plugins import PluginManager, PluginRegistry
+from ..memory.compact import (
+    CompactionConfig,
+    CompactionResult,
+    compact_session,
+    estimate_session_tokens,
+    should_compact,
+)
 from ..memory.prompting import PromptAssembler, discover_project_context
+from ..observability.metrics import AuditLogger, MetricsCollector
+from ..plugins import PluginManager
+from ..plugins.mcp import McpManager
+from ..security.permissions import (
+    PermissionEnforcer,
+    PermissionPolicy,
+    PermissionPrompter,
+    PermissionRules,
+    parse_permission_rule,
+)
+from ..security.safety import scan_and_redact_secrets
+from ..tools import ToolRegistry
 from .errors import (
-    AgentError,
-    BudgetExhaustedError,
     CompactionError,
     McpError,
     ProviderError,
-    ToolExecutionError,
     tool_error_response,
 )
-from ..security.safety import scan_and_redact_secrets
 from .providers import OpenAICompatibleProvider
 from .session import Message, Session, Usage, UsageTracker
-from ..tools import ToolRegistry
-from ..observability.metrics import AuditLogger, MetricsCollector
 
 _log = logging.getLogger("yucode.runtime")
 
 
 EventCallback = Callable[[dict[str, Any]], None]
+
+_AUTO_COMPACT_ENV = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS"
+_DEFAULT_AUTO_COMPACT_THRESHOLD = 100_000
+
+
+def _parse_auto_compact_threshold() -> int:
+    raw = os.environ.get(_AUTO_COMPACT_ENV, "").strip()
+    if not raw:
+        return _DEFAULT_AUTO_COMPACT_THRESHOLD
+    try:
+        val = int(raw)
+        return val if val > 0 else _DEFAULT_AUTO_COMPACT_THRESHOLD
+    except ValueError:
+        return _DEFAULT_AUTO_COMPACT_THRESHOLD
+
+
+def _content_stable_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
 
 
 @dataclass
@@ -42,6 +72,7 @@ class TurnSummary:
     assistant_messages: list[Message] = field(default_factory=list)
     tool_messages: list[Message] = field(default_factory=list)
     usage: Usage = field(default_factory=Usage)
+    auto_compaction_performed: bool = False
 
 
 class AgentRuntime:
@@ -60,8 +91,15 @@ class AgentRuntime:
     ) -> None:
         self.workspace_root = workspace_root.resolve()
         self.config = config
-        self.permission_policy = PermissionPolicy(config.runtime.permission_mode)
+
+        perm_rules = PermissionRules(
+            allow=[parse_permission_rule(r) for r in config.permission_rules.allow],
+            deny=[parse_permission_rule(r) for r in config.permission_rules.deny],
+            ask=[parse_permission_rule(r) for r in config.permission_rules.ask],
+        )
+        self.permission_policy = PermissionPolicy(config.runtime.permission_mode, rules=perm_rules)
         self.permission_prompter = permission_prompter
+        self.permission_enforcer = PermissionEnforcer(self.permission_policy, self.workspace_root)
         self.session = session or Session(model=config.provider.model)
         self.mcp_manager = mcp_manager if mcp_manager is not None else (McpManager(config.mcp) if config.mcp else None)
 
@@ -74,11 +112,16 @@ class AgentRuntime:
             self.workspace_root, config, self.mcp_manager,
             plugin_tools=plugin_tools or None,
         )
+
+        for name, perm in self.tools.permission_specs():
+            self.permission_policy.with_tool_requirement(name, perm)
+
         self.provider = provider or OpenAICompatibleProvider(config.provider)
 
         hook_config = HookConfig(
             pre_tool_use=list(config.hooks.pre_tool_use) + plugin_hooks.pre_tool_use,
             post_tool_use=list(config.hooks.post_tool_use) + plugin_hooks.post_tool_use,
+            post_tool_use_failure=list(config.hooks.post_tool_use_failure) + getattr(plugin_hooks, "post_tool_use_failure", []),
             pre_compact=list(config.hooks.pre_compact),
             post_compact=list(config.hooks.post_compact),
         )
@@ -88,8 +131,27 @@ class AgentRuntime:
             preserve_recent_messages=config.runtime.compact_preserve_recent,
             max_estimated_tokens=config.runtime.compact_token_threshold,
         )
+        self._auto_compact_threshold = _parse_auto_compact_threshold()
         audit_logger = AuditLogger(self.workspace_root, enabled=config.audit.enabled)
         self.metrics = MetricsCollector(audit_logger=audit_logger)
+
+        self._plugins_initialized = False
+
+    def _ensure_plugins_initialized(self) -> None:
+        if self._plugins_initialized:
+            return
+        self._plugins_initialized = True
+        try:
+            self.plugin_registry.init_plugins()
+        except Exception as exc:
+            _log.warning("Plugin init failed: %s", exc)
+
+    def _shutdown_plugins(self) -> None:
+        if self._plugins_initialized:
+            try:
+                self.plugin_registry.shutdown_plugins()
+            except Exception as exc:
+                _log.warning("Plugin shutdown failed: %s", exc)
 
     @classmethod
     def from_workspace(
@@ -109,13 +171,30 @@ class AgentRuntime:
             )
         return runtime
 
+    # ------------------------------------------------------------------
+    # orchestrate (top-level entry)
+    # ------------------------------------------------------------------
+
+    @property
+    def orchestration_mode(self) -> str:
+        return self.config.runtime.orchestration_mode
+
+    @property
+    def compact_preserve_recent(self) -> int:
+        return self.config.runtime.compact_preserve_recent
+
+    @property
+    def auto_resume_latest(self) -> bool:
+        return self.config.runtime.auto_resume_latest
+
     def orchestrate(
         self,
         prompt: str,
         event_callback: EventCallback | None = None,
     ) -> TurnSummary:
-        """Top-level entry point that picks single vs. multi-worker mode."""
         from .coordinator import AdminCoordinator, is_complex_prompt
+
+        self._ensure_plugins_initialized()
 
         mode = self.config.runtime.orchestration_mode
         use_coordinator = (
@@ -150,12 +229,18 @@ class AgentRuntime:
         )
         return summary
 
+    # ------------------------------------------------------------------
+    # run_turn (single-agent loop)
+    # ------------------------------------------------------------------
+
     def run_turn(
         self,
         prompt: str,
         event_callback: EventCallback | None = None,
         max_steps_override: int | None = None,
     ) -> TurnSummary:
+        self._ensure_plugins_initialized()
+
         if event_callback:
             event_callback({
                 "type": "provider_info",
@@ -177,7 +262,7 @@ class AgentRuntime:
         max_tool_calls = self.config.runtime.max_tool_calls
         dedup_threshold = self.config.runtime.dedup_tool_threshold
         tool_call_count = 0
-        dedup_counts: dict[tuple[str, int], int] = {}
+        dedup_counts: dict[tuple[str, str], int] = {}
         budget_exhausted = False
 
         summary = TurnSummary(final_text="", iterations=0)
@@ -235,6 +320,7 @@ class AgentRuntime:
                 if event_callback:
                     event_callback({"type": "completed", "text": response.text})
                 self.metrics.record_session(summary.iterations, summary.usage)
+                self._maybe_auto_compact(summary, event_callback)
                 return summary
 
             for tool_call in response.tool_calls:
@@ -246,7 +332,7 @@ class AgentRuntime:
                         "tool_call_id": tool_call.id,
                     })
 
-                call_key = (tool_call.name, hash(tool_call.arguments))
+                call_key = (tool_call.name, _content_stable_hash(tool_call.arguments))
                 dedup_counts[call_key] = dedup_counts.get(call_key, 0) + 1
 
                 if dedup_counts[call_key] >= dedup_threshold:
@@ -302,7 +388,47 @@ class AgentRuntime:
         if event_callback:
             event_callback({"type": "completed", "text": summary.final_text})
         self.metrics.record_session(summary.iterations, summary.usage)
+        self._maybe_auto_compact(summary, event_callback)
         return summary
+
+    # ------------------------------------------------------------------
+    # Post-turn auto-compaction (Rust parity: cumulative input tokens)
+    # ------------------------------------------------------------------
+
+    def _maybe_auto_compact(
+        self,
+        summary: TurnSummary,
+        event_callback: EventCallback | None = None,
+    ) -> None:
+        cumulative = self.usage_tracker.total_input_tokens
+        if cumulative < self._auto_compact_threshold:
+            return
+        try:
+            force_config = CompactionConfig(
+                preserve_recent_messages=self._compaction_config.preserve_recent_messages,
+                max_estimated_tokens=0,
+            )
+            result = compact_session(self.session.messages, force_config)
+            if result.removed_message_count > 0:
+                self.session.messages = result.compacted_messages
+                summary.auto_compaction_performed = True
+                _log.info(
+                    "Auto-compacted %d messages (cumulative input tokens %d >= threshold %d)",
+                    result.removed_message_count, cumulative, self._auto_compact_threshold,
+                )
+                if event_callback:
+                    event_callback({
+                        "type": "auto_compaction",
+                        "removed": result.removed_message_count,
+                        "threshold": self._auto_compact_threshold,
+                        "cumulative_input_tokens": cumulative,
+                    })
+        except Exception as exc:
+            _log.warning("Auto-compaction failed: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Compaction
+    # ------------------------------------------------------------------
 
     def compact(self, config: CompactionConfig | None = None) -> CompactionResult:
         msg_count = len(self.session.messages)
@@ -323,7 +449,6 @@ class AgentRuntime:
         return result
 
     def _archive_before_compact(self) -> None:
-        """Dump current messages to .yucode/archives/ before compaction."""
         try:
             archives_dir = self.workspace_root / ".yucode" / "archives"
             archives_dir.mkdir(parents=True, exist_ok=True)
@@ -352,7 +477,6 @@ class AgentRuntime:
         return self.session.save_to_workspace(self.workspace_root, sid)
 
     def checkpoint(self, label: str = "") -> Path:
-        """Save a full checkpoint: session + metrics snapshot."""
         checkpoints_dir = self.workspace_root / ".yucode" / "checkpoints"
         checkpoints_dir.mkdir(parents=True, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -383,17 +507,32 @@ class AgentRuntime:
         _log.info("Checkpoint saved to %s", cp_path)
         return cp_path
 
+    # ------------------------------------------------------------------
+    # Tool execution with enforcer + failure hooks
+    # ------------------------------------------------------------------
+
     def _execute_tool(self, tool_name: str, raw_arguments: str) -> str:
         import time as _time
         started = _time.monotonic()
 
-        if tool_name not in self.tools._tools:
+        if not self.tools.has_tool(tool_name):
             self.metrics.record_tool_call(tool_name, _time.monotonic() - started, is_error=True)
             return tool_error_response(
                 f"Unknown tool `{tool_name}`.",
                 error_code="unknown_tool",
                 recoverable=False,
                 suggestion="Check available tools and try a different one.",
+            )
+
+        enforcer_result = self.permission_enforcer.check(tool_name, raw_arguments)
+        if not enforcer_result.allowed:
+            self.metrics.record_security_event("enforcer_denied", tool_name, enforcer_result.reason)
+            self.metrics.record_tool_call(tool_name, _time.monotonic() - started, is_error=True)
+            return tool_error_response(
+                enforcer_result.reason,
+                error_code="permission_denied",
+                recoverable=False,
+                suggestion="Request elevated permissions or use a read-only alternative.",
             )
 
         permission = self.tools.permission_for(tool_name)
@@ -445,12 +584,20 @@ class AgentRuntime:
 
         output = merge_hook_feedback(pre_hook.messages, output, False)
 
-        post_hook = self.hook_runner.run_post_tool_use(
-            tool_name, raw_arguments, output, is_error,
-        )
-        if post_hook.is_denied:
-            is_error = True
-        output = merge_hook_feedback(post_hook.messages, output, post_hook.is_denied)
+        if is_error:
+            failure_hook = self.hook_runner.run_post_tool_use_failure(
+                tool_name, raw_arguments, output,
+            )
+            if failure_hook.is_denied:
+                is_error = True
+            output = merge_hook_feedback(failure_hook.messages, output, failure_hook.is_denied)
+        else:
+            post_hook = self.hook_runner.run_post_tool_use(
+                tool_name, raw_arguments, output, is_error,
+            )
+            if post_hook.is_denied:
+                is_error = True
+            output = merge_hook_feedback(post_hook.messages, output, post_hook.is_denied)
 
         self.metrics.record_tool_call(tool_name, _time.monotonic() - started, is_error=is_error)
 

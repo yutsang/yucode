@@ -8,6 +8,7 @@ from .permissions import (
     PermissionPrompter,
     PermissionRequest,
 )
+from .safety import SafetyVerdict, check_bash_safety
 from .sandbox import (
     LinuxSandboxCommand,
     SandboxConfig,
@@ -16,7 +17,6 @@ from .sandbox import (
     detect_container_environment,
     resolve_sandbox_status,
 )
-from .safety import SafetyVerdict, check_bash_safety
 
 __all__ = [
     "PERMISSION_ORDER",

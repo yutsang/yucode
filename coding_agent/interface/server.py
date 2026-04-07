@@ -16,20 +16,19 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from typing import Any
 from pathlib import Path
+from typing import Any
 
 
 def _require_aiohttp():
     try:
-        import aiohttp
         from aiohttp import web
         return web
-    except ImportError:
+    except ImportError as exc:
         raise RuntimeError(
             "aiohttp is required for the server. Install with: "
             "pip install yucode-agent[server]"
-        )
+        ) from exc
 
 
 class SessionStore:
@@ -41,8 +40,8 @@ class SessionStore:
         self._workspace_root = workspace_root
 
     def create_session(self) -> str:
-        from ..core.runtime import AgentRuntime
         from ..config import load_app_config
+        from ..core.runtime import AgentRuntime
         from ..core.session import Session
 
         session_id = f"session-{self._next_id}"
@@ -54,7 +53,7 @@ class SessionStore:
         }
         self._subscribers[session_id] = []
 
-        config = load_app_config()
+        config = load_app_config(workspace=self._workspace_root)
         agent_session = Session(model=config.provider.model)
         runtime = AgentRuntime(self._workspace_root, config, session=agent_session)
         self._runtimes[session_id] = runtime

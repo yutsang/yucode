@@ -17,16 +17,16 @@ def _require_yfinance():
     try:
         import yfinance as yf  # noqa: F401
         return yf
-    except ImportError:
-        raise RuntimeError("yfinance is required: pip install yfinance>=0.2")
+    except ImportError as exc:
+        raise RuntimeError("yfinance is required: pip install yfinance>=0.2") from exc
 
 
 def _require_pandas():
     try:
         import pandas  # noqa: F401
         return pandas
-    except ImportError:
-        raise RuntimeError("pandas is required: pip install pandas>=2.0")
+    except ImportError as exc:
+        raise RuntimeError("pandas is required: pip install pandas>=2.0") from exc
 
 
 def handle_quote(args: dict[str, Any]) -> Any:

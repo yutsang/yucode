@@ -94,6 +94,7 @@ class VscodeOptions:
 class HookOptions:
     pre_tool_use: list[str] = field(default_factory=list)
     post_tool_use: list[str] = field(default_factory=list)
+    post_tool_use_failure: list[str] = field(default_factory=list)
     pre_compact: list[str] = field(default_factory=list)
     post_compact: list[str] = field(default_factory=list)
 
@@ -102,6 +103,13 @@ class HookOptions:
 class PluginOptions:
     enabled_plugins: list[str] = field(default_factory=list)
     extra_dirs: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class PermissionRuleConfig:
+    allow: list[str] = field(default_factory=list)
+    deny: list[str] = field(default_factory=list)
+    ask: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -136,6 +144,7 @@ class AppConfig:
     hooks: HookOptions = field(default_factory=HookOptions)
     plugins: PluginOptions = field(default_factory=PluginOptions)
     sandbox: SandboxOptions = field(default_factory=SandboxOptions)
+    permission_rules: PermissionRuleConfig = field(default_factory=PermissionRuleConfig)
     logging: LoggingOptions = field(default_factory=LoggingOptions)
     audit: AuditOptions = field(default_factory=AuditOptions)
 
@@ -203,6 +212,7 @@ class AppConfig:
             "hooks": {
                 "pre_tool_use": list(self.hooks.pre_tool_use),
                 "post_tool_use": list(self.hooks.post_tool_use),
+                "post_tool_use_failure": list(self.hooks.post_tool_use_failure),
                 "pre_compact": list(self.hooks.pre_compact),
                 "post_compact": list(self.hooks.post_compact),
             },
@@ -216,6 +226,11 @@ class AppConfig:
                 "network_isolation": self.sandbox.network_isolation,
                 "filesystem_mode": self.sandbox.filesystem_mode,
                 "allowed_mounts": list(self.sandbox.allowed_mounts),
+            },
+            "permission_rules": {
+                "allow": list(self.permission_rules.allow),
+                "deny": list(self.permission_rules.deny),
+                "ask": list(self.permission_rules.ask),
             },
             "logging": {
                 "level": self.logging.level,
@@ -413,6 +428,7 @@ def app_config_from_dict(raw: dict[str, Any]) -> AppConfig:
     hooks = HookOptions(
         pre_tool_use=_coerce_string_list(hooks_raw.get("pre_tool_use", []), "hooks.pre_tool_use"),
         post_tool_use=_coerce_string_list(hooks_raw.get("post_tool_use", []), "hooks.post_tool_use"),
+        post_tool_use_failure=_coerce_string_list(hooks_raw.get("post_tool_use_failure", []), "hooks.post_tool_use_failure"),
         pre_compact=_coerce_string_list(hooks_raw.get("pre_compact", []), "hooks.pre_compact"),
         post_compact=_coerce_string_list(hooks_raw.get("post_compact", []), "hooks.post_compact"),
     )
@@ -439,6 +455,12 @@ def app_config_from_dict(raw: dict[str, Any]) -> AppConfig:
     audit_opts = AuditOptions(
         enabled=bool(audit_raw.get("enabled", True)),
     )
+    perm_rules_raw = _expect_dict(raw.get("permission_rules", {}), "permission_rules")
+    permission_rules = PermissionRuleConfig(
+        allow=_coerce_string_list(perm_rules_raw.get("allow", []), "permission_rules.allow"),
+        deny=_coerce_string_list(perm_rules_raw.get("deny", []), "permission_rules.deny"),
+        ask=_coerce_string_list(perm_rules_raw.get("ask", []), "permission_rules.ask"),
+    )
     return AppConfig(
         provider=provider,
         runtime=runtime,
@@ -449,6 +471,7 @@ def app_config_from_dict(raw: dict[str, Any]) -> AppConfig:
         hooks=hooks,
         plugins=plugins,
         sandbox=sandbox,
+        permission_rules=permission_rules,
         logging=logging_opts,
         audit=audit_opts,
     )
@@ -557,11 +580,22 @@ def _coerce_positive_int(value: Any, label: str) -> int:
     return parsed
 
 
+_PERMISSION_MODE_ALIASES: dict[str, PermissionMode] = {
+    "plan": "read-only",
+    "default": "read-only",
+    "acceptEdits": "workspace-write",
+    "auto": "workspace-write",
+    "dontAsk": "danger-full-access",
+}
+
+
 def _coerce_permission_mode(value: Any) -> PermissionMode:
     text = str(value)
-    if text not in {"read-only", "workspace-write", "danger-full-access", "prompt", "allow"}:
-        raise ConfigError(f"Unsupported permission mode: {text}")
-    return text  # type: ignore[return-value]
+    if text in {"read-only", "workspace-write", "danger-full-access", "prompt", "allow"}:
+        return text  # type: ignore[return-value]
+    if text in _PERMISSION_MODE_ALIASES:
+        return _PERMISSION_MODE_ALIASES[text]
+    raise ConfigError(f"Unsupported permission mode: {text}")
 
 
 def _coerce_orchestration_mode(value: Any) -> OrchestrationMode:

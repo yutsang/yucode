@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any
 
 _DANGEROUS_GIT_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"git\s+push\s+.*--force", re.I), "git push --force can overwrite remote history"),

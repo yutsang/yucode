@@ -267,11 +267,11 @@ def office_tools(registry: ToolRegistry) -> list[ToolDefinition]:
 def _require(module: str, package: str, pip_extra: str) -> Any:
     try:
         return __import__(module)
-    except ImportError:
+    except ImportError as exc:
         raise RuntimeError(
             f"{package} is required for this tool. "
             f"Install with: pip install yucode-agent[{pip_extra}]  or  pip install {package}"
-        )
+        ) from exc
 
 
 def _read_excel_sheet(registry: ToolRegistry, args: dict[str, Any]) -> str:

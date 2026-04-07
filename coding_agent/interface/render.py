@@ -14,9 +14,18 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+
+def _get_version() -> str:
+    try:
+        from .. import __version__
+        return __version__
+    except Exception:
+        return "0.2.0"
+
 
 # ---- Color theme ------------------------------------------------------------
 
@@ -306,7 +315,7 @@ def startup_banner(
 
     lines = [
         "",
-        f"  {BOLD}{THEME.brand}╭─ YuCode{RESET} {DIM}· v0.1.0{RESET}",
+        f"  {BOLD}{THEME.brand}╭─ YuCode{RESET} {DIM}· v{_get_version()}{RESET}",
         f"  {THEME.brand}│{RESET}",
         f"  {THEME.brand}│{RESET}  {DIM}cwd{RESET}         {cwd}{branch_display}",
         f"  {THEME.brand}│{RESET}  {DIM}model{RESET}       {provider}/{model}",
@@ -433,11 +442,9 @@ def _summarize_tool_result(name: str, content: str, is_error: bool) -> str:
     if name in ("web_fetch",):
         try:
             parsed = _json.loads(content)
-            url = parsed.get("url", "?")
             status = parsed.get("status", "?")
             byte_size = parsed.get("bytes", 0)
             duration = parsed.get("duration_ms", 0)
-            result_preview = _truncate(str(parsed.get("result", "")), 60)
             size_str = f"{byte_size // 1024}KB" if byte_size > 1024 else f"{byte_size}B"
             return f"{status} · {size_str} · {duration}ms"
         except Exception:

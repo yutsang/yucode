@@ -6,6 +6,7 @@
 *.pem
 credentials.json
 Claude Code Coding Agent*.md
+.yucode/
 
 # Python
 __pycache__/

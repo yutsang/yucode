@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import shutil
 import sys
+from contextlib import suppress
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -51,10 +52,8 @@ class SandboxConfig:
         mode = d.get("filesystem_mode")
         fs_mode = None
         if mode:
-            try:
+            with suppress(ValueError):
                 fs_mode = FilesystemIsolationMode(mode)
-            except ValueError:
-                pass
         return cls(
             enabled=d.get("enabled"),
             namespace_restrictions=d.get("namespace_restrictions"),

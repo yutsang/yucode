@@ -21,8 +21,8 @@ def _read_repo_version() -> str:
 
 __version__ = _read_repo_version()
 
-from .config import AppConfig, load_app_config
-from .core.errors import (
+from .config import AppConfig, load_app_config  # noqa: E402
+from .core.errors import (  # noqa: E402
     AgentError,
     BudgetExhaustedError,
     CompactionError,
@@ -32,14 +32,22 @@ from .core.errors import (
     ProviderError,
     ToolExecutionError,
 )
-from .core.runtime import AgentRuntime, TurnSummary
-from .core.session import Session, Message, Usage, UsageTracker
-from .security.permissions import PermissionPolicy, PermissionMode, PermissionPrompter
-from .hooks import HookRunner, HookRunResult, HookConfig
-from .memory.compact import compact_session, CompactionConfig, CompactionResult
-from .plugins import PluginManager, PluginManifest, PluginRegistry
-from .security.sandbox import SandboxConfig, SandboxStatus
-from .tools import RiskLevel
+from .core.runtime import AgentRuntime, TurnSummary  # noqa: E402
+from .core.session import Message, Session, Usage, UsageTracker  # noqa: E402
+from .hooks import HookConfig, HookRunner, HookRunResult  # noqa: E402
+from .memory.compact import CompactionConfig, CompactionResult, compact_session  # noqa: E402
+from .plugins import PluginManager, PluginManifest, PluginRegistry  # noqa: E402
+from .security.permissions import (  # noqa: E402
+    EnforcementResult,
+    PermissionContext,
+    PermissionEnforcer,
+    PermissionMode,
+    PermissionPolicy,
+    PermissionPrompter,
+    PermissionRules,
+)
+from .security.sandbox import SandboxConfig, SandboxStatus  # noqa: E402
+from .tools import RiskLevel  # noqa: E402
 
 __all__ = [
     "AgentError",
@@ -59,6 +67,10 @@ __all__ = [
     "PermissionMode",
     "PermissionPolicy",
     "PermissionPrompter",
+    "PermissionEnforcer",
+    "PermissionRules",
+    "PermissionContext",
+    "EnforcementResult",
     "PluginManager",
     "PluginManifest",
     "PluginRegistry",

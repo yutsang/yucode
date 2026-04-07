@@ -8,15 +8,16 @@ runs as a scoped sub-runtime with role-appropriate tools.
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from ..config import AppConfig, ToolOptions
 from ..plugins.mcp import McpManager
 from .providers import OpenAICompatibleProvider
-from .session import Message, Session, Usage
+from .session import Message, Usage
 
 EventCallback = Callable[[dict[str, Any]], None]
 
@@ -334,12 +335,17 @@ class AdminCoordinator:
         )
 
     def _scoped_config(self, role: WorkerRole) -> AppConfig:
-        role_tools = ROLE_TOOLS.get(role, [])
+        role_tools = list(ROLE_TOOLS.get(role, []))
+        if self.mcp_manager:
+            for spec in self.mcp_manager.tool_specs():
+                mcp_name = spec["function"]["name"]
+                if mcp_name not in role_tools:
+                    role_tools.append(mcp_name)
         return AppConfig(
             provider=self.config.provider,
             runtime=self.config.runtime,
             tools=ToolOptions(
-                allowed=list(role_tools),
+                allowed=role_tools,
                 disabled=list(self.config.tools.disabled),
             ),
             mcp=self.config.mcp,

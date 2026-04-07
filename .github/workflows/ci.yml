@@ -29,9 +29,29 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev]"
           python -m pip install build
+          sudo apt-get update
+          sudo apt-get install -y ripgrep
+
+      - name: Lint (ruff)
+        run: ruff check coding_agent/ tests/
 
       - name: Run tests
         run: pytest -q
+
+      - name: Run parity harness
+        run: pytest tests/test_parity_harness.py -v
+
+      - name: Run doctor check
+        env:
+          YUCODE_API_KEY: ci-placeholder-key
+        run: |
+          mkdir -p "$HOME/.yucode"
+          cat <<'EOF' > "$HOME/.yucode/settings.yml"
+          provider:
+            api_key: ci-placeholder-key
+          EOF
+          python -m coding_agent.interface.cli init .
+          python -m coding_agent.interface.cli doctor --workspace . --output-format json
 
       - name: Build package
         run: python -m build

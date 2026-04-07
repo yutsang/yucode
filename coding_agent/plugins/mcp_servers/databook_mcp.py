@@ -12,8 +12,6 @@ Run:  python -m coding_agent.plugins.mcp_servers.databook_mcp
 from __future__ import annotations
 
 import csv
-import io
-import json
 from pathlib import Path
 from typing import Any
 
@@ -26,16 +24,16 @@ def _require_openpyxl():
     try:
         import openpyxl
         return openpyxl
-    except ImportError:
-        raise RuntimeError("openpyxl is required: pip install openpyxl>=3.1")
+    except ImportError as exc:
+        raise RuntimeError("openpyxl is required: pip install openpyxl>=3.1") from exc
 
 
 def _require_pptx():
     try:
         import pptx
         return pptx
-    except ImportError:
-        raise RuntimeError("python-pptx is required: pip install python-pptx>=1.0")
+    except ImportError as exc:
+        raise RuntimeError("python-pptx is required: pip install python-pptx>=1.0") from exc
 
 
 def _read_csv(path: str, max_rows: int = 500) -> tuple[list[str], list[list[str]]]:
@@ -167,10 +165,7 @@ def handle_create_pptx(args: dict[str, Any]) -> Any:
     slides_data = args.get("slides", [])
     template_path = args.get("template_path")
 
-    if template_path:
-        prs = pptx.Presentation(template_path)
-    else:
-        prs = pptx.Presentation()
+    prs = pptx.Presentation(template_path) if template_path else pptx.Presentation()
 
     for slide_info in slides_data:
         layout_idx = int(slide_info.get("layout", 1))

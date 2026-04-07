@@ -5,9 +5,9 @@ import os
 import subprocess
 from typing import TYPE_CHECKING, Any
 
-from . import RiskLevel, ToolDefinition, ToolSpec
-from ..security.sandbox import SandboxConfig, build_linux_sandbox_command, resolve_sandbox_status
 from ..security.safety import check_bash_safety
+from ..security.sandbox import SandboxConfig, build_linux_sandbox_command, resolve_sandbox_status
+from . import RiskLevel, ToolDefinition, ToolSpec
 
 if TYPE_CHECKING:
     from . import ToolRegistry

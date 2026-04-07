@@ -24,10 +24,10 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/user/yucode"
-Repository = "https://github.com/user/yucode"
-Documentation = "https://github.com/user/yucode#readme"
-Changelog = "https://github.com/user/yucode/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/ultraworkers/yucode"
+Repository = "https://github.com/ultraworkers/yucode"
+Documentation = "https://github.com/ultraworkers/yucode#readme"
+Changelog = "https://github.com/ultraworkers/yucode/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 server = ["aiohttp>=3.9"]

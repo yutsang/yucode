@@ -6,11 +6,11 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-from .commands import InputKind, parse_input
 from ..config import ensure_default_config, load_app_config, resolve_config_path
 from ..core.runtime import AgentRuntime
 from ..core.session import Session
 from ..memory.skills import list_skills
+from .commands import InputKind, parse_input
 
 
 class BridgeServer:

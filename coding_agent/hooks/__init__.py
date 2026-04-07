@@ -22,12 +22,12 @@ import platform
 import subprocess
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
 
 
 class HookEvent(Enum):
     PRE_TOOL_USE = "PreToolUse"
     POST_TOOL_USE = "PostToolUse"
+    POST_TOOL_USE_FAILURE = "PostToolUseFailure"
     PRE_COMPACT = "PreCompact"
     POST_COMPACT = "PostCompact"
 
@@ -50,6 +50,7 @@ class HookRunResult:
 class HookConfig:
     pre_tool_use: list[str] = field(default_factory=list)
     post_tool_use: list[str] = field(default_factory=list)
+    post_tool_use_failure: list[str] = field(default_factory=list)
     pre_compact: list[str] = field(default_factory=list)
     post_compact: list[str] = field(default_factory=list)
 
@@ -80,6 +81,21 @@ class HookRunner:
             tool_input,
             tool_output=tool_output,
             is_error=is_error,
+        )
+
+    def run_post_tool_use_failure(
+        self,
+        tool_name: str,
+        tool_input: str,
+        tool_output: str,
+    ) -> HookRunResult:
+        return self._run_commands(
+            HookEvent.POST_TOOL_USE_FAILURE,
+            self.config.post_tool_use_failure,
+            tool_name,
+            tool_input,
+            tool_output=tool_output,
+            is_error=True,
         )
 
     def run_pre_compact(self, message_count: int, estimated_tokens: int) -> HookRunResult:

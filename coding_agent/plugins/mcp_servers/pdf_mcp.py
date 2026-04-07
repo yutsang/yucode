@@ -16,8 +16,8 @@ def _require_pdfplumber():
     try:
         import pdfplumber  # noqa: F401
         return pdfplumber
-    except ImportError:
-        raise RuntimeError("pdfplumber is required: pip install pdfplumber>=0.11")
+    except ImportError as exc:
+        raise RuntimeError("pdfplumber is required: pip install pdfplumber>=0.11") from exc
 
 
 def handle_extract_text(args: dict[str, Any]) -> Any:

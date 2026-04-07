@@ -6,7 +6,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-
 Role = Literal["system", "user", "assistant", "tool"]
 SESSION_VERSION = 1
 
@@ -128,8 +127,27 @@ class UsageTracker:
     def turns(self) -> int:
         return self._turns
 
+    @property
+    def total_input_tokens(self) -> int:
+        return self._cumulative.input_tokens
+
+    @property
+    def total_output_tokens(self) -> int:
+        return self._cumulative.output_tokens
+
     def cumulative_usage(self) -> Usage:
         return self._cumulative
+
+    def cost_summary(self) -> dict[str, Any]:
+        """Structured cost/usage summary for CLI and JSON output."""
+        return {
+            "turns": self._turns,
+            "total_tokens": self._cumulative.total_tokens(),
+            "input_tokens": self._cumulative.input_tokens,
+            "output_tokens": self._cumulative.output_tokens,
+            "cache_creation_input_tokens": self._cumulative.cache_creation_input_tokens,
+            "cache_read_input_tokens": self._cumulative.cache_read_input_tokens,
+        }
 
     def record(self, usage: Usage) -> None:
         self._turns += 1

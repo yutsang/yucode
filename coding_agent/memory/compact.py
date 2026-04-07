@@ -7,10 +7,9 @@ requests, pending work, key files, and a message-level timeline.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from ..core.session import Message
@@ -32,10 +31,17 @@ _INTERESTING_EXTENSIONS = frozenset(
 )
 
 
+CompactStrategy = str  # "heuristic" | "llm"
+
+LlmCompactor = None  # type alias placeholder for callable
+
+
 @dataclass
 class CompactionConfig:
     preserve_recent_messages: int = 4
     max_estimated_tokens: int = 10_000
+    strategy: CompactStrategy = "heuristic"
+    llm_compactor: Any = None
 
 
 @dataclass
@@ -93,7 +99,11 @@ def compact_session(
     removed = messages[prefix_len:keep_from]
     preserved = messages[keep_from:]
 
-    raw_summary = _summarize_messages(removed)
+    if cfg.strategy == "llm" and cfg.llm_compactor is not None:
+        raw_summary = _llm_summarize(removed, cfg.llm_compactor)
+    else:
+        raw_summary = _summarize_messages(removed)
+
     summary = _merge_summaries(existing_summary, raw_summary)
     formatted = format_compact_summary(summary)
     continuation = get_compact_continuation(summary, suppress_follow_up=True, recent_preserved=bool(preserved))
@@ -105,6 +115,25 @@ def compact_session(
         compacted_messages=compacted,
         removed_message_count=len(removed),
     )
+
+
+def _llm_summarize(messages: list[Message], compactor: Any) -> str:
+    """Use an LLM-backed compactor to produce a context summary.
+
+    ``compactor`` should be a callable accepting a list of message dicts and
+    returning a summary string.  Falls back to heuristic if it fails.
+    """
+    try:
+        msg_dicts = [
+            {"role": m.role, "content": m.content or "", "tool_calls": [{"name": tc.name, "arguments": tc.arguments} for tc in m.tool_calls]}
+            for m in messages
+        ]
+        result = compactor(msg_dicts)
+        if isinstance(result, str) and result.strip():
+            return f"<summary>\n{result.strip()}\n</summary>"
+    except Exception:
+        pass
+    return _summarize_messages(messages)
 
 
 # ---- summary building -----------------------------------------------------

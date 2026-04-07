@@ -4,8 +4,8 @@ import json
 import time
 from typing import TYPE_CHECKING, Any
 
-from . import RiskLevel, ToolDefinition, ToolSpec
 from ..memory.skills import load_skill
+from . import RiskLevel, ToolDefinition, ToolSpec
 
 if TYPE_CHECKING:
     from . import ToolRegistry
@@ -137,7 +137,7 @@ def _structured_output(args: dict[str, Any]) -> str:
 
 
 def _config_write(registry: ToolRegistry, args: dict[str, Any]) -> str:
-    from ..config import resolve_config_path, load_yaml, dump_yaml
+    from ..config import dump_yaml, load_yaml, resolve_config_path
     key = str(args["key"])
     value = str(args["value"])
     path = resolve_config_path()
