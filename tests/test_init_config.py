@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 
 from coding_agent.config import AppConfig, ProviderConfig, RuntimeOptions
 from coding_agent.config.settings import (
     _coerce_streaming_mode,
+    app_config_from_dict,
     state_dir,
     workspace_key,
 )
+from coding_agent.config.simple_yaml import load_yaml
 from coding_agent.core.session import AssistantResponse, Usage
 from coding_agent.interface import cli
 from coding_agent.interface.cli import (
@@ -218,3 +221,89 @@ def test_probe_provider_connection_error_includes_url(tmp_path: Path, monkeypatc
     assert ok is False
     assert status == "error"
     assert "example.com/chat/completions" in message
+
+
+def test_app_config_from_dict_reads_append_chat_path() -> None:
+    config = app_config_from_dict({
+        "provider": {
+            "base_url": "https://api.example.com/v1/chat/completions",
+            "api_key": "key",
+            "model": "demo-model",
+            "chat_path": "/chat/completions",
+            "append_chat_path": False,
+        }
+    })
+    assert config.provider.append_chat_path is False
+
+
+def test_to_control_dict_includes_append_chat_path() -> None:
+    config = AppConfig(
+        provider=ProviderConfig(
+            base_url="https://api.example.com",
+            api_key="key",
+            model="demo-model",
+            append_chat_path=False,
+        ),
+        runtime=RuntimeOptions(),
+    )
+    assert config.to_control_dict()["provider"]["append_chat_path"] is False
+
+
+def test_probe_provider_connection_uses_base_url_when_append_disabled(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config = AppConfig(
+        provider=ProviderConfig(
+            name="test",
+            api_key="key",
+            base_url="https://example.com/v1/chat/completions",
+            model="demo-model",
+            chat_path="/chat/completions",
+            append_chat_path=False,
+            stream=True,
+        ),
+        runtime=RuntimeOptions(),
+    )
+
+    monkeypatch.setattr(cli, "load_app_config", lambda *args, **kwargs: config)
+
+    def fake_complete(self, messages, tools, stream_callback=None):
+        raise ConnectionError("Connection refused")
+
+    monkeypatch.setattr(cli.OpenAICompatibleProvider, "complete", fake_complete)
+
+    ok, status, message = _probe_provider_connection(None, workspace=tmp_path, stream=False)
+    assert ok is False
+    assert status == "error"
+    assert "https://example.com/v1/chat/completions" in message
+    assert "https://example.com/v1/chat/completions/chat/completions" not in message
+
+
+def test_handle_init_config_saves_append_chat_path(tmp_path: Path, monkeypatch) -> None:
+    config_path = tmp_path / ".yucode" / "settings.yml"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(
+        "provider:\n"
+        "  base_url: https://api.example.com\n"
+        "  api_key: key\n"
+        "  model: demo-model\n"
+        "  chat_path: /chat/completions\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    def fake_prompt(label, current, *, secret=False, choices=None):
+        if label.startswith("provider.append_chat_path"):
+            return False
+        return current
+
+    monkeypatch.setattr(cli, "_prompt", fake_prompt)
+    monkeypatch.setattr(cli, "_test_api_connection", lambda *args, **kwargs: (True, "ok"))
+
+    result = cli.handle_init_config(argparse.Namespace(config_path=str(config_path)))
+    saved = load_yaml(config_path.read_text(encoding="utf-8"))
+
+    assert result == 0
+    assert isinstance(saved, dict)
+    assert saved["provider"]["append_chat_path"] is False

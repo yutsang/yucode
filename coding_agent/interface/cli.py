@@ -267,6 +267,7 @@ def _probe_provider_connection(
         api_key=config.provider.api_key,
         model=config.provider.model,
         chat_path=config.provider.chat_path,
+        append_chat_path=config.provider.append_chat_path,
         stream=stream,
         streaming_mode="stream" if stream else "no_stream",
         temperature=0.0,
@@ -341,6 +342,11 @@ def handle_init_config(args: argparse.Namespace) -> int:
         p["base_url"]    = _prompt("provider.base_url    (API endpoint)",   p.get("base_url", ""))
         p["model"]       = _prompt("provider.model       (model name)",     p.get("model", ""))
         p["chat_path"]   = _prompt("provider.chat_path",                    p.get("chat_path", "/chat/completions"))
+        p["append_chat_path"] = _prompt(
+            "provider.append_chat_path (append chat_path to base_url)",
+            p.get("append_chat_path", True),
+            choices=["true", "false"],
+        )
         p["stream"]      = _prompt("provider.stream",                       p.get("stream", True),   choices=["true", "false"])
         p["temperature"] = _prompt("provider.temperature",                  p.get("temperature", 0.0))
 
@@ -427,6 +433,7 @@ provider:
   api_key: ""
   model: ""
   chat_path: /chat/completions
+  append_chat_path: true
   stream: true
   temperature: 0.0
   extra_headers: {}
@@ -681,6 +688,7 @@ def _apply_cli_overrides(config: Any, args: argparse.Namespace) -> Any:
             name=old_provider.name, type=old_provider.type,
             base_url=old_provider.base_url, api_key=old_provider.api_key,
             model=args.model, chat_path=old_provider.chat_path,
+            append_chat_path=old_provider.append_chat_path,
             stream=old_provider.stream, streaming_mode=old_provider.streaming_mode,
             temperature=old_provider.temperature,
             extra_headers=dict(old_provider.extra_headers),
@@ -786,6 +794,7 @@ def _run_single_turn(args: argparse.Namespace) -> int:
                 "  Checklist:\n"
                 "    - Is YUCODE_API_KEY set (or api_key in settings.yml)?\n"
                 "    - Is provider.base_url correct?\n"
+                "    - Is provider.append_chat_path correct for your endpoint?\n"
                 "    - Is provider.model a valid model name for your provider?\n"
                 "    - Does your provider support streaming? (try setting provider.stream: false)\n"
                 "  Run `yucode doctor --workspace .` for diagnostics."
@@ -1113,6 +1122,7 @@ def _handle_slash_command_interactive(command: str, arguments: str, config: Any,
                 name=config.provider.name, type=config.provider.type,
                 base_url=config.provider.base_url, api_key=config.provider.api_key,
                 model=new_model, chat_path=config.provider.chat_path,
+                append_chat_path=config.provider.append_chat_path,
                 stream=config.provider.stream, streaming_mode=config.provider.streaming_mode,
                 temperature=config.provider.temperature,
                 extra_headers=dict(config.provider.extra_headers),
@@ -1132,6 +1142,8 @@ def _handle_slash_command_interactive(command: str, arguments: str, config: Any,
             print(render_info(f"Current model: {BOLD}{config.provider.model}{RESET}"))
             print(f"  {DIM}provider{RESET}        {config.provider.name}")
             print(f"  {DIM}base_url{RESET}        {config.provider.base_url}")
+            print(f"  {DIM}chat_path{RESET}       {config.provider.chat_path}")
+            print(f"  {DIM}append_path{RESET}     {config.provider.append_chat_path}")
             print(f"  {DIM}stream{RESET}          {config.provider.stream}")
             print(f"  {DIM}streaming_mode{RESET}  {config.provider.streaming_mode}")
             print(f"\n  {DIM}Usage: /model <model-name> to switch{RESET}")

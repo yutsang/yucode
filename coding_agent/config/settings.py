@@ -61,6 +61,7 @@ class ProviderConfig:
     api_key: str = ""
     model: str = ""
     chat_path: str = "/chat/completions"
+    append_chat_path: bool = True
     stream: bool = True
     streaming_mode: StreamingMode = "hybrid"
     temperature: float = 0.0
@@ -188,6 +189,7 @@ class AppConfig:
                 "api_key": self.provider.api_key,
                 "model": self.provider.model,
                 "chat_path": self.provider.chat_path,
+                "append_chat_path": self.provider.append_chat_path,
                 "stream": self.provider.stream,
                 "streaming_mode": self.provider.streaming_mode,
                 "temperature": self.provider.temperature,
@@ -417,6 +419,7 @@ def app_config_from_dict(raw: dict[str, Any]) -> AppConfig:
         api_key=resolved_api_key,
         model=os.environ.get("YUCODE_MODEL", "").strip() or str(provider_raw.get("model", "")),
         chat_path=str(provider_raw.get("chat_path", "/chat/completions")),
+        append_chat_path=bool(provider_raw.get("append_chat_path", True)),
         stream=bool(provider_raw.get("stream", True)),
         streaming_mode=_coerce_streaming_mode(provider_raw.get("streaming_mode", "")),
         temperature=float(provider_raw.get("temperature", 0.0)),

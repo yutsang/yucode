@@ -219,6 +219,8 @@ class OpenAICompatibleProvider:
     def _build_url(self) -> str:
         if self.config.chat_path.startswith("http://") or self.config.chat_path.startswith("https://"):
             return self.config.chat_path
+        if not self.config.append_chat_path:
+            return self.config.base_url
         return f"{self.config.base_url}{self.config.chat_path}"
 
     def _headers(self, *, stream: bool | None = None) -> dict[str, str]:
@@ -245,13 +247,13 @@ class OpenAICompatibleProvider:
                 raise RuntimeError(
                     f"The provider endpoint ({self._build_url()}) returned a non-OpenAI "
                     f"response. Payload keys: {sorted(payload.keys())}.{hint} "
-                    "This usually means base_url or chat_path is pointing at a "
+                    "This usually means base_url, chat_path, or append_chat_path is pointing at a "
                     "gateway or wrong endpoint instead of the chat completions API."
                 )
             _emit_warning(
                 stream_callback,
                 "Provider response contained no choices. "
-                f"Payload keys: {list(payload.keys())}. Check that base_url, chat_path, and model are correct.",
+                f"Payload keys: {list(payload.keys())}. Check that base_url, chat_path, append_chat_path, and model are correct.",
                 category="provider_no_choices",
             )
         choice = choices[0] if choices else {}
@@ -328,9 +330,9 @@ class OpenAICompatibleProvider:
                 stream_callback,
                 f"Streaming response from {self._build_url()} contained zero SSE "
                 "data chunks. Either the endpoint does not support streaming, or "
-                "base_url/chat_path is pointing at a non-chat-completions URL. "
+                "base_url/chat_path/append_chat_path is pointing at a non-chat-completions URL. "
                 "Try setting provider.streaming_mode to no_stream, or check that "
-                "your base_url and chat_path are correct.",
+                "your base_url, chat_path, and append_chat_path are correct.",
                 category="provider_empty_stream",
             )
 

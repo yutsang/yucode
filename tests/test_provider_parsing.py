@@ -160,6 +160,28 @@ def _make_provider(**overrides: Any) -> OpenAICompatibleProvider:
     return OpenAICompatibleProvider(config=ProviderConfig(**defaults))
 
 
+class TestBuildUrl:
+    def test_appends_chat_path_by_default(self):
+        provider = _make_provider(base_url="https://api.example.com", chat_path="/chat/completions")
+        assert provider._build_url() == "https://api.example.com/chat/completions"
+
+    def test_uses_base_url_when_append_chat_path_disabled(self):
+        provider = _make_provider(
+            base_url="https://api.example.com/v1/chat/completions",
+            chat_path="/chat/completions",
+            append_chat_path=False,
+        )
+        assert provider._build_url() == "https://api.example.com/v1/chat/completions"
+
+    def test_absolute_chat_path_takes_precedence(self):
+        provider = _make_provider(
+            base_url="https://api.example.com",
+            chat_path="https://gateway.example.com/custom/chat",
+            append_chat_path=False,
+        )
+        assert provider._build_url() == "https://gateway.example.com/custom/chat"
+
+
 class TestParseResponsePayload:
     def test_standard_openai_payload(self):
         provider = _make_provider()
@@ -535,3 +557,16 @@ class TestStreamingZeroChunksDiagnostics:
         provider._parse_streaming_response(stream, events.append)
         warnings = [e for e in events if e.get("type") == "warning"]
         assert any("https://my-provider.com/chat/completions" in w["warning"] for w in warnings)
+
+    def test_zero_chunks_warning_uses_base_url_when_append_disabled(self):
+        provider = _make_provider(
+            base_url="https://my-provider.com/v1/chat/completions",
+            chat_path="/chat/completions",
+            append_chat_path=False,
+            stream=True,
+        )
+        stream = io.BytesIO(b"data: [DONE]\n\n")
+        events: list[dict] = []
+        provider._parse_streaming_response(stream, events.append)
+        warnings = [e for e in events if e.get("type") == "warning"]
+        assert any("https://my-provider.com/v1/chat/completions" in w["warning"] for w in warnings)
