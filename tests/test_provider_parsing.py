@@ -1,0 +1,343 @@
+"""Tests for provider response parsing — content extraction, usage
+extraction, and streaming edge cases.
+
+Covers:
+  - Standard OpenAI-style payloads (string content, prompt/completion tokens)
+  - Alternate content shapes (block arrays, None, non-string)
+  - Alternate usage keys (input_tokens / output_tokens)
+  - Empty-response detection and logging
+  - Streaming with and without usage chunks
+  - Malformed SSE lines
+"""
+
+from __future__ import annotations
+
+import io
+import json
+import logging
+from typing import Any
+
+import pytest
+
+from coding_agent.core.providers import (
+    OpenAICompatibleProvider,
+    _extract_content_text,
+    _extract_usage,
+    _merge_usage_max,
+)
+from coding_agent.core.session import Usage
+from coding_agent.config import ProviderConfig
+
+
+# ---------------------------------------------------------------------------
+# _extract_content_text
+# ---------------------------------------------------------------------------
+
+class TestExtractContentText:
+    def test_plain_string(self):
+        assert _extract_content_text("hello") == "hello"
+
+    def test_none_returns_empty(self):
+        assert _extract_content_text(None) == ""
+
+    def test_empty_string(self):
+        assert _extract_content_text("") == ""
+
+    def test_block_array_text_only(self):
+        blocks = [
+            {"type": "text", "text": "Hello "},
+            {"type": "text", "text": "world"},
+        ]
+        assert _extract_content_text(blocks) == "Hello world"
+
+    def test_block_array_mixed_types(self):
+        blocks = [
+            {"type": "thinking", "text": "internal"},
+            {"type": "text", "text": "visible"},
+        ]
+        assert _extract_content_text(blocks) == "visible"
+
+    def test_block_array_with_text_key_no_type(self):
+        blocks = [{"text": "fallback content"}]
+        assert _extract_content_text(blocks) == "fallback content"
+
+    def test_integer_returns_empty(self):
+        assert _extract_content_text(42) == ""
+
+    def test_empty_list_returns_empty(self):
+        assert _extract_content_text([]) == ""
+
+
+# ---------------------------------------------------------------------------
+# _extract_usage
+# ---------------------------------------------------------------------------
+
+class TestExtractUsage:
+    def test_openai_style(self):
+        raw = {"prompt_tokens": 100, "completion_tokens": 50}
+        usage = _extract_usage(raw)
+        assert usage.input_tokens == 100
+        assert usage.output_tokens == 50
+
+    def test_anthropic_style(self):
+        raw = {"input_tokens": 200, "output_tokens": 80}
+        usage = _extract_usage(raw)
+        assert usage.input_tokens == 200
+        assert usage.output_tokens == 80
+
+    def test_openai_takes_priority_when_both_present(self):
+        raw = {"prompt_tokens": 100, "completion_tokens": 50,
+               "input_tokens": 200, "output_tokens": 80}
+        usage = _extract_usage(raw)
+        assert usage.input_tokens == 100
+        assert usage.output_tokens == 50
+
+    def test_empty_dict_returns_zeros(self):
+        usage = _extract_usage({})
+        assert usage.total_tokens() == 0
+
+    def test_none_returns_zeros(self):
+        usage = _extract_usage({})
+        assert usage.total_tokens() == 0
+
+    def test_cache_tokens_openai_nested(self):
+        raw = {
+            "prompt_tokens": 100,
+            "completion_tokens": 50,
+            "prompt_tokens_details": {
+                "cached_tokens_creation": 10,
+                "cached_tokens": 20,
+            },
+        }
+        usage = _extract_usage(raw)
+        assert usage.cache_creation_input_tokens == 10
+        assert usage.cache_read_input_tokens == 20
+
+    def test_cache_tokens_flat_keys(self):
+        raw = {
+            "prompt_tokens": 100,
+            "completion_tokens": 50,
+            "cache_creation_input_tokens": 15,
+            "cache_read_input_tokens": 25,
+        }
+        usage = _extract_usage(raw)
+        assert usage.cache_creation_input_tokens == 15
+        assert usage.cache_read_input_tokens == 25
+
+
+# ---------------------------------------------------------------------------
+# _merge_usage_max
+# ---------------------------------------------------------------------------
+
+class TestMergeUsageMax:
+    def test_takes_maximum(self):
+        target = Usage(input_tokens=50, output_tokens=30)
+        _merge_usage_max(target, {"prompt_tokens": 100, "completion_tokens": 10})
+        assert target.input_tokens == 100
+        assert target.output_tokens == 30
+
+    def test_empty_raw_is_noop(self):
+        target = Usage(input_tokens=50, output_tokens=30)
+        _merge_usage_max(target, {})
+        assert target.input_tokens == 50
+        assert target.output_tokens == 30
+
+
+# ---------------------------------------------------------------------------
+# _parse_response_payload
+# ---------------------------------------------------------------------------
+
+def _make_provider(**overrides: Any) -> OpenAICompatibleProvider:
+    defaults = {
+        "name": "test",
+        "api_key": "test-key",
+        "base_url": "http://localhost",
+        "model": "test-model",
+        "stream": False,
+    }
+    defaults.update(overrides)
+    return OpenAICompatibleProvider(config=ProviderConfig(**defaults))
+
+
+class TestParseResponsePayload:
+    def test_standard_openai_payload(self):
+        provider = _make_provider()
+        payload = {
+            "choices": [{
+                "message": {
+                    "content": "Hello!",
+                    "role": "assistant",
+                },
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+        }
+        resp = provider._parse_response_payload(payload, None)
+        assert resp.text == "Hello!"
+        assert resp.usage.input_tokens == 10
+        assert resp.usage.output_tokens == 5
+        assert resp.tool_calls == []
+
+    def test_block_array_content(self):
+        provider = _make_provider()
+        payload = {
+            "choices": [{
+                "message": {
+                    "content": [{"type": "text", "text": "block response"}],
+                    "role": "assistant",
+                },
+            }],
+            "usage": {"input_tokens": 20, "output_tokens": 10},
+        }
+        resp = provider._parse_response_payload(payload, None)
+        assert resp.text == "block response"
+        assert resp.usage.input_tokens == 20
+
+    def test_empty_choices_logs_warning(self, caplog):
+        provider = _make_provider()
+        payload = {"id": "xxx", "object": "chat.completion"}
+        with caplog.at_level(logging.WARNING, logger="yucode.providers"):
+            resp = provider._parse_response_payload(payload, None)
+        assert resp.text == ""
+        assert any("no choices" in r.message.lower() for r in caplog.records)
+
+    def test_null_content_with_tool_calls(self):
+        provider = _make_provider()
+        payload = {
+            "choices": [{
+                "message": {
+                    "content": None,
+                    "tool_calls": [{
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": '{"path":"a.txt"}'},
+                    }],
+                },
+            }],
+            "usage": {"prompt_tokens": 15, "completion_tokens": 8},
+        }
+        resp = provider._parse_response_payload(payload, None)
+        assert resp.text == ""
+        assert len(resp.tool_calls) == 1
+        assert resp.tool_calls[0].name == "read_file"
+
+    def test_empty_response_logs_warning(self, caplog):
+        provider = _make_provider()
+        payload = {
+            "choices": [{"message": {"content": "", "role": "assistant"}}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0},
+        }
+        with caplog.at_level(logging.WARNING, logger="yucode.providers"):
+            resp = provider._parse_response_payload(payload, None)
+        assert resp.text == ""
+        assert any("empty response" in r.message.lower() for r in caplog.records)
+
+    def test_stream_callback_receives_delta(self):
+        provider = _make_provider()
+        payload = {
+            "choices": [{"message": {"content": "hi", "role": "assistant"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        }
+        events: list[dict] = []
+        provider._parse_response_payload(payload, events.append)
+        assert any(e["type"] == "assistant_delta" for e in events)
+
+
+# ---------------------------------------------------------------------------
+# _parse_streaming_response
+# ---------------------------------------------------------------------------
+
+def _sse_lines(*chunks: str) -> io.BytesIO:
+    """Build a fake SSE byte stream from a sequence of JSON payloads."""
+    lines: list[bytes] = []
+    for chunk in chunks:
+        lines.append(f"data: {chunk}\n\n".encode())
+    lines.append(b"data: [DONE]\n\n")
+    return io.BytesIO(b"".join(lines))
+
+
+class TestParseStreamingResponse:
+    def test_standard_streaming(self):
+        provider = _make_provider(stream=True)
+        chunks = [
+            json.dumps({"choices": [{"delta": {"content": "Hel"}}]}),
+            json.dumps({"choices": [{"delta": {"content": "lo!"}}]}),
+            json.dumps({"choices": [{"delta": {}}], "usage": {"prompt_tokens": 10, "completion_tokens": 5}}),
+        ]
+        resp = provider._parse_streaming_response(_sse_lines(*chunks), None)
+        assert resp.text == "Hello!"
+        assert resp.usage.input_tokens == 10
+        assert resp.usage.output_tokens == 5
+
+    def test_streaming_without_usage(self):
+        provider = _make_provider(stream=True)
+        chunks = [
+            json.dumps({"choices": [{"delta": {"content": "No usage"}}]}),
+        ]
+        resp = provider._parse_streaming_response(_sse_lines(*chunks), None)
+        assert resp.text == "No usage"
+        assert resp.usage.total_tokens() == 0
+
+    def test_streaming_with_anthropic_usage_keys(self):
+        provider = _make_provider(stream=True)
+        chunks = [
+            json.dumps({"choices": [{"delta": {"content": "ok"}}]}),
+            json.dumps({"choices": [{"delta": {}}], "usage": {"input_tokens": 30, "output_tokens": 12}}),
+        ]
+        resp = provider._parse_streaming_response(_sse_lines(*chunks), None)
+        assert resp.usage.input_tokens == 30
+        assert resp.usage.output_tokens == 12
+
+    def test_zero_chunks_logs_warning(self, caplog):
+        provider = _make_provider(stream=True)
+        stream = io.BytesIO(b"data: [DONE]\n\n")
+        with caplog.at_level(logging.WARNING, logger="yucode.providers"):
+            resp = provider._parse_streaming_response(stream, None)
+        assert resp.text == ""
+        assert any("zero data chunks" in r.message.lower() for r in caplog.records)
+
+    def test_empty_stream_logs_warning(self, caplog):
+        provider = _make_provider(stream=True)
+        stream = io.BytesIO(b"")
+        with caplog.at_level(logging.WARNING, logger="yucode.providers"):
+            resp = provider._parse_streaming_response(stream, None)
+        assert resp.text == ""
+        assert any("zero data chunks" in r.message.lower() for r in caplog.records)
+
+    def test_malformed_json_in_sse_skipped(self, caplog):
+        provider = _make_provider(stream=True)
+        raw = (
+            b"data: {bad json}\n\n"
+            b'data: {"choices": [{"delta": {"content": "ok"}}]}\n\n'
+            b"data: [DONE]\n\n"
+        )
+        with caplog.at_level(logging.DEBUG, logger="yucode.providers"):
+            resp = provider._parse_streaming_response(io.BytesIO(raw), None)
+        assert resp.text == "ok"
+
+    def test_streaming_tool_calls(self):
+        provider = _make_provider(stream=True)
+        chunks = [
+            json.dumps({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "tc1", "function": {"name": "read_file", "arguments": ""}}]}}]}),
+            json.dumps({"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": '{"path":"x"}'}}]}}]}),
+        ]
+        resp = provider._parse_streaming_response(_sse_lines(*chunks), None)
+        assert len(resp.tool_calls) == 1
+        assert resp.tool_calls[0].name == "read_file"
+        assert '"path"' in resp.tool_calls[0].arguments
+
+    def test_block_content_in_streaming_delta(self):
+        provider = _make_provider(stream=True)
+        chunks = [
+            json.dumps({"choices": [{"delta": {"content": [{"type": "text", "text": "block"}]}}]}),
+        ]
+        resp = provider._parse_streaming_response(_sse_lines(*chunks), None)
+        assert resp.text == "block"
+
+    def test_stream_callback_invoked(self):
+        provider = _make_provider(stream=True)
+        chunks = [
+            json.dumps({"choices": [{"delta": {"content": "hi"}}]}),
+        ]
+        events: list[dict] = []
+        provider._parse_streaming_response(_sse_lines(*chunks), events.append)
+        assert any(e["type"] == "assistant_delta" for e in events)

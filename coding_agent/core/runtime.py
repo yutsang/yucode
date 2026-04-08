@@ -317,6 +317,23 @@ class AgentRuntime:
 
             if not response.tool_calls:
                 summary.final_text = response.text
+                if not response.text and response.usage.total_tokens() == 0 and iteration == 1:
+                    _log.warning(
+                        "Provider returned empty text with zero token usage on the "
+                        "first iteration. This usually indicates a provider "
+                        "configuration problem (wrong base_url, model, or API key). "
+                        "Run `yucode doctor --workspace .` to diagnose."
+                    )
+                    if event_callback:
+                        event_callback({
+                            "type": "error",
+                            "error": (
+                                "Provider returned an empty response with 0 tokens. "
+                                "Check your provider configuration (base_url, model, api_key) "
+                                "or run `yucode doctor`."
+                            ),
+                            "category": "empty_response",
+                        })
                 if event_callback:
                     event_callback({"type": "completed", "text": response.text})
                 self.metrics.record_session(summary.iterations, summary.usage)

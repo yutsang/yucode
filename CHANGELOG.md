@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.2] - 2026-04-08
+
+### Added
+- Added focused provider parsing regression coverage for alternate content shapes, usage schemas, and streaming edge cases
+
+### Changed
+- Improved CLI troubleshooting guidance for empty provider responses and environment setup
+- Broadened OpenAI-compatible response parsing to accept block-style content and alternate token usage fields
+
+### Fixed
+- Fixed silent `yucode chat` failures where compatible providers could return a blank response with `0` token usage
+- Surfaced clearer runtime and CLI diagnostics when provider configuration or streaming output is incompatible
+
 ## [0.2.1] - 2026-04-07
 
 ### Added

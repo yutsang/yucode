@@ -742,6 +742,17 @@ def _run_single_turn(args: argparse.Namespace) -> int:
         summary = runtime.orchestrate(parsed.effective_prompt, event_callback=_cli_event_callback)
         _cli_event_callback._progress.stop()  # type: ignore[attr-defined]
         _auto_save(runtime)
+        if not summary.final_text.strip() and summary.usage.total_tokens() == 0:
+            print(render_warning(
+                "The provider returned an empty response with 0 tokens.\n"
+                "  This usually means your provider configuration is wrong.\n"
+                "  Checklist:\n"
+                "    - Is YUCODE_API_KEY set (or api_key in settings.yml)?\n"
+                "    - Is provider.base_url correct?\n"
+                "    - Is provider.model a valid model name for your provider?\n"
+                "    - Does your provider support streaming? (try setting provider.stream: false)\n"
+                "  Run `yucode doctor --workspace .` for diagnostics."
+            ), file=sys.stderr)
         print(format_assistant_text(summary.final_text))
         print()
         print(format_cost_summary(summary.usage.to_dict()))
@@ -839,6 +850,11 @@ def _run_interactive(args: argparse.Namespace) -> int:
             continue
         try:
             summary = runtime.orchestrate(parsed.effective_prompt, event_callback=handler)
+            if not summary.final_text.strip() and summary.usage.total_tokens() == 0:
+                print(render_warning(
+                    "Provider returned an empty response with 0 tokens. "
+                    "Check your provider config or run `yucode doctor`."
+                ), file=sys.stderr)
             if not handler._text_started:
                 print(agent_label(), end="")
                 print(format_assistant_text(summary.final_text))

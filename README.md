@@ -204,6 +204,36 @@ flowchart TD
     Sessions --> Final
 ```
 
+## Troubleshooting
+
+### Empty response with 0 tokens
+
+If `yucode chat` prints a blank answer with all-zero token usage:
+
+1. **Run diagnostics** — `yucode doctor --workspace .` checks config, API key, and provider connectivity.
+2. **Check your API key** — set the `YUCODE_API_KEY` environment variable or add `api_key` to `~/.yucode/settings.yml` (or `.yucode/settings.local.yml` in the project).
+3. **Check `provider.base_url` and `provider.model`** — the URL must be the base endpoint (e.g. `https://api.deepseek.com`) and the model name must be valid for that provider.
+4. **Try disabling streaming** — some providers do not support SSE streaming. Set `provider.stream: false` in your config and retry.
+5. **Use a clean virtualenv** — installing yucode into a global Python environment can cause unrelated `pip` dependency conflicts (e.g. `camelot-py`, `tableauhyperapi`). These warnings are cosmetic and do not affect yucode, but a clean virtualenv avoids confusion:
+
+```bash
+python -m venv .venv
+# Windows: .venv\Scripts\activate
+# macOS/Linux: source .venv/bin/activate
+pip install yucode-agent
+```
+
+### Provider compatibility
+
+YuCode uses the OpenAI-compatible `/chat/completions` API. It recognises both OpenAI-style and Anthropic-style response shapes:
+
+| Key style | `content` | `usage` |
+|-----------|-----------|---------|
+| OpenAI | `string` | `prompt_tokens` / `completion_tokens` |
+| Anthropic / block | `[{"type":"text","text":"..."}]` | `input_tokens` / `output_tokens` |
+
+If your provider returns a different payload format, open an issue.
+
 ## Documentation
 
 See [coding_agent/README.md](coding_agent/README.md) for the full manual -- run modes, config reference, command catalog, tool list, MCP/plugin guide, and optional dependency matrix.
