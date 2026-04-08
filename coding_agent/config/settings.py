@@ -62,6 +62,7 @@ class ProviderConfig:
     model: str = ""
     chat_path: str = "/chat/completions"
     append_chat_path: bool = True
+    verify_tls: bool = True
     stream: bool = True
     streaming_mode: StreamingMode = "hybrid"
     temperature: float = 0.0
@@ -190,6 +191,7 @@ class AppConfig:
                 "model": self.provider.model,
                 "chat_path": self.provider.chat_path,
                 "append_chat_path": self.provider.append_chat_path,
+                "verify_tls": self.provider.verify_tls,
                 "stream": self.provider.stream,
                 "streaming_mode": self.provider.streaming_mode,
                 "temperature": self.provider.temperature,
@@ -420,6 +422,7 @@ def app_config_from_dict(raw: dict[str, Any]) -> AppConfig:
         model=os.environ.get("YUCODE_MODEL", "").strip() or str(provider_raw.get("model", "")),
         chat_path=str(provider_raw.get("chat_path", "/chat/completions")),
         append_chat_path=bool(provider_raw.get("append_chat_path", True)),
+        verify_tls=_coerce_bool(provider_raw.get("verify_tls", True), "provider.verify_tls"),
         stream=bool(provider_raw.get("stream", True)),
         streaming_mode=_coerce_streaming_mode(provider_raw.get("streaming_mode", "")),
         temperature=float(provider_raw.get("temperature", 0.0)),
@@ -604,6 +607,18 @@ def _coerce_string_dict(value: Any, label: str) -> dict[str, str]:
     ):
         raise ConfigError(f"{label} must be an object of string values")
     return dict(value)
+
+
+def _coerce_bool(value: Any, label: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"true", "1", "yes", "y"}:
+            return True
+        if text in {"false", "0", "no", "n"}:
+            return False
+    raise ConfigError(f"{label} must be a boolean")
 
 
 def _coerce_positive_int(value: Any, label: str) -> int:

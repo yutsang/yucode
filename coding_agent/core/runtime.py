@@ -332,7 +332,7 @@ class AgentRuntime:
                             "Provider returned empty text with zero token usage on the "
                             "first iteration. This usually indicates a provider "
                             "configuration problem (wrong base_url, chat_path, "
-                            "append_chat_path, model, or API key). "
+                            "append_chat_path, verify_tls, model, or API key). "
                             "Run `yucode doctor --workspace .` to diagnose."
                         )
                 if event_callback:

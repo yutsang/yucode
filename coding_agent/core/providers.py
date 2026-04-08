@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import ssl
 import time
 import urllib.error
 import urllib.request
@@ -177,6 +178,7 @@ class OpenAICompatibleProvider:
         payload = json.dumps(body).encode("utf-8")
         url = self._build_url()
         headers = self._headers(stream=stream)
+        context = self._ssl_context()
 
         last_error: Exception | None = None
         for attempt in range(_MAX_RETRIES):
@@ -187,7 +189,7 @@ class OpenAICompatibleProvider:
                 method="POST",
             )
             try:
-                with urllib.request.urlopen(request, timeout=90) as response:
+                with urllib.request.urlopen(request, timeout=90, context=context) as response:
                     if stream:
                         return self._parse_streaming_response(response, stream_callback)
                     raw_body = response.read().decode("utf-8")
@@ -209,6 +211,12 @@ class OpenAICompatibleProvider:
                 raise RuntimeError(f"Provider request failed with {exc.code}: {detail}") from exc
             except urllib.error.URLError as exc:
                 last_error = exc
+                if self._is_tls_verification_error(exc):
+                    raise RuntimeError(
+                        "Provider TLS verification failed. "
+                        "If your provider uses an enterprise proxy or custom certificate, "
+                        "try setting `provider.verify_tls: false`."
+                    ) from exc
                 if attempt < _MAX_RETRIES - 1:
                     wait = _RETRY_BACKOFF_BASE * (2 ** attempt)
                     time.sleep(wait)
@@ -233,6 +241,19 @@ class OpenAICompatibleProvider:
             headers["Authorization"] = f"Bearer {self.config.api_key}"
         headers.update(self.config.extra_headers)
         return headers
+
+    def _ssl_context(self) -> ssl.SSLContext | None:
+        if self.config.verify_tls:
+            return None
+        return ssl._create_unverified_context()  # noqa: S323
+
+    def _is_tls_verification_error(self, exc: urllib.error.URLError) -> bool:
+        reason = getattr(exc, "reason", None)
+        if isinstance(reason, ssl.SSLCertVerificationError):
+            return True
+        if isinstance(reason, ssl.SSLError) and "CERTIFICATE_VERIFY_FAILED" in str(reason):
+            return True
+        return "CERTIFICATE_VERIFY_FAILED" in str(reason)
 
     def _parse_response_payload(
         self,
@@ -284,6 +305,7 @@ class OpenAICompatibleProvider:
         tool_call_accumulator: dict[int, dict[str, str]] = {}
         usage = Usage()
         chunk_count = 0
+        saw_non_openai_stream_payload = False
         for raw_line in response:
             line = raw_line.decode("utf-8", errors="replace").strip()
             if not line or not line.startswith("data:"):
@@ -295,6 +317,22 @@ class OpenAICompatibleProvider:
                 payload = json.loads(payload_text)
             except json.JSONDecodeError:
                 _log.debug("Skipping non-JSON SSE chunk: %s", payload_text[:120])
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if not _looks_like_openai_response(payload):
+                if not saw_non_openai_stream_payload:
+                    detail = _extract_envelope_detail(payload)
+                    hint = f" Server message: {detail}" if detail else ""
+                    _emit_warning(
+                        stream_callback,
+                        f"Streaming response from {self._build_url()} returned a non-OpenAI "
+                        f"SSE payload. Payload keys: {sorted(payload.keys())}.{hint} "
+                        "This provider may not support OpenAI-style streaming; "
+                        "try setting `provider.streaming_mode: no_stream`.",
+                        category="provider_streaming_non_openai",
+                    )
+                    saw_non_openai_stream_payload = True
                 continue
             chunk_count += 1
             choice = payload.get("choices", [{}])[0]
@@ -325,7 +363,7 @@ class OpenAICompatibleProvider:
             if raw_usage:
                 _merge_usage_max(usage, raw_usage)
 
-        if chunk_count == 0:
+        if chunk_count == 0 and not saw_non_openai_stream_payload:
             _emit_warning(
                 stream_callback,
                 f"Streaming response from {self._build_url()} contained zero SSE "
@@ -341,7 +379,7 @@ class OpenAICompatibleProvider:
             for _, item in sorted(tool_call_accumulator.items())
         ]
         final_text = "".join(text_parts)
-        if not final_text and not tool_calls:
+        if not final_text and not tool_calls and not saw_non_openai_stream_payload:
             _emit_warning(
                 stream_callback,
                 "Provider streaming completed with no text and no tool calls. "

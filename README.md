@@ -218,9 +218,10 @@ If `yucode chat` prints a blank answer with all-zero token usage:
 1. **Run diagnostics** — `yucode doctor --workspace .` checks config, API key, and provider connectivity. If the endpoint returns a non-OpenAI JSON schema (e.g. a gateway envelope), doctor will now report the exact URL and payload keys to help you pinpoint the misconfiguration.
 2. **Check your API key** — set the `YUCODE_API_KEY` environment variable or add `api_key` to `~/.yucode/settings.yml` (or `.yucode/settings.local.yml` in the project).
 3. **Check `provider.base_url`, `provider.chat_path`, and `provider.append_chat_path`** — by default YuCode uses OpenAI-style URL joining (`base_url + chat_path`). For example, `https://api.deepseek.com` plus `/chat/completions` with `append_chat_path: true` becomes `https://api.deepseek.com/chat/completions`. If your provider already gives you the full endpoint URL, set `append_chat_path: false` and put the final URL in `base_url` instead.
-4. **Check `provider.model`** — the model name must be valid for your provider. An unrecognised model can produce an empty completion with zero tokens.
-5. **Try disabling streaming** — some providers do not support SSE streaming. The default `streaming_mode: hybrid` handles this automatically, but you can also set `provider.streaming_mode: no_stream` (or the legacy `provider.stream: false`) in your config.
-6. **Use a clean virtualenv** — installing yucode into a global Python environment can cause unrelated `pip` dependency conflicts (e.g. `camelot-py`, `tableauhyperapi`). These warnings are cosmetic and do not affect yucode, but a clean virtualenv avoids confusion:
+4. **Check `provider.verify_tls`** — keep this as `true` for normal providers. If you are behind an enterprise proxy or custom certificate setup and a direct SDK client only works with certificate verification disabled, set `provider.verify_tls: false`.
+5. **Check `provider.model`** — the model name must be valid for your provider. An unrecognised model can produce an empty completion with zero tokens.
+6. **Try disabling streaming** — some providers do not support SSE streaming, or they return gateway-style SSE error payloads instead of OpenAI deltas. The default `streaming_mode: hybrid` handles this automatically, but you can also set `provider.streaming_mode: no_stream` (or the legacy `provider.stream: false`) in your config.
+7. **Use a clean virtualenv** — installing yucode into a global Python environment can cause unrelated `pip` dependency conflicts (e.g. `camelot-py`, `tableauhyperapi`). These warnings are cosmetic and do not affect yucode, but a clean virtualenv avoids confusion:
 
 ```bash
 python -m venv .venv
@@ -238,12 +239,13 @@ YuCode uses the OpenAI-compatible `/chat/completions` API. It recognises both Op
 | OpenAI | `string` | `prompt_tokens` / `completion_tokens` |
 | Anthropic / block | `[{"type":"text","text":"..."}]` | `input_tokens` / `output_tokens` |
 
-If your provider returns a different payload format (e.g. keys like `flag`, `code`, `msg`), YuCode will now raise a clear error identifying the endpoint and payload shape instead of silently returning an empty response. Check that `base_url`, `chat_path`, and `append_chat_path` resolve to the actual chat completions endpoint, not a gateway or status route. If the format is genuinely a supported provider, open an issue.
+If your provider returns a different payload format (e.g. keys like `flag`, `code`, `msg`), YuCode will now raise a clear error identifying the endpoint and payload shape instead of silently returning an empty response. Check that `base_url`, `chat_path`, `append_chat_path`, and `verify_tls` resolve to the actual chat completions endpoint, not a gateway or status route. If the format is genuinely a supported provider, open an issue.
 
 Two supported connection styles are:
 
 - `base_url: https://api.deepseek.com` + `chat_path: /chat/completions` + `append_chat_path: true`
 - `base_url: https://api.deepseek.com/v1/chat/completions` + `chat_path: /chat/completions` + `append_chat_path: false`
+- `base_url: https://enterprise-gateway.example.com/openAi/v1` + `chat_path: /chat/completions` + `append_chat_path: true` + `verify_tls: false` for enterprise environments that require disabled certificate verification
 
 ## Documentation
 

@@ -6,6 +6,7 @@ provider:
   model: deepseek-chat
   chat_path: /chat/completions
   append_chat_path: true
+  verify_tls: true
   stream: true
   streaming_mode: hybrid
   temperature: 0.0

@@ -236,6 +236,18 @@ def test_app_config_from_dict_reads_append_chat_path() -> None:
     assert config.provider.append_chat_path is False
 
 
+def test_app_config_from_dict_reads_verify_tls() -> None:
+    config = app_config_from_dict({
+        "provider": {
+            "base_url": "https://api.example.com",
+            "api_key": "key",
+            "model": "demo-model",
+            "verify_tls": False,
+        }
+    })
+    assert config.provider.verify_tls is False
+
+
 def test_to_control_dict_includes_append_chat_path() -> None:
     config = AppConfig(
         provider=ProviderConfig(
@@ -247,6 +259,19 @@ def test_to_control_dict_includes_append_chat_path() -> None:
         runtime=RuntimeOptions(),
     )
     assert config.to_control_dict()["provider"]["append_chat_path"] is False
+
+
+def test_to_control_dict_includes_verify_tls() -> None:
+    config = AppConfig(
+        provider=ProviderConfig(
+            base_url="https://api.example.com",
+            api_key="key",
+            model="demo-model",
+            verify_tls=False,
+        ),
+        runtime=RuntimeOptions(),
+    )
+    assert config.to_control_dict()["provider"]["verify_tls"] is False
 
 
 def test_probe_provider_connection_uses_base_url_when_append_disabled(
@@ -280,6 +305,33 @@ def test_probe_provider_connection_uses_base_url_when_append_disabled(
     assert "https://example.com/v1/chat/completions/chat/completions" not in message
 
 
+def test_probe_provider_connection_preserves_verify_tls(tmp_path: Path, monkeypatch) -> None:
+    config = AppConfig(
+        provider=ProviderConfig(
+            name="test",
+            api_key="key",
+            base_url="https://example.com",
+            model="demo-model",
+            verify_tls=False,
+            stream=True,
+        ),
+        runtime=RuntimeOptions(),
+    )
+
+    monkeypatch.setattr(cli, "load_app_config", lambda *args, **kwargs: config)
+
+    def fake_complete(self, messages, tools, stream_callback=None):
+        assert self.config.verify_tls is False
+        return AssistantResponse(text="OK", usage=Usage(input_tokens=1, output_tokens=1))
+
+    monkeypatch.setattr(cli.OpenAICompatibleProvider, "complete", fake_complete)
+
+    ok, status, message = _probe_provider_connection(None, workspace=tmp_path, stream=False)
+    assert ok is True
+    assert status == "ok"
+    assert "Non-streaming request succeeded" in message
+
+
 def test_handle_init_config_saves_append_chat_path(tmp_path: Path, monkeypatch) -> None:
     config_path = tmp_path / ".yucode" / "settings.yml"
     config_path.parent.mkdir(parents=True)
@@ -296,6 +348,8 @@ def test_handle_init_config_saves_append_chat_path(tmp_path: Path, monkeypatch) 
     def fake_prompt(label, current, *, secret=False, choices=None):
         if label.startswith("provider.append_chat_path"):
             return False
+        if label.startswith("provider.verify_tls"):
+            return False
         return current
 
     monkeypatch.setattr(cli, "_prompt", fake_prompt)
@@ -307,3 +361,4 @@ def test_handle_init_config_saves_append_chat_path(tmp_path: Path, monkeypatch) 
     assert result == 0
     assert isinstance(saved, dict)
     assert saved["provider"]["append_chat_path"] is False
+    assert saved["provider"]["verify_tls"] is False

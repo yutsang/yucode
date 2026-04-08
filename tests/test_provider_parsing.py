@@ -15,6 +15,9 @@ from __future__ import annotations
 import io
 import json
 import logging
+import ssl
+import urllib.error
+import urllib.request
 from typing import Any
 
 import pytest
@@ -180,6 +183,65 @@ class TestBuildUrl:
             append_chat_path=False,
         )
         assert provider._build_url() == "https://gateway.example.com/custom/chat"
+
+
+class _FakeHTTPResponse:
+    def __init__(self, body: str, *, content_type: str = "application/json", status: int = 200):
+        self._body = body.encode("utf-8")
+        self.status = status
+        self.headers = {"Content-Type": content_type}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def read(self) -> bytes:
+        return self._body
+
+
+class TestTlsVerification:
+    def test_verify_tls_true_uses_default_context(self, monkeypatch):
+        provider = _make_provider(verify_tls=True)
+        seen_contexts: list[Any] = []
+
+        def fake_urlopen(request, timeout=90, context=None):
+            seen_contexts.append(context)
+            return _FakeHTTPResponse(
+                '{"choices":[{"message":{"content":"OK","role":"assistant"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}'
+            )
+
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        response = provider._do_complete([{"role": "user", "content": "hi"}], [], stream=False)
+        assert response.text == "OK"
+        assert seen_contexts == [None]
+
+    def test_verify_tls_false_uses_unverified_context(self, monkeypatch):
+        provider = _make_provider(verify_tls=False)
+        seen_contexts: list[Any] = []
+
+        def fake_urlopen(request, timeout=90, context=None):
+            seen_contexts.append(context)
+            return _FakeHTTPResponse(
+                '{"choices":[{"message":{"content":"OK","role":"assistant"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}'
+            )
+
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        response = provider._do_complete([{"role": "user", "content": "hi"}], [], stream=False)
+        assert response.text == "OK"
+        assert seen_contexts
+        assert seen_contexts[0] is not None
+
+    def test_tls_verification_error_suggests_verify_tls_false(self, monkeypatch):
+        provider = _make_provider(verify_tls=True)
+
+        def fake_urlopen(request, timeout=90, context=None):
+            raise urllib.error.URLError(ssl.SSLCertVerificationError("CERTIFICATE_VERIFY_FAILED"))
+
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        with pytest.raises(RuntimeError, match="provider.verify_tls: false"):
+            provider._do_complete([{"role": "user", "content": "hi"}], [], stream=False)
 
 
 class TestParseResponsePayload:
@@ -365,6 +427,19 @@ class TestParseStreamingResponse:
         provider._parse_streaming_response(_sse_lines(*chunks), events.append)
         assert any(e["type"] == "assistant_delta" for e in events)
 
+    def test_non_openai_sse_payload_warns_clearly(self):
+        provider = _make_provider(stream=True)
+        raw = (
+            b'data: {"flag": false, "code": 400, "msg": "406 NOT_ACCEPTABLE"}\n\n'
+            b"data: [DONE]\n\n"
+        )
+        events: list[dict] = []
+        resp = provider._parse_streaming_response(io.BytesIO(raw), events.append)
+        warnings = [e["warning"] for e in events if e.get("type") == "warning"]
+        assert resp.text == ""
+        assert any("non-OpenAI SSE payload" in warning for warning in warnings)
+        assert not any("zero SSE data chunks" in warning for warning in warnings)
+
 
 class TestHybridFallback:
     """Test the hybrid streaming_mode behaviour in OpenAICompatibleProvider."""
@@ -463,6 +538,40 @@ class TestHybridFallback:
         resp = provider.complete([], [])
         assert resp.text == ""
         assert call_count == 1
+
+    def test_hybrid_retries_after_non_openai_stream_payload(self, monkeypatch):
+        provider = OpenAICompatibleProvider(
+            config=ProviderConfig(
+                base_url="https://example.com",
+                model="test",
+                api_key="k",
+                stream=True,
+                streaming_mode="hybrid",
+            )
+        )
+        call_count = 0
+
+        def fake_do_complete(self, messages, tools, *, stream, stream_callback=None):
+            nonlocal call_count
+            call_count += 1
+            from coding_agent.core.session import AssistantResponse, Usage
+
+            if stream:
+                raw = io.BytesIO(
+                    b'data: {"flag": false, "code": 400, "msg": "406 NOT_ACCEPTABLE"}\n\n'
+                    b"data: [DONE]\n\n"
+                )
+                return self._parse_streaming_response(raw, stream_callback)
+            return AssistantResponse(text="fallback ok", tool_calls=[], usage=Usage(input_tokens=5, output_tokens=3))
+
+        monkeypatch.setattr(OpenAICompatibleProvider, "_do_complete", fake_do_complete)
+        events: list[dict] = []
+        resp = provider.complete([], [], stream_callback=events.append)
+        warnings = [e.get("warning", "") for e in events if e.get("type") == "warning"]
+        assert resp.text == "fallback ok"
+        assert call_count == 2
+        assert any("non-OpenAI SSE payload" in warning for warning in warnings)
+        assert any(e.get("type") == "fallback" for e in events)
 
 
 # ---------------------------------------------------------------------------
