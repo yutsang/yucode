@@ -341,3 +341,102 @@ class TestParseStreamingResponse:
         events: list[dict] = []
         provider._parse_streaming_response(_sse_lines(*chunks), events.append)
         assert any(e["type"] == "assistant_delta" for e in events)
+
+
+class TestHybridFallback:
+    """Test the hybrid streaming_mode behaviour in OpenAICompatibleProvider."""
+
+    def test_hybrid_retries_after_empty_stream(self, monkeypatch):
+        provider = OpenAICompatibleProvider(
+            config=ProviderConfig(
+                base_url="https://example.com",
+                model="test",
+                api_key="k",
+                stream=True,
+                streaming_mode="hybrid",
+            )
+        )
+        call_count = 0
+
+        def fake_do_complete(self, messages, tools, *, stream, stream_callback=None):
+            nonlocal call_count
+            call_count += 1
+            from coding_agent.core.session import AssistantResponse, Usage
+            if stream:
+                return AssistantResponse(text="", tool_calls=[], usage=Usage())
+            return AssistantResponse(text="fallback ok", tool_calls=[], usage=Usage(input_tokens=5, output_tokens=3))
+
+        monkeypatch.setattr(OpenAICompatibleProvider, "_do_complete", fake_do_complete)
+        events: list[dict] = []
+        resp = provider.complete([], [], stream_callback=events.append)
+        assert resp.text == "fallback ok"
+        assert call_count == 2
+        assert any(e.get("type") == "fallback" for e in events)
+
+    def test_hybrid_does_not_retry_when_stream_succeeds(self, monkeypatch):
+        provider = OpenAICompatibleProvider(
+            config=ProviderConfig(
+                base_url="https://example.com",
+                model="test",
+                api_key="k",
+                stream=True,
+                streaming_mode="hybrid",
+            )
+        )
+        call_count = 0
+
+        def fake_do_complete(self, messages, tools, *, stream, stream_callback=None):
+            nonlocal call_count
+            call_count += 1
+            from coding_agent.core.session import AssistantResponse, Usage
+            return AssistantResponse(text="streamed", tool_calls=[], usage=Usage(input_tokens=10, output_tokens=5))
+
+        monkeypatch.setattr(OpenAICompatibleProvider, "_do_complete", fake_do_complete)
+        resp = provider.complete([], [])
+        assert resp.text == "streamed"
+        assert call_count == 1
+
+    def test_no_stream_mode_skips_streaming(self, monkeypatch):
+        provider = OpenAICompatibleProvider(
+            config=ProviderConfig(
+                base_url="https://example.com",
+                model="test",
+                api_key="k",
+                stream=True,
+                streaming_mode="no_stream",
+            )
+        )
+        streams_used: list[bool] = []
+
+        def fake_do_complete(self, messages, tools, *, stream, stream_callback=None):
+            streams_used.append(stream)
+            from coding_agent.core.session import AssistantResponse, Usage
+            return AssistantResponse(text="non-stream", tool_calls=[], usage=Usage(input_tokens=1))
+
+        monkeypatch.setattr(OpenAICompatibleProvider, "_do_complete", fake_do_complete)
+        resp = provider.complete([], [])
+        assert resp.text == "non-stream"
+        assert streams_used == [False]
+
+    def test_stream_mode_does_not_fallback(self, monkeypatch):
+        provider = OpenAICompatibleProvider(
+            config=ProviderConfig(
+                base_url="https://example.com",
+                model="test",
+                api_key="k",
+                stream=True,
+                streaming_mode="stream",
+            )
+        )
+        call_count = 0
+
+        def fake_do_complete(self, messages, tools, *, stream, stream_callback=None):
+            nonlocal call_count
+            call_count += 1
+            from coding_agent.core.session import AssistantResponse, Usage
+            return AssistantResponse(text="", tool_calls=[], usage=Usage())
+
+        monkeypatch.setattr(OpenAICompatibleProvider, "_do_complete", fake_do_complete)
+        resp = provider.complete([], [])
+        assert resp.text == ""
+        assert call_count == 1

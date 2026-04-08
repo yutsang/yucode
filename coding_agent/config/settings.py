@@ -13,11 +13,37 @@ CompactStrategy = Literal["heuristic", "llm"]
 ErrorStrategy = Literal["strict", "resilient"]
 LogLevel = Literal["DEBUG", "INFO", "WARN", "ERROR"]
 LogFormat = Literal["text", "json"]
+StreamingMode = Literal["stream", "no_stream", "hybrid"]
 
 BUNDLED_CONFIG_PATH = Path(__file__).resolve().with_name("config.yml")
 DEFAULT_CONFIG_PATH = Path.home() / ".yucode" / "settings.yml"
 
 _API_KEY_ENV_VARS = ("YUCODE_API_KEY",)
+
+
+import hashlib as _hashlib
+
+_HOME_YUCODE = Path.home() / ".yucode"
+
+
+def workspace_key(workspace: Path) -> str:
+    """Derive a stable short key from a workspace path for home-based state."""
+    resolved = str(workspace.resolve())
+    return _hashlib.sha256(resolved.encode()).hexdigest()[:12]
+
+
+def state_dir(workspace: Path) -> Path:
+    """Return the home-based state directory for a given workspace.
+
+    Layout: ~/.yucode/projects/<workspace_key>/
+    Falls back to workspace/.yucode if the legacy directory already exists
+    and the home-based one does not (migration path).
+    """
+    home_state = _HOME_YUCODE / "projects" / workspace_key(workspace)
+    legacy = workspace.resolve() / ".yucode"
+    if home_state.exists() or not legacy.exists():
+        return home_state
+    return home_state
 
 
 def _resolve_api_key(config_value: str) -> str:
@@ -38,6 +64,7 @@ class ProviderConfig:
     model: str = ""
     chat_path: str = "/chat/completions"
     stream: bool = True
+    streaming_mode: StreamingMode = "hybrid"
     temperature: float = 0.0
     extra_headers: dict[str, str] = field(default_factory=dict)
     extra_body: dict[str, Any] = field(default_factory=dict)
@@ -164,6 +191,7 @@ class AppConfig:
                 "model": self.provider.model,
                 "chat_path": self.provider.chat_path,
                 "stream": self.provider.stream,
+                "streaming_mode": self.provider.streaming_mode,
                 "temperature": self.provider.temperature,
                 "extra_headers": dict(self.provider.extra_headers),
                 "extra_body": dict(self.provider.extra_body),
@@ -270,7 +298,13 @@ def ensure_default_config(path: Path | None = None) -> Path:
 
 def _resolve_workspace_mcp_path(workspace: Path | None = None) -> Path:
     base = (workspace or Path.cwd()).resolve()
-    return base / ".yucode" / "mcp.yml"
+    home_mcp = state_dir(base) / "mcp.yml"
+    if home_mcp.is_file():
+        return home_mcp
+    legacy = base / ".yucode" / "mcp.yml"
+    if legacy.is_file():
+        return legacy
+    return home_mcp
 
 
 def _load_workspace_mcp_servers(workspace: Path | None = None) -> list[dict[str, Any]]:
@@ -386,6 +420,7 @@ def app_config_from_dict(raw: dict[str, Any]) -> AppConfig:
         model=os.environ.get("YUCODE_MODEL", "").strip() or str(provider_raw.get("model", "")),
         chat_path=str(provider_raw.get("chat_path", "/chat/completions")),
         stream=bool(provider_raw.get("stream", True)),
+        streaming_mode=_coerce_streaming_mode(provider_raw.get("streaming_mode", "")),
         temperature=float(provider_raw.get("temperature", 0.0)),
         extra_headers=_coerce_string_dict(provider_raw.get("extra_headers", {}), "provider.extra_headers"),
         extra_body=_expect_dict(provider_raw.get("extra_body", {}), "provider.extra_body"),
@@ -624,6 +659,19 @@ def _coerce_log_level(value: Any) -> LogLevel:
     if text not in {"DEBUG", "INFO", "WARN", "ERROR"}:
         raise ConfigError(f"Unsupported log level: {text}")
     return text  # type: ignore[return-value]
+
+
+def _coerce_streaming_mode(value: Any, *, stream_fallback: bool = True) -> StreamingMode:
+    text = str(value).strip().lower()
+    if text in {"stream", "no_stream", "hybrid"}:
+        return text  # type: ignore[return-value]
+    if text in ("", "auto"):
+        return "hybrid"
+    if text in ("true", "1", "yes"):
+        return "stream"
+    if text in ("false", "0", "no"):
+        return "no_stream"
+    return "hybrid"
 
 
 def _coerce_log_format(value: Any) -> LogFormat:

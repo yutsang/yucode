@@ -16,7 +16,7 @@ def _read_repo_version() -> str:
         version = project.get("version")
         if isinstance(version, str) and version.strip():
             return version.strip()
-    return "0.2.3"
+    return "0.3.0"
 
 
 __version__ = _read_repo_version()

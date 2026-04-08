@@ -83,7 +83,8 @@ class AuditLogger:
         if not self._enabled or not self._workspace_root:
             return
         try:
-            audit_dir = self._workspace_root / ".yucode" / "audit"
+            from ..config.settings import state_dir
+            audit_dir = state_dir(self._workspace_root) / "audit"
             audit_dir.mkdir(parents=True, exist_ok=True)
             date_str = datetime.now().strftime("%Y-%m-%d")
             path = audit_dir / f"{date_str}.jsonl"
@@ -167,7 +168,8 @@ class MetricsCollector:
         }
 
     def save(self, workspace_root: Path, filename: str = "metrics.json") -> Path:
-        metrics_dir = workspace_root / ".yucode" / "metrics"
+        from ..config.settings import state_dir
+        metrics_dir = state_dir(workspace_root) / "metrics"
         metrics_dir.mkdir(parents=True, exist_ok=True)
         path = metrics_dir / filename
         path.write_text(json.dumps(self.to_dict(), indent=2) + "\n", encoding="utf-8")

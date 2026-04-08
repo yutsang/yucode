@@ -268,6 +268,7 @@ def _probe_provider_connection(
         model=config.provider.model,
         chat_path=config.provider.chat_path,
         stream=stream,
+        streaming_mode="stream" if stream else "no_stream",
         temperature=0.0,
         extra_headers=dict(config.provider.extra_headers),
         extra_body=dict(config.provider.extra_body),
@@ -456,13 +457,15 @@ instruction_files: []
 
 
 def handle_init(args: argparse.Namespace) -> int:
+    from ..config.settings import state_dir
     target = Path(args.target).resolve()
     target.mkdir(parents=True, exist_ok=True)
 
-    yucode_dir = target / ".yucode"
-    yucode_dir.mkdir(parents=True, exist_ok=True)
+    home_state = state_dir(target)
+    home_state.mkdir(parents=True, exist_ok=True)
+    print(f"  State dir {home_state}")
 
-    config_path = yucode_dir / "settings.yml"
+    config_path = home_state / "settings.yml"
     if not config_path.exists():
         config_path.write_text(_DEFAULT_INIT_CONFIG, encoding="utf-8")
         print(f"  Created {config_path}")
@@ -476,14 +479,14 @@ def handle_init(args: argparse.Namespace) -> int:
     else:
         print(f"  Exists  {instruction_path}")
 
-    mcp_path = yucode_dir / "mcp.yml"
+    mcp_path = home_state / "mcp.yml"
     if not mcp_path.exists():
         mcp_path.write_text("servers: []\n", encoding="utf-8")
         print(f"  Created {mcp_path}")
     else:
         print(f"  Exists  {mcp_path}")
 
-    skills_dir = yucode_dir / "skills"
+    skills_dir = home_state / "skills"
     skills_dir.mkdir(parents=True, exist_ok=True)
 
     for created in _ensure_project_support_files(target):
@@ -492,7 +495,7 @@ def handle_init(args: argparse.Namespace) -> int:
 
     print(f"\n  Project initialized at {target}")
     print("\n  Getting started:")
-    print("    1. Set YUCODE_API_KEY in .env or edit .yucode/settings.local.yml")
+    print("    1. Set YUCODE_API_KEY in .env or edit ~/.yucode/settings.yml")
     print("    2. Edit YUCODE.md to describe your project conventions")
     print(f"    3. Run: yucode chat --workspace {target}")
     print()
@@ -673,7 +676,8 @@ def _apply_cli_overrides(config: Any, args: argparse.Namespace) -> Any:
             name=old_provider.name, type=old_provider.type,
             base_url=old_provider.base_url, api_key=old_provider.api_key,
             model=args.model, chat_path=old_provider.chat_path,
-            stream=old_provider.stream, temperature=old_provider.temperature,
+            stream=old_provider.stream, streaming_mode=old_provider.streaming_mode,
+            temperature=old_provider.temperature,
             extra_headers=dict(old_provider.extra_headers),
             extra_body=dict(old_provider.extra_body),
         )
@@ -861,7 +865,7 @@ def _run_interactive(args: argparse.Namespace) -> int:
         session_info=session_info,
     ))
 
-    handler = _InteractiveEventHandler(streaming=config.provider.stream)
+    handler = _InteractiveEventHandler(streaming=config.provider.streaming_mode != "no_stream")
 
     while True:
         try:
@@ -958,6 +962,7 @@ def _handle_slash_command_interactive(command: str, arguments: str, config: Any,
         print(f"  {DIM}provider{RESET}     {config.provider.name}/{config.provider.model}")
         print(f"  {DIM}workspace{RESET}    {workspace}")
         print(f"  {DIM}permissions{RESET}  {config.runtime.permission_mode}")
+        print(f"  {DIM}streaming{RESET}    {config.provider.streaming_mode}")
         print(f"  {DIM}tools{RESET}        {len(runtime.tools.list_names())}")
         print(f"  {DIM}mcp servers{RESET}  {len(config.mcp)}")
         print(f"  {DIM}messages{RESET}     {len(runtime.session.messages)}")
@@ -1103,7 +1108,8 @@ def _handle_slash_command_interactive(command: str, arguments: str, config: Any,
                 name=config.provider.name, type=config.provider.type,
                 base_url=config.provider.base_url, api_key=config.provider.api_key,
                 model=new_model, chat_path=config.provider.chat_path,
-                stream=config.provider.stream, temperature=config.provider.temperature,
+                stream=config.provider.stream, streaming_mode=config.provider.streaming_mode,
+                temperature=config.provider.temperature,
                 extra_headers=dict(config.provider.extra_headers),
                 extra_body=dict(config.provider.extra_body),
             )
@@ -1119,9 +1125,10 @@ def _handle_slash_command_interactive(command: str, arguments: str, config: Any,
             print(render_success(f"Model switched: {old_model} → {new_model}"))
         else:
             print(render_info(f"Current model: {BOLD}{config.provider.model}{RESET}"))
-            print(f"  {DIM}provider{RESET}  {config.provider.name}")
-            print(f"  {DIM}base_url{RESET}  {config.provider.base_url}")
-            print(f"  {DIM}stream{RESET}    {config.provider.stream}")
+            print(f"  {DIM}provider{RESET}        {config.provider.name}")
+            print(f"  {DIM}base_url{RESET}        {config.provider.base_url}")
+            print(f"  {DIM}stream{RESET}          {config.provider.stream}")
+            print(f"  {DIM}streaming_mode{RESET}  {config.provider.streaming_mode}")
             print(f"\n  {DIM}Usage: /model <model-name> to switch{RESET}")
     elif command == "version":
         from .. import __version__
@@ -1496,11 +1503,12 @@ def handle_doctor(args: argparse.Namespace) -> int:
         "summary": "API key configured" if api_key_ok else "No API key found (set YUCODE_API_KEY or configure in settings)",
     })
 
-    yucode_dir = workspace / ".yucode"
+    from ..config.settings import state_dir
+    yucode_state = state_dir(workspace)
     checks.append({
-        "name": "workspace_init",
-        "status": "ok" if yucode_dir.is_dir() else "missing",
-        "summary": f".yucode/ at {yucode_dir}" if yucode_dir.is_dir() else f"No .yucode/ directory at {workspace}",
+        "name": "state_dir",
+        "status": "ok" if yucode_state.is_dir() else "info",
+        "summary": f"State directory at {yucode_state}" if yucode_state.is_dir() else f"State directory will be created at {yucode_state}",
     })
 
     if config and config.mcp:

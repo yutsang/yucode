@@ -468,7 +468,8 @@ class AgentRuntime:
 
     def _archive_before_compact(self) -> None:
         try:
-            archives_dir = self.workspace_root / ".yucode" / "archives"
+            from ..config.settings import state_dir
+            archives_dir = state_dir(self.workspace_root) / "archives"
             archives_dir.mkdir(parents=True, exist_ok=True)
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             sid = self.session.session_id if hasattr(self.session, "session_id") else "unknown"
@@ -495,7 +496,8 @@ class AgentRuntime:
         return self.session.save_to_workspace(self.workspace_root, sid)
 
     def checkpoint(self, label: str = "") -> Path:
-        checkpoints_dir = self.workspace_root / ".yucode" / "checkpoints"
+        from ..config.settings import state_dir
+        checkpoints_dir = state_dir(self.workspace_root) / "checkpoints"
         checkpoints_dir.mkdir(parents=True, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         cp_path = checkpoints_dir / f"checkpoint_{ts}.json"

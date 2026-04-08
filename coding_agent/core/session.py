@@ -205,7 +205,8 @@ class Session:
 
     @staticmethod
     def sessions_dir(workspace: Path) -> Path:
-        return workspace / ".yucode" / "sessions"
+        from ..config.settings import state_dir
+        return state_dir(workspace) / "sessions"
 
     def save_to_workspace(self, workspace: Path, session_id: str) -> Path:
         path = self.sessions_dir(workspace) / f"{session_id}.json"

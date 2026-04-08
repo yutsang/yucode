@@ -216,8 +216,9 @@ class PluginManager:
     MANIFEST_FILENAME = "plugin.json"
 
     def __init__(self, workspace_root: Path) -> None:
+        from ..config.settings import state_dir
         self.workspace_root = workspace_root.resolve()
-        self._plugins_dir = self.workspace_root / ".yucode" / "plugins"
+        self._plugins_dir = state_dir(self.workspace_root) / "plugins"
         self._registry_path = self._plugins_dir / "registry.json"
 
     @property

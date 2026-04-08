@@ -74,7 +74,8 @@ def misc_tools(registry: ToolRegistry) -> list[ToolDefinition]:
 
 
 def _todo_write(registry: ToolRegistry, args: dict[str, Any]) -> str:
-    todos_path = registry.workspace_root / ".yucode" / "todos.json"
+    from ..config.settings import state_dir
+    todos_path = state_dir(registry.workspace_root) / "todos.json"
     todos_path.parent.mkdir(parents=True, exist_ok=True)
     incoming = args["todos"]
     merge = bool(args.get("merge", True))

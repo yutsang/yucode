@@ -265,7 +265,8 @@ def run_git_worktree(workspace: Path, action: str = "list") -> str:
 
 
 def export_session(workspace: Path, messages: list, fmt: str = "md") -> str:
-    export_dir = workspace / ".yucode" / "exports"
+    from ..config.settings import state_dir
+    export_dir = state_dir(workspace) / "exports"
     export_dir.mkdir(parents=True, exist_ok=True)
     import time
     ts = time.strftime("%Y%m%d-%H%M%S")

@@ -3,6 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 
 from coding_agent.config import AppConfig, ProviderConfig, RuntimeOptions
+from coding_agent.config.settings import (
+    _coerce_streaming_mode,
+    state_dir,
+    workspace_key,
+)
 from coding_agent.core.session import AssistantResponse, Usage
 from coding_agent.interface import cli
 from coding_agent.interface.cli import (
@@ -90,3 +95,61 @@ def test_probe_provider_connection_reports_stream_warning(tmp_path: Path, monkey
     assert ok is False
     assert status == "warning"
     assert "provider.stream: false" in message
+
+
+# ---------------------------------------------------------------------------
+# workspace_key / state_dir
+# ---------------------------------------------------------------------------
+
+
+def test_workspace_key_is_deterministic(tmp_path: Path) -> None:
+    k1 = workspace_key(tmp_path)
+    k2 = workspace_key(tmp_path)
+    assert k1 == k2
+    assert len(k1) == 12
+
+
+def test_workspace_key_different_for_different_paths(tmp_path: Path) -> None:
+    a = tmp_path / "project_a"
+    b = tmp_path / "project_b"
+    a.mkdir()
+    b.mkdir()
+    assert workspace_key(a) != workspace_key(b)
+
+
+def test_state_dir_returns_home_based_path(tmp_path: Path, monkeypatch) -> None:
+    fake_home = tmp_path / "fake_home"
+    fake_home.mkdir()
+    monkeypatch.setattr("coding_agent.config.settings._HOME_YUCODE", fake_home / ".yucode")
+    project = tmp_path / "my_project"
+    project.mkdir()
+    sd = state_dir(project)
+    assert str(sd).startswith(str(fake_home / ".yucode" / "projects"))
+
+
+# ---------------------------------------------------------------------------
+# _coerce_streaming_mode
+# ---------------------------------------------------------------------------
+
+
+def test_coerce_streaming_mode_valid_values() -> None:
+    assert _coerce_streaming_mode("stream") == "stream"
+    assert _coerce_streaming_mode("no_stream") == "no_stream"
+    assert _coerce_streaming_mode("hybrid") == "hybrid"
+
+
+def test_coerce_streaming_mode_empty_defaults_to_hybrid() -> None:
+    assert _coerce_streaming_mode("") == "hybrid"
+
+
+def test_coerce_streaming_mode_boolean_strings() -> None:
+    assert _coerce_streaming_mode("true") == "stream"
+    assert _coerce_streaming_mode("false") == "no_stream"
+
+
+def test_coerce_streaming_mode_auto_maps_to_hybrid() -> None:
+    assert _coerce_streaming_mode("auto") == "hybrid"
+
+
+def test_coerce_streaming_mode_unknown_defaults_to_hybrid() -> None:
+    assert _coerce_streaming_mode("foobar") == "hybrid"

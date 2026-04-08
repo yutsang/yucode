@@ -13,6 +13,7 @@ from .settings import (
     ProviderConfig,
     RuntimeOptions,
     SandboxOptions,
+    StreamingMode,
     ToolOptions,
     VscodeOptions,
     add_mcp_server_to_config,
@@ -25,6 +26,8 @@ from .settings import (
     remove_mcp_server_from_config,
     resolve_config_path,
     set_api_key,
+    state_dir,
+    workspace_key,
 )
 from .simple_yaml import YamlError, dump_yaml, load_yaml
 
@@ -41,6 +44,7 @@ __all__ = [
     "ProviderConfig",
     "RuntimeOptions",
     "SandboxOptions",
+    "StreamingMode",
     "ToolOptions",
     "VscodeOptions",
     "YamlError",
@@ -56,4 +60,6 @@ __all__ = [
     "remove_mcp_server_from_config",
     "resolve_config_path",
     "set_api_key",
+    "state_dir",
+    "workspace_key",
 ]

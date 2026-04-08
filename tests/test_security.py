@@ -27,16 +27,26 @@ def test_bash_safety_warns_force_push() -> None:
     assert verdict.warning is True
 
 
-def test_audit_logger_writes_jsonl(tmp_path: Path) -> None:
+def test_audit_logger_writes_jsonl(tmp_path: Path, monkeypatch) -> None:
+    fake_state = tmp_path / ".state"
+    monkeypatch.setattr(
+        "coding_agent.config.settings.state_dir",
+        lambda _ws: fake_state,
+    )
     logger = AuditLogger(tmp_path, enabled=True)
     logger.log({"type": "security_event", "event_type": "secret_redacted"})
-    files = sorted((tmp_path / ".yucode" / "audit").glob("*.jsonl"))
+    files = sorted((fake_state / "audit").glob("*.jsonl"))
     assert len(files) == 1
     content = files[0].read_text(encoding="utf-8")
     assert "secret_redacted" in content
 
 
-def test_metrics_collector_records_security_events(tmp_path: Path) -> None:
+def test_metrics_collector_records_security_events(tmp_path: Path, monkeypatch) -> None:
+    fake_state = tmp_path / ".state"
+    monkeypatch.setattr(
+        "coding_agent.config.settings.state_dir",
+        lambda _ws: fake_state,
+    )
     metrics = MetricsCollector(audit_logger=AuditLogger(tmp_path, enabled=True))
     metrics.record_security_event("permission_denied", "bash", "blocked")
     assert len(metrics.security_events) == 1

@@ -24,7 +24,7 @@ def _get_version() -> str:
         from .. import __version__
         return __version__
     except Exception:
-        return "0.2.3"
+        return "0.3.0"
 
 
 # ---- Color theme ------------------------------------------------------------

@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.0] - 2026-04-08
+
+### Added
+- **Hybrid provider mode** (`streaming_mode: hybrid`): automatically retries with non-streaming when streaming returns an empty response, resolving connectivity failures on providers with unreliable SSE support
+- `streaming_mode` config field with values `stream`, `no_stream`, and `hybrid` (default); backward-compatible with existing `provider.stream` boolean
+- Home-based state management: sessions, audit logs, metrics, todos, exports, plugins, archives, and checkpoints now live under `~/.yucode/projects/<workspace_key>/` instead of `<workspace>/.yucode/`
+- `state_dir()` and `workspace_key()` helpers in config for deterministic per-project state paths
+- 12 new tests covering hybrid fallback, streaming mode coercion, workspace key generation, and state directory resolution
+
+### Changed
+- Provider `complete()` refactored into `complete()` dispatcher + `_do_complete()` so both modes share the same HTTP/retry logic
+- `yucode doctor` reports the home-based state directory instead of checking for workspace `.yucode/`
+- `yucode init` creates state under `~/.yucode/projects/` instead of `<target>/.yucode/`
+- Default `streaming_mode` is `hybrid` in bundled config and new installations
+
+### Fixed
+- Providers that silently fail on streaming now automatically retry via non-streaming in hybrid mode instead of returning an empty response
+
 ## [0.2.3] - 2026-04-08
 
 ### Added

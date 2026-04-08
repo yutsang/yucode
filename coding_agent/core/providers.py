@@ -116,11 +116,38 @@ class OpenAICompatibleProvider:
         tools: list[dict[str, Any]],
         stream_callback: StreamCallback | None = None,
     ) -> AssistantResponse:
+        use_stream = self.config.streaming_mode != "no_stream"
+        response = self._do_complete(messages, tools, stream=use_stream, stream_callback=stream_callback)
+
+        if (
+            self.config.streaming_mode == "hybrid"
+            and use_stream
+            and not response.text
+            and not response.tool_calls
+        ):
+            _log.info("Hybrid mode: streaming returned empty response, retrying without streaming.")
+            if stream_callback:
+                stream_callback({
+                    "type": "fallback",
+                    "message": "Streaming returned no usable response; retrying without streaming.",
+                })
+            response = self._do_complete(messages, tools, stream=False, stream_callback=stream_callback)
+
+        return response
+
+    def _do_complete(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        stream: bool,
+        stream_callback: StreamCallback | None = None,
+    ) -> AssistantResponse:
         body: dict[str, Any] = {
             "model": self.config.model,
             "messages": messages,
             "temperature": self.config.temperature,
-            "stream": self.config.stream,
+            "stream": stream,
         }
         if tools:
             body["tools"] = tools
@@ -129,18 +156,19 @@ class OpenAICompatibleProvider:
             body.update(self.config.extra_body)
         payload = json.dumps(body).encode("utf-8")
         url = self._build_url()
+        headers = self._headers(stream=stream)
 
         last_error: Exception | None = None
         for attempt in range(_MAX_RETRIES):
             request = urllib.request.Request(
                 url,
                 data=payload,
-                headers=self._headers(),
+                headers=headers,
                 method="POST",
             )
             try:
                 with urllib.request.urlopen(request, timeout=90) as response:
-                    if self.config.stream:
+                    if stream:
                         return self._parse_streaming_response(response, stream_callback)
                     raw_body = response.read().decode("utf-8")
                     try:
@@ -173,10 +201,11 @@ class OpenAICompatibleProvider:
             return self.config.chat_path
         return f"{self.config.base_url}{self.config.chat_path}"
 
-    def _headers(self) -> dict[str, str]:
+    def _headers(self, *, stream: bool | None = None) -> dict[str, str]:
+        use_stream = stream if stream is not None else self.config.stream
         headers = {
             "Content-Type": "application/json",
-            "Accept": "text/event-stream" if self.config.stream else "application/json",
+            "Accept": "text/event-stream" if use_stream else "application/json",
         }
         if self.config.api_key:
             headers["Authorization"] = f"Bearer {self.config.api_key}"
