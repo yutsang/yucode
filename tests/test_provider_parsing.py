@@ -19,15 +19,16 @@ from typing import Any
 
 import pytest
 
+from coding_agent.config import ProviderConfig
 from coding_agent.core.providers import (
     OpenAICompatibleProvider,
     _extract_content_text,
+    _extract_envelope_detail,
     _extract_usage,
+    _looks_like_openai_response,
     _merge_usage_max,
 )
 from coding_agent.core.session import Usage
-from coding_agent.config import ProviderConfig
-
 
 # ---------------------------------------------------------------------------
 # _extract_content_text
@@ -293,7 +294,7 @@ class TestParseStreamingResponse:
         with caplog.at_level(logging.WARNING, logger="yucode.providers"):
             resp = provider._parse_streaming_response(stream, None)
         assert resp.text == ""
-        assert any("zero data chunks" in r.message.lower() for r in caplog.records)
+        assert any("zero sse data chunks" in r.message.lower() for r in caplog.records)
 
     def test_empty_stream_logs_warning(self, caplog):
         provider = _make_provider(stream=True)
@@ -301,7 +302,7 @@ class TestParseStreamingResponse:
         with caplog.at_level(logging.WARNING, logger="yucode.providers"):
             resp = provider._parse_streaming_response(stream, None)
         assert resp.text == ""
-        assert any("zero data chunks" in r.message.lower() for r in caplog.records)
+        assert any("zero sse data chunks" in r.message.lower() for r in caplog.records)
 
     def test_malformed_json_in_sse_skipped(self, caplog):
         provider = _make_provider(stream=True)
@@ -440,3 +441,97 @@ class TestHybridFallback:
         resp = provider.complete([], [])
         assert resp.text == ""
         assert call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# _looks_like_openai_response / _extract_envelope_detail
+# ---------------------------------------------------------------------------
+
+
+class TestLooksLikeOpenaiResponse:
+    def test_standard_openai_payload(self):
+        assert _looks_like_openai_response({"id": "x", "choices": [], "usage": {}})
+
+    def test_minimal_choices_only(self):
+        assert _looks_like_openai_response({"choices": [{}]})
+
+    def test_gateway_envelope_not_openai(self):
+        assert not _looks_like_openai_response({"flag": 1, "code": 0, "msg": "ok", "ts": 123})
+
+    def test_empty_payload_not_openai(self):
+        assert not _looks_like_openai_response({})
+
+    def test_random_keys_not_openai(self):
+        assert not _looks_like_openai_response({"status": "healthy", "version": "1.0"})
+
+
+class TestExtractEnvelopeDetail:
+    def test_msg_key(self):
+        assert _extract_envelope_detail({"msg": "invalid token"}) == "invalid token"
+
+    def test_message_key(self):
+        assert _extract_envelope_detail({"message": "not found"}) == "not found"
+
+    def test_error_dict_with_message(self):
+        assert _extract_envelope_detail({"error": {"message": "bad key"}}) == "bad key"
+
+    def test_error_string(self):
+        assert _extract_envelope_detail({"error": "something broke"}) == "something broke"
+
+    def test_no_detail(self):
+        assert _extract_envelope_detail({"flag": 1, "code": 0}) == ""
+
+
+# ---------------------------------------------------------------------------
+# Non-OpenAI envelope detection in _parse_response_payload
+# ---------------------------------------------------------------------------
+
+
+class TestNonOpenaiEnvelopeDetection:
+    def test_gateway_envelope_raises(self):
+        provider = _make_provider()
+        payload = {"flag": 1, "code": 0, "msg": "invalid api key", "ts": 1234567890}
+        with pytest.raises(RuntimeError, match="non-OpenAI response"):
+            provider._parse_response_payload(payload, None)
+
+    def test_gateway_envelope_includes_server_message(self):
+        provider = _make_provider()
+        payload = {"flag": 1, "code": 403, "msg": "auth failed", "ts": 99}
+        with pytest.raises(RuntimeError, match="auth failed"):
+            provider._parse_response_payload(payload, None)
+
+    def test_gateway_envelope_includes_url(self):
+        provider = _make_provider(base_url="https://my-api.example.com", chat_path="/v1/chat")
+        payload = {"status": "error", "detail": "not found"}
+        with pytest.raises(RuntimeError, match="https://my-api.example.com/v1/chat"):
+            provider._parse_response_payload(payload, None)
+
+    def test_empty_choices_with_openai_keys_warns_not_raises(self, caplog):
+        """An OpenAI-shaped payload with empty choices warns but does not raise."""
+        provider = _make_provider()
+        payload = {"id": "chatcmpl-xxx", "object": "chat.completion", "choices": []}
+        with caplog.at_level(logging.WARNING, logger="yucode.providers"):
+            resp = provider._parse_response_payload(payload, None)
+        assert resp.text == ""
+        assert any("no choices" in r.message.lower() for r in caplog.records)
+
+    def test_gateway_envelope_via_stream_callback(self):
+        provider = _make_provider()
+        payload = {"code": -1, "msg": "rate limited"}
+        events: list[dict] = []
+        with pytest.raises(RuntimeError, match="rate limited"):
+            provider._parse_response_payload(payload, events.append)
+
+
+class TestStreamingZeroChunksDiagnostics:
+    def test_zero_chunks_warning_includes_url(self):
+        provider = _make_provider(
+            base_url="https://my-provider.com",
+            chat_path="/chat/completions",
+            stream=True,
+        )
+        stream = io.BytesIO(b"data: [DONE]\n\n")
+        events: list[dict] = []
+        provider._parse_streaming_response(stream, events.append)
+        warnings = [e for e in events if e.get("type") == "warning"]
+        assert any("https://my-provider.com/chat/completions" in w["warning"] for w in warnings)

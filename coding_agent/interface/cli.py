@@ -273,18 +273,21 @@ def _probe_provider_connection(
         extra_headers=dict(config.provider.extra_headers),
         extra_body=dict(config.provider.extra_body),
     )
+    provider = OpenAICompatibleProvider(test_provider)
+    effective_url = provider._build_url()  # noqa: SLF001
+    mode_name = "Streaming" if stream else "Non-streaming"
+
     events: list[dict[str, Any]] = []
     try:
-        response = OpenAICompatibleProvider(test_provider).complete(
+        response = provider.complete(
             [{"role": "user", "content": "Reply with exactly OK."}],
             [],
             stream_callback=events.append,
         )
     except Exception as exc:  # noqa: BLE001
-        return False, "error", str(exc)
+        return False, "error", f"{mode_name} request to {effective_url} failed: {exc}"
 
     text = (response.text or "").strip()
-    mode_name = "Streaming" if stream else "Non-streaming"
     if text:
         return True, "ok", f"{mode_name} request succeeded: {text[:80]}"
     if response.tool_calls:
@@ -300,10 +303,12 @@ def _probe_provider_connection(
         return False, "warning", f"{mode_name} request returned no usable text. {summary}"
     if stream:
         return False, "warning", (
-            f"{mode_name} request completed but returned no text or usage. "
+            f"{mode_name} request to {effective_url} completed but returned no text or usage. "
             "This provider may not support SSE streaming; try setting `provider.stream: false`."
         )
-    return False, "warning", f"{mode_name} request completed but returned no text."
+    return False, "warning", (
+        f"{mode_name} request to {effective_url} completed but returned no text."
+    )
 
 
 def handle_init_config(args: argparse.Namespace) -> int:

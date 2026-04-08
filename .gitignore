@@ -47,3 +47,4 @@ htmlcov/
 
 # Reference / vendored (not part of this package)
 claw-code-main/
+python-pptx-hr/

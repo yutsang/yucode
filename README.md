@@ -215,11 +215,12 @@ flowchart TD
 
 If `yucode chat` prints a blank answer with all-zero token usage:
 
-1. **Run diagnostics** — `yucode doctor --workspace .` checks config, API key, and provider connectivity.
+1. **Run diagnostics** — `yucode doctor --workspace .` checks config, API key, and provider connectivity. If the endpoint returns a non-OpenAI JSON schema (e.g. a gateway envelope), doctor will now report the exact URL and payload keys to help you pinpoint the misconfiguration.
 2. **Check your API key** — set the `YUCODE_API_KEY` environment variable or add `api_key` to `~/.yucode/settings.yml` (or `.yucode/settings.local.yml` in the project).
-3. **Check `provider.base_url` and `provider.model`** — the URL must be the base endpoint (e.g. `https://api.deepseek.com`) and the model name must be valid for that provider.
-4. **Try disabling streaming** — some providers do not support SSE streaming. The default `streaming_mode: hybrid` handles this automatically, but you can also set `provider.streaming_mode: no_stream` (or the legacy `provider.stream: false`) in your config.
-5. **Use a clean virtualenv** — installing yucode into a global Python environment can cause unrelated `pip` dependency conflicts (e.g. `camelot-py`, `tableauhyperapi`). These warnings are cosmetic and do not affect yucode, but a clean virtualenv avoids confusion:
+3. **Check `provider.base_url` and `provider.chat_path`** — `base_url` must be the API origin (e.g. `https://api.deepseek.com`) and `chat_path` must point at the chat completions endpoint (default `/chat/completions`). A common mistake is pointing `base_url` at a gateway root URL, status page, or a non-completions path, which returns a valid HTTP 200 response but with a non-OpenAI JSON body (e.g. `{"flag":...,"code":...,"msg":...}`).
+4. **Check `provider.model`** — the model name must be valid for your provider. An unrecognised model can produce an empty completion with zero tokens.
+5. **Try disabling streaming** — some providers do not support SSE streaming. The default `streaming_mode: hybrid` handles this automatically, but you can also set `provider.streaming_mode: no_stream` (or the legacy `provider.stream: false`) in your config.
+6. **Use a clean virtualenv** — installing yucode into a global Python environment can cause unrelated `pip` dependency conflicts (e.g. `camelot-py`, `tableauhyperapi`). These warnings are cosmetic and do not affect yucode, but a clean virtualenv avoids confusion:
 
 ```bash
 python -m venv .venv
@@ -237,7 +238,7 @@ YuCode uses the OpenAI-compatible `/chat/completions` API. It recognises both Op
 | OpenAI | `string` | `prompt_tokens` / `completion_tokens` |
 | Anthropic / block | `[{"type":"text","text":"..."}]` | `input_tokens` / `output_tokens` |
 
-If your provider returns a different payload format, open an issue.
+If your provider returns a different payload format (e.g. keys like `flag`, `code`, `msg`), YuCode will now raise a clear error identifying the endpoint and payload shape instead of silently returning an empty response. Check that `base_url` and `chat_path` point at the actual chat completions endpoint, not a gateway or status route. If the format is genuinely a supported provider, open an issue.
 
 ## Documentation
 

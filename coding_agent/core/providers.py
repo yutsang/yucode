@@ -21,6 +21,8 @@ _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 StreamCallback = Callable[[dict[str, Any]], None]
 
+_OPENAI_TOPLEVEL_KEYS = {"id", "object", "choices", "model", "usage", "created"}
+
 
 def _emit_warning(
     stream_callback: StreamCallback | None,
@@ -32,6 +34,24 @@ def _emit_warning(
         stream_callback({"type": "warning", "warning": message, "category": category})
         return
     _log.warning(message)
+
+
+def _extract_envelope_detail(payload: dict[str, Any]) -> str:
+    """Pull a human-readable hint from a non-OpenAI JSON envelope."""
+    for key in ("msg", "message", "error", "detail", "reason"):
+        val = payload.get(key)
+        if isinstance(val, str) and val:
+            return val
+        if isinstance(val, dict):
+            inner = val.get("message") or val.get("msg") or val.get("detail")
+            if isinstance(inner, str) and inner:
+                return inner
+    return ""
+
+
+def _looks_like_openai_response(payload: dict[str, Any]) -> bool:
+    """Return True if *payload* has at least one typical chat-completions key."""
+    return bool(payload.keys() & _OPENAI_TOPLEVEL_KEYS)
 
 
 def _extract_content_text(content: Any) -> str:
@@ -219,6 +239,15 @@ class OpenAICompatibleProvider:
     ) -> AssistantResponse:
         choices = payload.get("choices", [])
         if not choices:
+            if not _looks_like_openai_response(payload):
+                detail = _extract_envelope_detail(payload)
+                hint = f" Server message: {detail}" if detail else ""
+                raise RuntimeError(
+                    f"The provider endpoint ({self._build_url()}) returned a non-OpenAI "
+                    f"response. Payload keys: {sorted(payload.keys())}.{hint} "
+                    "This usually means base_url or chat_path is pointing at a "
+                    "gateway or wrong endpoint instead of the chat completions API."
+                )
             _emit_warning(
                 stream_callback,
                 "Provider response contained no choices. "
@@ -297,9 +326,11 @@ class OpenAICompatibleProvider:
         if chunk_count == 0:
             _emit_warning(
                 stream_callback,
-                "Streaming response contained zero data chunks. "
-                "The provider may not support streaming, or the stream was empty. "
-                "Try setting provider.stream to false in your config.",
+                f"Streaming response from {self._build_url()} contained zero SSE "
+                "data chunks. Either the endpoint does not support streaming, or "
+                "base_url/chat_path is pointing at a non-chat-completions URL. "
+                "Try setting provider.streaming_mode to no_stream, or check that "
+                "your base_url and chat_path are correct.",
                 category="provider_empty_stream",
             )
 

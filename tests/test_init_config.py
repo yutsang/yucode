@@ -153,3 +153,68 @@ def test_coerce_streaming_mode_auto_maps_to_hybrid() -> None:
 
 def test_coerce_streaming_mode_unknown_defaults_to_hybrid() -> None:
     assert _coerce_streaming_mode("foobar") == "hybrid"
+
+
+# ---------------------------------------------------------------------------
+# _probe_provider_connection — non-OpenAI envelope
+# ---------------------------------------------------------------------------
+
+
+def test_probe_provider_connection_reports_gateway_error(tmp_path: Path, monkeypatch) -> None:
+    """When the provider raises RuntimeError (non-OpenAI envelope), doctor
+    should report an error with the effective URL."""
+    config = AppConfig(
+        provider=ProviderConfig(
+            name="test",
+            api_key="key",
+            base_url="https://gateway.example.com",
+            model="demo-model",
+            chat_path="/v1/chat/completions",
+            stream=True,
+        ),
+        runtime=RuntimeOptions(),
+    )
+
+    monkeypatch.setattr(cli, "load_app_config", lambda *args, **kwargs: config)
+
+    def fake_complete(self, messages, tools, stream_callback=None):
+        raise RuntimeError(
+            "The provider endpoint (https://gateway.example.com/v1/chat/completions) "
+            "returned a non-OpenAI response. Payload keys: ['code', 'flag', 'msg', 'ts']. "
+            "Server message: auth failed"
+        )
+
+    monkeypatch.setattr(cli.OpenAICompatibleProvider, "complete", fake_complete)
+
+    ok, status, message = _probe_provider_connection(None, workspace=tmp_path, stream=False)
+    assert ok is False
+    assert status == "error"
+    assert "gateway.example.com" in message
+    assert "non-OpenAI" in message
+
+
+def test_probe_provider_connection_error_includes_url(tmp_path: Path, monkeypatch) -> None:
+    """Doctor error messages now include the effective URL."""
+    config = AppConfig(
+        provider=ProviderConfig(
+            name="test",
+            api_key="key",
+            base_url="https://example.com",
+            model="demo-model",
+            chat_path="/chat/completions",
+            stream=True,
+        ),
+        runtime=RuntimeOptions(),
+    )
+
+    monkeypatch.setattr(cli, "load_app_config", lambda *args, **kwargs: config)
+
+    def fake_complete(self, messages, tools, stream_callback=None):
+        raise ConnectionError("Connection refused")
+
+    monkeypatch.setattr(cli.OpenAICompatibleProvider, "complete", fake_complete)
+
+    ok, status, message = _probe_provider_connection(None, workspace=tmp_path, stream=False)
+    assert ok is False
+    assert status == "error"
+    assert "example.com/chat/completions" in message

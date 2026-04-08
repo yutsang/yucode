@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib as _hashlib
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -19,9 +20,6 @@ BUNDLED_CONFIG_PATH = Path(__file__).resolve().with_name("config.yml")
 DEFAULT_CONFIG_PATH = Path.home() / ".yucode" / "settings.yml"
 
 _API_KEY_ENV_VARS = ("YUCODE_API_KEY",)
-
-
-import hashlib as _hashlib
 
 _HOME_YUCODE = Path.home() / ".yucode"
 

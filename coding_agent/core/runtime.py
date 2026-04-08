@@ -322,9 +322,8 @@ class AgentRuntime:
                         event_callback({
                             "type": "error",
                             "error": (
-                                "Provider returned an empty response with 0 tokens. "
-                                "Check your provider configuration (base_url, model, api_key) "
-                                "or run `yucode doctor`."
+                                "The provider returned an empty response with 0 tokens. "
+                                "This usually means your provider configuration is wrong."
                             ),
                             "category": "empty_response",
                         })
