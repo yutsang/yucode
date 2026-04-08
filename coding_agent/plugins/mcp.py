@@ -179,7 +179,7 @@ class StdioMcpClient:
                     {
                         "protocolVersion": "2024-11-05",
                         "capabilities": {},
-                        "clientInfo": {"name": "yucode-agent", "version": "0.2.2"},
+                        "clientInfo": {"name": "yucode-agent", "version": "0.2.3"},
                     },
                 )
                 self._initialized = True

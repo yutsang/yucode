@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.3] - 2026-04-08
+
+### Added
+- Added doctor smoke tests that verify provider probing reports streaming failures more clearly
+
+### Changed
+- Upgraded `yucode doctor` to probe both non-streaming and streaming provider modes instead of only checking whether an API key exists
+
+### Fixed
+- Reduced duplicate warning noise during `yucode chat` failures by routing provider diagnostics through CLI events
+- Improved diagnostics for providers that pass basic config checks but fail to return usable streaming output
+
 ## [0.2.2] - 2026-04-08
 
 ### Added

@@ -22,6 +22,18 @@ _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 StreamCallback = Callable[[dict[str, Any]], None]
 
 
+def _emit_warning(
+    stream_callback: StreamCallback | None,
+    message: str,
+    *,
+    category: str,
+) -> None:
+    if stream_callback:
+        stream_callback({"type": "warning", "warning": message, "category": category})
+        return
+    _log.warning(message)
+
+
 def _extract_content_text(content: Any) -> str:
     """Extract plain text from ``message.content`` regardless of shape.
 
@@ -178,10 +190,11 @@ class OpenAICompatibleProvider:
     ) -> AssistantResponse:
         choices = payload.get("choices", [])
         if not choices:
-            _log.warning(
+            _emit_warning(
+                stream_callback,
                 "Provider response contained no choices. "
-                "Payload keys: %s. Check that base_url, chat_path, and model are correct.",
-                list(payload.keys()),
+                f"Payload keys: {list(payload.keys())}. Check that base_url, chat_path, and model are correct.",
+                category="provider_no_choices",
             )
         choice = choices[0] if choices else {}
         message = choice.get("message", {})
@@ -190,10 +203,12 @@ class OpenAICompatibleProvider:
         usage = _extract_usage(payload.get("usage", {}))
 
         if not text and not tool_calls:
-            _log.warning(
+            _emit_warning(
+                stream_callback,
                 "Provider returned an empty response (no text, no tool calls). "
                 "This usually means the provider, model, or API key is misconfigured. "
-                "Run `yucode doctor --workspace .` to diagnose."
+                "Run `yucode doctor --workspace .` to diagnose.",
+                category="provider_empty_response",
             )
 
         if stream_callback and text:
@@ -251,10 +266,12 @@ class OpenAICompatibleProvider:
                 _merge_usage_max(usage, raw_usage)
 
         if chunk_count == 0:
-            _log.warning(
+            _emit_warning(
+                stream_callback,
                 "Streaming response contained zero data chunks. "
                 "The provider may not support streaming, or the stream was empty. "
-                "Try setting provider.stream to false in your config."
+                "Try setting provider.stream to false in your config.",
+                category="provider_empty_stream",
             )
 
         tool_calls = [
@@ -263,9 +280,11 @@ class OpenAICompatibleProvider:
         ]
         final_text = "".join(text_parts)
         if not final_text and not tool_calls:
-            _log.warning(
+            _emit_warning(
+                stream_callback,
                 "Provider streaming completed with no text and no tool calls. "
-                "Run `yucode doctor --workspace .` to check your configuration."
+                "Run `yucode doctor --workspace .` to check your configuration.",
+                category="provider_streaming_empty_response",
             )
         return AssistantResponse(text=final_text, tool_calls=tool_calls, usage=usage)
 

@@ -238,17 +238,27 @@ def _has_configured_api_key(config_path: str | None, workspace: Path | None = No
 
 
 def _test_api_connection(config_path: str | None, workspace: Path | None = None) -> tuple[bool, str]:
+    ok, _, message = _probe_provider_connection(config_path, workspace=workspace, stream=False)
+    return ok, message
+
+
+def _probe_provider_connection(
+    config_path: str | None,
+    workspace: Path | None = None,
+    *,
+    stream: bool,
+) -> tuple[bool, str, str]:
     try:
         config = load_app_config(config_path, workspace=workspace)
     except Exception as exc:  # noqa: BLE001
-        return False, f"Could not load config: {exc}"
+        return False, "error", f"Could not load config: {exc}"
 
     if not config.provider.api_key.strip():
-        return False, "No API key configured via env or config."
+        return False, "error", "No API key configured via env or config."
     if not config.provider.base_url.strip():
-        return False, "No provider base_url configured."
+        return False, "error", "No provider base_url configured."
     if not config.provider.model.strip():
-        return False, "No provider model configured."
+        return False, "error", "No provider model configured."
 
     test_provider = ProviderConfig(
         name=config.provider.name,
@@ -257,24 +267,42 @@ def _test_api_connection(config_path: str | None, workspace: Path | None = None)
         api_key=config.provider.api_key,
         model=config.provider.model,
         chat_path=config.provider.chat_path,
-        stream=False,
+        stream=stream,
         temperature=0.0,
         extra_headers=dict(config.provider.extra_headers),
         extra_body=dict(config.provider.extra_body),
     )
+    events: list[dict[str, Any]] = []
     try:
         response = OpenAICompatibleProvider(test_provider).complete(
             [{"role": "user", "content": "Reply with exactly OK."}],
             [],
-            stream_callback=None,
+            stream_callback=events.append,
         )
     except Exception as exc:  # noqa: BLE001
-        return False, str(exc)
+        return False, "error", str(exc)
 
     text = (response.text or "").strip()
-    if not text:
-        return True, "Provider request succeeded."
-    return True, f"Provider request succeeded: {text[:80]}"
+    mode_name = "Streaming" if stream else "Non-streaming"
+    if text:
+        return True, "ok", f"{mode_name} request succeeded: {text[:80]}"
+    if response.tool_calls:
+        return True, "warning", f"{mode_name} request returned tool calls during smoke test."
+    warnings = [e.get("warning", "") for e in events if e.get("type") == "warning"]
+    if warnings:
+        summary = warnings[0]
+        if stream:
+            return False, "warning", (
+                f"{mode_name} request returned no usable text. {summary} "
+                "Try setting `provider.stream: false`."
+            )
+        return False, "warning", f"{mode_name} request returned no usable text. {summary}"
+    if stream:
+        return False, "warning", (
+            f"{mode_name} request completed but returned no text or usage. "
+            "This provider may not support SSE streaming; try setting `provider.stream: false`."
+        )
+    return False, "warning", f"{mode_name} request completed but returned no text."
 
 
 def handle_init_config(args: argparse.Namespace) -> int:
@@ -1482,6 +1510,35 @@ def handle_doctor(args: argparse.Namespace) -> int:
             "status": "ok",
             "summary": f"MCP servers configured: {', '.join(mcp_names)}",
         })
+
+    if config:
+        probe_ok, probe_status, probe_message = _probe_provider_connection(
+            getattr(args, "config_path", None),
+            workspace=workspace,
+            stream=False,
+        )
+        checks.append({
+            "name": "provider_non_streaming",
+            "status": "ok" if probe_ok and probe_status == "ok" else probe_status,
+            "summary": probe_message,
+        })
+        if config.provider.stream:
+            stream_ok, stream_status, stream_message = _probe_provider_connection(
+                getattr(args, "config_path", None),
+                workspace=workspace,
+                stream=True,
+            )
+            checks.append({
+                "name": "provider_streaming",
+                "status": "ok" if stream_ok and stream_status == "ok" else stream_status,
+                "summary": stream_message,
+            })
+        else:
+            checks.append({
+                "name": "provider_streaming",
+                "status": "info",
+                "summary": "Streaming is disabled in config (`provider.stream: false`).",
+            })
 
     sandbox_info: dict[str, Any] = {"name": "sandbox", "status": "info"}
     try:
