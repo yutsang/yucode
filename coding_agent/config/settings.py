@@ -66,6 +66,7 @@ class ProviderConfig:
     stream: bool = True
     streaming_mode: StreamingMode = "hybrid"
     temperature: float = 0.0
+    request_timeout_seconds: int = 90
     extra_headers: dict[str, str] = field(default_factory=dict)
     extra_body: dict[str, Any] = field(default_factory=dict)
 
@@ -195,6 +196,7 @@ class AppConfig:
                 "stream": self.provider.stream,
                 "streaming_mode": self.provider.streaming_mode,
                 "temperature": self.provider.temperature,
+                "request_timeout_seconds": self.provider.request_timeout_seconds,
                 "extra_headers": dict(self.provider.extra_headers),
                 "extra_body": dict(self.provider.extra_body),
             },
@@ -426,6 +428,10 @@ def app_config_from_dict(raw: dict[str, Any]) -> AppConfig:
         stream=bool(provider_raw.get("stream", True)),
         streaming_mode=_coerce_streaming_mode(provider_raw.get("streaming_mode", "")),
         temperature=float(provider_raw.get("temperature", 0.0)),
+        request_timeout_seconds=_coerce_positive_int(
+            provider_raw.get("request_timeout_seconds", 90),
+            "provider.request_timeout_seconds",
+        ),
         extra_headers=_coerce_string_dict(provider_raw.get("extra_headers", {}), "provider.extra_headers"),
         extra_body=_expect_dict(provider_raw.get("extra_body", {}), "provider.extra_body"),
     )

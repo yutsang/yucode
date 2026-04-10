@@ -38,6 +38,10 @@ _EXFILTRATION_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"wget\s+.*\|\s*(?:ba)?sh", re.I), "piping wget output to shell is dangerous"),
     (re.compile(r"curl\s+.*\|\s*python", re.I), "piping curl to python is dangerous"),
     (re.compile(r"wget\s+.*-O\s*-\s*\|\s*(?:ba)?sh", re.I), "piping wget to shell is dangerous"),
+    (re.compile(r"(?:env|printenv|set)\s*\|.*curl", re.I), "exfiltrating environment variables"),
+    (re.compile(r"curl\s+.*-d\s+@", re.I), "uploading file contents via curl -d @file"),
+    (re.compile(r"curl\s+.*--data(?:-\w+)?\s+@", re.I), "uploading file contents via curl --data @file"),
+    (re.compile(r"nc\s+.*<\s*/", re.I), "sending file contents via netcat"),
 ]
 
 _BYPASS_PATTERNS: list[tuple[re.Pattern[str], str]] = [
@@ -52,6 +56,11 @@ _WARN_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"rm\s+-[a-zA-Z]*r", re.I), "recursive delete"),
     (re.compile(r">\s*/dev/(?:sd|nvme|vd)", re.I), "redirecting to block device"),
     (re.compile(r"pip\s+install\s+.*--break-system", re.I), "--break-system-packages may corrupt system Python"),
+    (re.compile(r"chmod\s+000\s", re.I), "chmod 000 makes files inaccessible"),
+    (re.compile(r"chown\s+root\b", re.I), "changing ownership to root"),
+    (re.compile(r"wget\s+.*-O\s+/", re.I), "wget overwriting system path"),
+    (re.compile(r"npm\s+publish\b", re.I), "publishing package to registry"),
+    (re.compile(r"docker\s+push\b", re.I), "pushing docker image to registry"),
 ]
 
 

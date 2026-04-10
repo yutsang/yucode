@@ -12,6 +12,9 @@ from . import RiskLevel, ToolDefinition, ToolSpec
 if TYPE_CHECKING:
     from . import ToolRegistry
 
+# Max output size to prevent context blowout (parity with Rust bash.rs)
+_MAX_OUTPUT_SIZE = 128 * 1024  # 128 KB per stream (stdout/stderr)
+
 
 def shell_tools(registry: ToolRegistry) -> list[ToolDefinition]:
     return [
@@ -71,14 +74,14 @@ def _bash(registry: ToolRegistry, args: dict[str, Any]) -> str:
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 start_new_session=True,
             )
-        output: dict[str, Any] = {
+        bg_output: dict[str, Any] = {
             "pid": proc.pid,
             "background": True,
             "command": command,
         }
         if verdict.warning:
-            output["safety_warning"] = verdict.reason
-        return json.dumps(output, indent=2)
+            bg_output["safety_warning"] = verdict.reason
+        return json.dumps(bg_output, indent=2)
 
     if sandbox_cmd:
         env = dict(sandbox_cmd.env)
@@ -93,11 +96,23 @@ def _bash(registry: ToolRegistry, args: dict[str, Any]) -> str:
             shell=True, timeout=timeout, check=False,
         )
 
-    output = {
+    stdout = result.stdout
+    stderr = result.stderr
+    truncated = False
+    if len(stdout) > _MAX_OUTPUT_SIZE:
+        stdout = stdout[:_MAX_OUTPUT_SIZE] + f"\n\n[stdout truncated: {len(result.stdout):,} bytes total, showing first {_MAX_OUTPUT_SIZE:,}]"
+        truncated = True
+    if len(stderr) > _MAX_OUTPUT_SIZE:
+        stderr = stderr[:_MAX_OUTPUT_SIZE] + f"\n\n[stderr truncated: {len(result.stderr):,} bytes total, showing first {_MAX_OUTPUT_SIZE:,}]"
+        truncated = True
+
+    output: dict[str, Any] = {
         "returncode": result.returncode,
-        "stdout": result.stdout,
-        "stderr": result.stderr,
+        "stdout": stdout,
+        "stderr": stderr,
     }
+    if truncated:
+        output["truncated"] = True
     if verdict.warning:
         output["safety_warning"] = verdict.reason
 

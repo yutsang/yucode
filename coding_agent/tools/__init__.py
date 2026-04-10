@@ -523,8 +523,17 @@ class ToolRegistry:
     def _resolve_path(self, raw_path: str, allow_outside_workspace: bool = False) -> Path:
         path = Path(raw_path)
         resolved = (path if path.is_absolute() else self.workspace_root / path).resolve()
-        if not allow_outside_workspace and self.workspace_root not in (resolved, *resolved.parents):
-            raise ValueError(f"Path `{resolved}` escapes the workspace")
+        if not allow_outside_workspace:
+            # Canonical path comparison prevents symlink escapes (parity with Rust)
+            try:
+                canonical = resolved.resolve(strict=False)
+            except (OSError, ValueError):
+                canonical = resolved
+            ws_canonical = self.workspace_root.resolve(strict=False)
+            if ws_canonical not in (canonical, *canonical.parents):
+                raise ValueError(
+                    f"Path `{resolved}` escapes the workspace (canonical: {canonical})"
+                )
         return resolved
 
 

@@ -190,7 +190,7 @@ class OpenAICompatibleProvider:
                 method="POST",
             )
             try:
-                with urllib.request.urlopen(request, timeout=90, context=context) as response:
+                with urllib.request.urlopen(request, timeout=self.config.request_timeout_seconds, context=context) as response:
                     if stream:
                         return self._parse_streaming_response(response, stream_callback)
                     raw_body = response.read().decode("utf-8")

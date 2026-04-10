@@ -9,6 +9,12 @@ from . import RiskLevel, ToolDefinition, ToolSpec
 if TYPE_CHECKING:
     from . import ToolRegistry
 
+# Parity with Rust file_ops.rs: hard limits to prevent OOM / context blowout
+MAX_READ_SIZE = 10 * 1024 * 1024   # 10 MB
+MAX_WRITE_SIZE = 10 * 1024 * 1024  # 10 MB
+_BINARY_PROBE_SIZE = 8192
+_GREP_MAX_OUTPUT = 64 * 1024       # 64 KB max grep output
+
 
 def filesystem_tools(registry: ToolRegistry) -> list[ToolDefinition]:
     return [
@@ -45,21 +51,51 @@ def filesystem_tools(registry: ToolRegistry) -> list[ToolDefinition]:
     ]
 
 
+def _is_binary_file(path: Any) -> bool:
+    """Detect binary files by scanning for NUL bytes (parity with Rust file_ops.rs)."""
+    try:
+        with open(path, "rb") as f:
+            chunk = f.read(_BINARY_PROBE_SIZE)
+        return b"\x00" in chunk
+    except OSError:
+        return False
+
+
 def _read_file(registry: ToolRegistry, args: dict[str, Any]) -> str:
     path = registry._resolve_path(str(args["path"]))
+    size = path.stat().st_size
+    if size > MAX_READ_SIZE:
+        raise ValueError(
+            f"File `{path}` is {size:,} bytes (limit: {MAX_READ_SIZE:,}). "
+            "Use offset/limit to read a portion, or use grep_search."
+        )
+    if _is_binary_file(path):
+        raise ValueError(
+            f"File `{path}` appears to be binary. "
+            "Use bash with `xxd`, `file`, or `hexdump` to inspect binary files."
+        )
     lines = path.read_text(encoding="utf-8").splitlines()
+    total_lines = len(lines)
     offset = int(args.get("offset", 1))
-    limit = int(args.get("limit", len(lines)))
+    limit = int(args.get("limit", total_lines))
     start = max(offset - 1, 0)
     selected = lines[start : start + limit]
-    return "\n".join(f"{index}|{line}" for index, line in enumerate(selected, start=start + 1))
+    numbered = "\n".join(f"{index}|{line}" for index, line in enumerate(selected, start=start + 1))
+    return f"[{len(selected)} lines shown, {total_lines} total]\n{numbered}"
 
 
 def _write_file(registry: ToolRegistry, args: dict[str, Any]) -> str:
     path = registry._resolve_path(str(args["path"]))
+    content = str(args["content"])
+    if len(content.encode("utf-8")) > MAX_WRITE_SIZE:
+        raise ValueError(
+            f"Content size exceeds limit ({MAX_WRITE_SIZE:,} bytes). "
+            "Split into smaller writes or use bash."
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(str(args["content"]), encoding="utf-8")
-    return f"Wrote {path}"
+    path.write_text(content, encoding="utf-8")
+    num_lines = content.count("\n") + 1
+    return f"Wrote {path} ({num_lines} lines)"
 
 
 def _edit_file(registry: ToolRegistry, args: dict[str, Any]) -> str:
@@ -70,9 +106,15 @@ def _edit_file(registry: ToolRegistry, args: dict[str, Any]) -> str:
     text = path.read_text(encoding="utf-8")
     if old not in text:
         raise ValueError(f"`{old}` not found in {path}")
+    count = text.count(old) if replace_all else 1
     updated = text.replace(old, new) if replace_all else text.replace(old, new, 1)
     path.write_text(updated, encoding="utf-8")
-    return f"Edited {path}"
+    # Return a snippet showing the change context
+    lines_changed = new.count("\n") + 1
+    return (
+        f"Edited {path} ({count} replacement{'s' if count > 1 else ''}, "
+        f"{lines_changed} line{'s' if lines_changed > 1 else ''} in new text)"
+    )
 
 
 def _glob_search(registry: ToolRegistry, args: dict[str, Any]) -> str:
@@ -89,4 +131,13 @@ def _grep_search(registry: ToolRegistry, args: dict[str, Any]) -> str:
     result = subprocess.run(command, cwd=registry.workspace_root, capture_output=True, text=True, check=False)
     if result.returncode not in {0, 1}:
         raise RuntimeError(result.stderr.strip() or "rg failed")
-    return result.stdout.strip()
+    output = result.stdout.strip()
+    if len(output) > _GREP_MAX_OUTPUT:
+        truncated = output[:_GREP_MAX_OUTPUT]
+        last_nl = truncated.rfind("\n")
+        if last_nl > 0:
+            truncated = truncated[:last_nl]
+        line_count = output.count("\n")
+        shown = truncated.count("\n")
+        return f"{truncated}\n\n[Output truncated: showing {shown}/{line_count} lines. Narrow your search with --glob or a more specific pattern.]"
+    return output

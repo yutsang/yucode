@@ -30,6 +30,11 @@ _INTERESTING_EXTENSIONS = frozenset(
     ["rs", "ts", "tsx", "js", "json", "md", "py", "yaml", "yml", "toml"]
 )
 
+# Budget caps for summary compression (parity with Rust summary_compression.rs)
+_MAX_TIMELINE_LINES = 24
+_MAX_SUMMARY_CHARS = 4000
+_MAX_LINE_CHARS = 160
+
 
 CompactStrategy = str  # "heuristic" | "llm"
 
@@ -177,18 +182,35 @@ def _summarize_messages(messages: list[Message]) -> str:
         lines.append(f"- Current work: {current}")
 
     lines.append("- Key timeline:")
+    timeline_entries: list[str] = []
     for m in messages:
         role = m.role
         parts = []
         if m.content and m.content.strip():
-            parts.append(_truncate(m.content, 160))
+            parts.append(_truncate(m.content, _MAX_LINE_CHARS))
         for tc in m.tool_calls:
             parts.append(f"tool_use {tc.name}({_truncate(tc.arguments, 80)})")
         content = " | ".join(parts) if parts else "(empty)"
-        lines.append(f"  - {role}: {content}")
+        timeline_entries.append(f"  - {role}: {content}")
+
+    # Budget: keep first few, last few, and sample the middle (Rust parity)
+    if len(timeline_entries) > _MAX_TIMELINE_LINES:
+        head = _MAX_TIMELINE_LINES // 3
+        tail = _MAX_TIMELINE_LINES // 3
+        lines.extend(timeline_entries[:head])
+        omitted = len(timeline_entries) - head - tail
+        lines.append(f"  - ... ({omitted} messages omitted) ...")
+        lines.extend(timeline_entries[-tail:])
+    else:
+        lines.extend(timeline_entries)
 
     lines.append("</summary>")
-    return "\n".join(lines)
+
+    # Enforce total budget
+    summary = "\n".join(lines)
+    if len(summary) > _MAX_SUMMARY_CHARS:
+        summary = summary[:_MAX_SUMMARY_CHARS] + "\n</summary>"
+    return summary
 
 
 def _merge_summaries(existing: str | None, new_summary: str) -> str:
