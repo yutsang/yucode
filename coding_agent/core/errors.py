@@ -104,6 +104,28 @@ class BudgetExhaustedError(AgentError):
         super().__init__(message, recoverable=False, category="budget_exhausted")
 
 
+class ContextWindowExceededError(AgentError):
+    """Context window is full — compaction or reset required."""
+
+    def __init__(self, message: str = "Context window exceeded") -> None:
+        super().__init__(message, recoverable=True, category="context_window_exceeded")
+
+
+class RetriesExhaustedError(ProviderError):
+    """All retry attempts exhausted for a provider request."""
+
+    def __init__(self, message: str, *, attempts: int = 0) -> None:
+        super().__init__(message, recoverable=False)
+        self.category = "retries_exhausted"
+        self.attempts = attempts
+
+    def to_dict(self) -> dict[str, Any]:
+        d = super().to_dict()
+        if self.attempts:
+            d["attempts"] = self.attempts
+        return d
+
+
 def tool_error_response(
     message: str,
     *,

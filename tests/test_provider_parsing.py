@@ -240,7 +240,7 @@ class TestTlsVerification:
             raise urllib.error.URLError(ssl.SSLCertVerificationError("CERTIFICATE_VERIFY_FAILED"))
 
         monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
-        with pytest.raises(RuntimeError, match="provider.verify_tls: false"):
+        with pytest.raises(Exception, match="provider.verify_tls: false"):
             provider._do_complete([{"role": "user", "content": "hi"}], [], stream=False)
 
 

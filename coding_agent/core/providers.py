@@ -13,6 +13,7 @@ from typing import Any
 from uuid import uuid4
 
 from ..config import ProviderConfig
+from .errors import ProviderError, RetriesExhaustedError
 from .session import AssistantResponse, ToolCall, Usage
 
 _log = logging.getLogger("yucode.providers")
@@ -209,21 +210,25 @@ class OpenAICompatibleProvider:
                     time.sleep(wait)
                     continue
                 detail = exc.read().decode("utf-8", errors="replace")
-                raise RuntimeError(f"Provider request failed with {exc.code}: {detail}") from exc
+                raise ProviderError(f"Provider request failed with {exc.code}: {detail}") from exc
             except urllib.error.URLError as exc:
                 last_error = exc
                 if self._is_tls_verification_error(exc):
-                    raise RuntimeError(
+                    raise ProviderError(
                         "Provider TLS verification failed. "
                         "If your provider uses an enterprise proxy or custom certificate, "
-                        "try setting `provider.verify_tls: false`."
+                        "try setting `provider.verify_tls: false`.",
+                        recoverable=False,
                     ) from exc
                 if attempt < _MAX_RETRIES - 1:
                     wait = _RETRY_BACKOFF_BASE * (2 ** attempt)
                     time.sleep(wait)
                     continue
-                raise RuntimeError(f"Provider request failed: {exc.reason}") from exc
-        raise RuntimeError(f"Provider request failed after {_MAX_RETRIES} attempts") from last_error
+                raise ProviderError(f"Provider request failed: {exc.reason}") from exc
+        raise RetriesExhaustedError(
+            f"Provider request failed after {_MAX_RETRIES} attempts",
+            attempts=_MAX_RETRIES,
+        ) from last_error
 
     def _build_url(self) -> str:
         if self.config.chat_path.startswith("http://") or self.config.chat_path.startswith("https://"):

@@ -14,6 +14,11 @@ from . import RiskLevel, ToolDefinition, ToolSpec
 if TYPE_CHECKING:
     from . import ToolRegistry
 
+# Parity with Rust web_fetch.rs limits
+_MAX_RESPONSE_SIZE = 5 * 1024 * 1024  # 5 MB
+_MAX_REDIRECTS = 10
+_FETCH_TIMEOUT = 30
+
 
 def web_tools(registry: ToolRegistry) -> list[ToolDefinition]:
     return [
@@ -63,6 +68,15 @@ def web_tools(registry: ToolRegistry) -> list[ToolDefinition]:
     ]
 
 
+def _build_redirect_limited_opener() -> urllib.request.OpenerDirector:
+    """Build an opener that enforces _MAX_REDIRECTS."""
+
+    class _LimitedRedirectHandler(urllib.request.HTTPRedirectHandler):
+        max_redirections = _MAX_REDIRECTS
+
+    return urllib.request.build_opener(_LimitedRedirectHandler)
+
+
 def _web_fetch(args: dict[str, Any]) -> str:
     raw_url = str(args["url"])
     prompt = str(args.get("prompt", ""))
@@ -73,11 +87,16 @@ def _web_fetch(args: dict[str, Any]) -> str:
         "User-Agent": "yucode-agent/0.1",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     })
-    with urllib.request.urlopen(req, timeout=20) as response:
-        body_bytes = response.read()
+    opener = _build_redirect_limited_opener()
+    with opener.open(req, timeout=_FETCH_TIMEOUT) as response:
+        body_bytes = response.read(_MAX_RESPONSE_SIZE + 1)
         final_url = response.url
         status_code = response.status
         content_type = response.headers.get("Content-Type", "")
+
+    truncated = len(body_bytes) > _MAX_RESPONSE_SIZE
+    if truncated:
+        body_bytes = body_bytes[:_MAX_RESPONSE_SIZE]
 
     duration_ms = int((time.monotonic() - started) * 1000)
     body = body_bytes.decode("utf-8", errors="replace")
@@ -87,14 +106,19 @@ def _web_fetch(args: dict[str, Any]) -> str:
     cleaned = _clean_html(body) if is_html else body.strip()
     summary = _summarize_web_fetch(final_url, prompt, cleaned)
 
-    return json.dumps({
+    result: dict[str, Any] = {
         "url": final_url,
         "status": status_code,
         "content_type": content_type,
         "bytes": byte_size,
         "duration_ms": duration_ms,
         "result": summary,
-    }, indent=2)
+    }
+    if truncated:
+        result["truncated"] = True
+        result["max_bytes"] = _MAX_RESPONSE_SIZE
+
+    return json.dumps(result, indent=2)
 
 
 def _web_search(args: dict[str, Any]) -> str:
@@ -104,8 +128,9 @@ def _web_search(args: dict[str, Any]) -> str:
         "User-Agent": "yucode-agent/0.1",
         "Accept": "text/html",
     })
-    with urllib.request.urlopen(req, timeout=20) as response:
-        body = response.read().decode("utf-8", errors="replace")
+    opener = _build_redirect_limited_opener()
+    with opener.open(req, timeout=_FETCH_TIMEOUT) as response:
+        body = response.read(_MAX_RESPONSE_SIZE).decode("utf-8", errors="replace")
 
     hits = _extract_ddg_search_hits(body)
     if not hits:

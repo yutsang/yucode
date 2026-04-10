@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import json
+import threading
 from typing import TYPE_CHECKING, Any
 
 from . import RiskLevel, ToolDefinition, ToolSpec
 
 if TYPE_CHECKING:
     from . import ToolRegistry
+
+_DEFAULT_AGENT_TIMEOUT = 300  # 5 minutes
 
 
 def agent_tools(registry: ToolRegistry) -> list[ToolDefinition]:
@@ -85,6 +89,40 @@ def _agent(registry: ToolRegistry, args: dict[str, Any]) -> str:
         )
 
     max_steps = registry.config.runtime.max_worker_steps
+    timeout = getattr(registry.config.runtime, "agent_timeout_seconds", _DEFAULT_AGENT_TIMEOUT)
     sub_runtime = AgentRuntime(registry.workspace_root, sub_config, mcp_manager=registry.mcp_manager)
-    summary = sub_runtime.run_turn(prompt, max_steps_override=max_steps)
-    return summary.final_text
+
+    result_holder: list[Any] = []
+    error_holder: list[BaseException] = []
+
+    def _run() -> None:
+        try:
+            summary = sub_runtime.run_turn(prompt, max_steps_override=max_steps)
+            result_holder.append(summary.final_text)
+        except BaseException as exc:
+            error_holder.append(exc)
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    thread.join(timeout=timeout)
+
+    if thread.is_alive():
+        return json.dumps({
+            "error": f"Sub-agent timed out after {timeout}s",
+            "error_code": "agent_timeout",
+            "recoverable": True,
+            "prompt_snippet": prompt[:200],
+        }, indent=2)
+
+    if error_holder:
+        return json.dumps({
+            "error": f"Sub-agent failed: {error_holder[0]}",
+            "error_code": "agent_error",
+            "recoverable": True,
+        }, indent=2)
+
+    return result_holder[0] if result_holder else json.dumps({
+        "error": "Sub-agent returned no output",
+        "error_code": "agent_empty",
+        "recoverable": True,
+    }, indent=2)
