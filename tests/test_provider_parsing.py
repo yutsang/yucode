@@ -679,3 +679,72 @@ class TestStreamingZeroChunksDiagnostics:
         provider._parse_streaming_response(stream, events.append)
         warnings = [e for e in events if e.get("type") == "warning"]
         assert any("https://my-provider.com/v1/chat/completions" in w["warning"] for w in warnings)
+
+
+class TestTextToolCallFallback:
+    """Models that emit tool calls as <tool_call> tags in text content."""
+
+    def test_extract_tool_call_tag(self):
+        from coding_agent.core.providers import _extract_text_tool_calls
+        text = (
+            'Here is the result:\n<tool_call>\n'
+            '{"name": "write_file", "arguments": {"path": "test.md", "content": "hello"}}\n'
+            '</tool_call>\n'
+        )
+        cleaned, calls = _extract_text_tool_calls(text)
+        assert len(calls) == 1
+        assert calls[0].name == "write_file"
+        assert '"path": "test.md"' in calls[0].arguments
+        assert "<tool_call>" not in cleaned
+
+    def test_extract_function_call_tag(self):
+        from coding_agent.core.providers import _extract_text_tool_calls
+        text = '<function_call>\n{"name": "bash", "arguments": {"command": "ls"}}\n</function_call>'
+        cleaned, calls = _extract_text_tool_calls(text)
+        assert len(calls) == 1
+        assert calls[0].name == "bash"
+
+    def test_no_tags_returns_original(self):
+        from coding_agent.core.providers import _extract_text_tool_calls
+        text = "Just a normal response with no tool calls."
+        cleaned, calls = _extract_text_tool_calls(text)
+        assert cleaned == text
+        assert calls == []
+
+    def test_multiple_tool_calls(self):
+        from coding_agent.core.providers import _extract_text_tool_calls
+        text = (
+            '<tool_call>{"name": "read_file", "arguments": {"path": "a.py"}}</tool_call>\n'
+            '<tool_call>{"name": "read_file", "arguments": {"path": "b.py"}}</tool_call>'
+        )
+        cleaned, calls = _extract_text_tool_calls(text)
+        assert len(calls) == 2
+        assert calls[0].name == "read_file"
+        assert calls[1].name == "read_file"
+
+    def test_malformed_json_skipped(self):
+        from coding_agent.core.providers import _extract_text_tool_calls
+        text = '<tool_call>{not valid json}</tool_call>\n<tool_call>{"name": "bash", "arguments": {"command": "ls"}}</tool_call>'
+        cleaned, calls = _extract_text_tool_calls(text)
+        assert len(calls) == 1
+        assert calls[0].name == "bash"
+
+    def test_payload_integration_fallback(self):
+        """Non-streaming response with tool calls in text triggers fallback."""
+        provider = _make_provider()
+        payload = {
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": '<tool_call>\n{"name": "write_file", "arguments": {"path": "out.txt", "content": "hi"}}\n</tool_call>',
+                },
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 50},
+        }
+        response = provider._parse_response_payload(payload, None)
+        assert len(response.tool_calls) == 1
+        assert response.tool_calls[0].name == "write_file"
+        assert response.text == ""  # tag content stripped

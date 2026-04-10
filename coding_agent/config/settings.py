@@ -41,7 +41,7 @@ def state_dir(workspace: Path) -> Path:
     legacy = workspace.resolve() / ".yucode"
     if home_state.exists() or not legacy.exists():
         return home_state
-    return home_state
+    return legacy
 
 
 def _resolve_api_key(config_value: str) -> str:
@@ -731,7 +731,8 @@ def add_mcp_server_to_config(
     return _add_mcp_to_yaml(server, mcp_path)
 
 
-def _add_mcp_to_config_yml(server: McpServerConfig, path: Path) -> Path:
+def _upsert_mcp_server(server: McpServerConfig, path: Path, servers_key_path: list[str]) -> Path:
+    """Add an MCP server entry to a YAML file at the given key path for the servers list."""
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.is_file():
         raw = load_yaml(path.read_text(encoding="utf-8"))
@@ -739,37 +740,27 @@ def _add_mcp_to_config_yml(server: McpServerConfig, path: Path) -> Path:
             raw = {}
     else:
         raw = {}
-    mcp_container = raw.setdefault("mcp", {})
-    servers = mcp_container.setdefault("servers", [])
+    container = raw
+    for key in servers_key_path[:-1]:
+        container = container.setdefault(key, {})
+    servers = container.setdefault(servers_key_path[-1], [])
     if not isinstance(servers, list):
         servers = []
-        mcp_container["servers"] = servers
+        container[servers_key_path[-1]] = servers
     for existing in servers:
         if isinstance(existing, dict) and existing.get("name") == server.name:
             raise ConfigError(f"MCP server `{server.name}` already exists in config")
     servers.append(_mcp_server_entry(server))
     path.write_text(dump_yaml(raw), encoding="utf-8")
     return path
+
+
+def _add_mcp_to_config_yml(server: McpServerConfig, path: Path) -> Path:
+    return _upsert_mcp_server(server, path, ["mcp", "servers"])
 
 
 def _add_mcp_to_yaml(server: McpServerConfig, path: Path) -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.is_file():
-        raw = load_yaml(path.read_text(encoding="utf-8"))
-        if not isinstance(raw, dict):
-            raw = {}
-    else:
-        raw = {}
-    servers = raw.setdefault("servers", [])
-    if not isinstance(servers, list):
-        servers = []
-        raw["servers"] = servers
-    for existing in servers:
-        if isinstance(existing, dict) and existing.get("name") == server.name:
-            raise ConfigError(f"MCP server `{server.name}` already exists in config")
-    servers.append(_mcp_server_entry(server))
-    path.write_text(dump_yaml(raw), encoding="utf-8")
-    return path
+    return _upsert_mcp_server(server, path, ["servers"])
 
 
 def remove_mcp_server_from_config(
@@ -784,14 +775,17 @@ def remove_mcp_server_from_config(
     return _remove_mcp_from_yaml(name, mcp_path)
 
 
-def _remove_mcp_from_config_yml(name: str, path: Path) -> Path:
+def _delete_mcp_server(name: str, path: Path, servers_key_path: list[str]) -> Path:
+    """Remove an MCP server entry from a YAML file at the given key path."""
     if not path.is_file():
         raise ConfigError(f"MCP server `{name}` not found in config")
     raw = load_yaml(path.read_text(encoding="utf-8"))
     if not isinstance(raw, dict):
         raise ConfigError(f"MCP server `{name}` not found in config")
-    mcp_container = raw.get("mcp", {})
-    servers = mcp_container.get("servers", [])
+    container: Any = raw
+    for key in servers_key_path[:-1]:
+        container = container.get(key, {})
+    servers = container.get(servers_key_path[-1], [])
     if not isinstance(servers, list):
         raise ConfigError(f"MCP server `{name}` not found in config")
     original_len = len(servers)
@@ -800,20 +794,11 @@ def _remove_mcp_from_config_yml(name: str, path: Path) -> Path:
         raise ConfigError(f"MCP server `{name}` not found in config")
     path.write_text(dump_yaml(raw), encoding="utf-8")
     return path
+
+
+def _remove_mcp_from_config_yml(name: str, path: Path) -> Path:
+    return _delete_mcp_server(name, path, ["mcp", "servers"])
 
 
 def _remove_mcp_from_yaml(name: str, path: Path) -> Path:
-    if not path.is_file():
-        raise ConfigError(f"MCP server `{name}` not found in config")
-    raw = load_yaml(path.read_text(encoding="utf-8"))
-    if not isinstance(raw, dict):
-        raise ConfigError(f"MCP server `{name}` not found in config")
-    servers = raw.get("servers", [])
-    if not isinstance(servers, list):
-        raise ConfigError(f"MCP server `{name}` not found in config")
-    original_len = len(servers)
-    servers[:] = [s for s in servers if not (isinstance(s, dict) and s.get("name") == name)]
-    if len(servers) == original_len:
-        raise ConfigError(f"MCP server `{name}` not found in config")
-    path.write_text(dump_yaml(raw), encoding="utf-8")
-    return path
+    return _delete_mcp_server(name, path, ["servers"])

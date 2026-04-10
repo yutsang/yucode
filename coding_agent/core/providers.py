@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import ssl
 import time
 import urllib.error
@@ -283,6 +284,10 @@ class OpenAICompatibleProvider:
         tool_calls = _tool_calls_from_payload(message.get("tool_calls", []))
         usage = _extract_usage(payload.get("usage", {}))
 
+        # Fallback: some models emit tool calls as <tool_call> tags in text
+        if text and not tool_calls:
+            text, tool_calls = _extract_text_tool_calls(text)
+
         if not text and not tool_calls:
             _emit_warning(
                 stream_callback,
@@ -379,6 +384,9 @@ class OpenAICompatibleProvider:
             for _, item in sorted(tool_call_accumulator.items())
         ]
         final_text = "".join(text_parts)
+        # Fallback: some models emit tool calls as <tool_call> tags in streamed text
+        if final_text and not tool_calls:
+            final_text, tool_calls = _extract_text_tool_calls(final_text)
         if not final_text and not tool_calls and not saw_non_openai_stream_payload:
             _emit_warning(
                 stream_callback,
@@ -401,3 +409,46 @@ def _tool_calls_from_payload(raw_tool_calls: list[dict[str, Any]]) -> list[ToolC
             )
         )
     return calls
+
+
+_RE_TOOL_CALL_TAG = re.compile(
+    r"<tool_call>\s*(\{.*?\})\s*</tool_call>",
+    re.DOTALL,
+)
+_RE_FUNCTION_CALL_TAG = re.compile(
+    r"<function_call>\s*(\{.*?\})\s*</function_call>",
+    re.DOTALL,
+)
+
+
+def _extract_text_tool_calls(text: str) -> tuple[str, list[ToolCall]]:
+    """Parse tool calls embedded as text (e.g. ``<tool_call>{...}</tool_call>``).
+
+    Some models (especially local/quantised ones) don't use the OpenAI
+    function-calling API and instead emit tool calls as XML-wrapped JSON in the
+    assistant message content.  This function extracts them, returning the
+    cleaned text and a list of ToolCall objects.
+    """
+    calls: list[ToolCall] = []
+    cleaned = text
+
+    for pattern in (_RE_TOOL_CALL_TAG, _RE_FUNCTION_CALL_TAG):
+        for match in pattern.finditer(text):
+            try:
+                data = json.loads(match.group(1))
+            except json.JSONDecodeError:
+                continue
+            name = data.get("name", "")
+            if not name:
+                continue
+            arguments = data.get("arguments", data.get("parameters", {}))
+            if isinstance(arguments, dict):
+                arguments = json.dumps(arguments)
+            calls.append(ToolCall(
+                id=f"tool_{uuid4().hex[:8]}",
+                name=str(name),
+                arguments=str(arguments),
+            ))
+            cleaned = cleaned.replace(match.group(0), "")
+
+    return cleaned.strip(), calls

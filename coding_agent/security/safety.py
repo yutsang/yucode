@@ -123,11 +123,7 @@ class ScanResult:
     """Result of a secret/PII scan."""
     redacted_text: str
     redaction_count: int = 0
-    matched_types: list[str] = ()  # type: ignore[assignment]
-
-    def __post_init__(self) -> None:
-        if isinstance(self.matched_types, tuple):
-            object.__setattr__(self, "matched_types", list(self.matched_types))
+    matched_types: tuple[str, ...] = ()
 
 
 def scan_and_redact_secrets(text: str) -> ScanResult:
@@ -141,7 +137,7 @@ def scan_and_redact_secrets(text: str) -> ScanResult:
             count += len(matches)
             matched.append(label)
             redacted = pattern.sub("[REDACTED]", redacted)
-    return ScanResult(redacted_text=redacted, redaction_count=count, matched_types=matched)
+    return ScanResult(redacted_text=redacted, redaction_count=count, matched_types=tuple(matched))
 
 
 def scan_pii(text: str) -> list[str]:

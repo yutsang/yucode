@@ -65,18 +65,39 @@ def _make_stub_tool(name: str, description: str, permission: PermissionMode, ris
     )
 
 
+def _registry_handler(
+    action: Callable[[dict[str, Any]], Any],
+    *,
+    catch: tuple[type[Exception], ...] = (KeyError,),
+) -> ToolHandler:
+    """Create a tool handler that calls *action*, serialises the result, and
+    catches expected exceptions as ``{"error": ...}`` responses."""
+    def handler(args: dict[str, Any]) -> str:
+        try:
+            result = action(args)
+            if result is None:
+                return json.dumps({"error": "Not found"})
+            if isinstance(result, str):
+                return result
+            if isinstance(result, list):
+                return json.dumps([r.to_dict() if hasattr(r, "to_dict") else r for r in result], indent=2)
+            if isinstance(result, dict):
+                return json.dumps(result, indent=2)
+            return json.dumps(result.to_dict(), indent=2)
+        except catch as exc:
+            return json.dumps({"error": str(exc)})
+    return handler
+
+
 def _run_task_create(args: dict[str, Any]) -> str:
     from ..core.task_registry import global_task_registry
-    reg = global_task_registry()
-    task = reg.create(str(args.get("prompt", "")), str(args.get("description", "")))
-    return json.dumps(task.to_dict(), indent=2)
+    return json.dumps(global_task_registry().create(str(args.get("prompt", "")), str(args.get("description", ""))).to_dict(), indent=2)
 
 
 def _run_task_packet(args: dict[str, Any]) -> str:
     from ..core.task_registry import global_task_registry
-    reg = global_task_registry()
     try:
-        task = reg.create_from_packet(args)
+        task = global_task_registry().create_from_packet(args)
         return json.dumps(task.to_dict(), indent=2)
     except ValueError as exc:
         return json.dumps({"error": str(exc)})
@@ -98,31 +119,51 @@ def _run_task_list(args: dict[str, Any]) -> str:
     return json.dumps([t.to_dict() for t in tasks], indent=2)
 
 
-def _run_task_stop(args: dict[str, Any]) -> str:
-    from ..core.task_registry import global_task_registry
-    try:
-        task = global_task_registry().stop(str(args.get("task_id", "")))
-        return json.dumps(task.to_dict(), indent=2)
-    except (KeyError, ValueError) as exc:
-        return json.dumps({"error": str(exc)})
+def _make_task_handler(method_name: str) -> ToolHandler:
+    """Create a handler that calls ``global_task_registry().<method_name>(task_id, ...)``."""
+    def handler(args: dict[str, Any]) -> str:
+        from ..core.task_registry import global_task_registry
+        try:
+            method = getattr(global_task_registry(), method_name)
+            if method_name == "update":
+                result = method(str(args.get("task_id", "")), str(args.get("message", "")))
+            elif method_name == "output":
+                output = method(str(args.get("task_id", "")))
+                return json.dumps({"task_id": args.get("task_id"), "output": output})
+            else:
+                result = method(str(args.get("task_id", "")))
+            return json.dumps(result.to_dict(), indent=2)
+        except (KeyError, ValueError) as exc:
+            return json.dumps({"error": str(exc)})
+    return handler
+
+_run_task_stop = _make_task_handler("stop")
+_run_task_update = _make_task_handler("update")
+_run_task_output = _make_task_handler("output")
 
 
-def _run_task_update(args: dict[str, Any]) -> str:
-    from ..core.task_registry import global_task_registry
-    try:
-        task = global_task_registry().update(str(args.get("task_id", "")), str(args.get("message", "")))
-        return json.dumps(task.to_dict(), indent=2)
-    except KeyError as exc:
-        return json.dumps({"error": str(exc)})
+def _make_worker_handler(method_name: str, extra_args: list[str] | None = None) -> ToolHandler:
+    """Create a handler that calls ``global_worker_registry().<method_name>(worker_id, ...)``."""
+    def handler(args: dict[str, Any]) -> str:
+        from ..core.worker_registry import global_worker_registry
+        try:
+            method = getattr(global_worker_registry(), method_name)
+            call_args: list[Any] = [str(args.get("worker_id", ""))]
+            for key in (extra_args or []):
+                call_args.append(args.get(key))
+            result = method(*call_args)
+            if hasattr(result, "to_dict"):
+                return json.dumps(result.to_dict(), indent=2)
+            return json.dumps(result, indent=2)
+        except (KeyError, ValueError) as exc:
+            return json.dumps({"error": str(exc)})
+    return handler
 
-
-def _run_task_output(args: dict[str, Any]) -> str:
-    from ..core.task_registry import global_task_registry
-    try:
-        output = global_task_registry().output(str(args.get("task_id", "")))
-        return json.dumps({"task_id": args.get("task_id"), "output": output})
-    except KeyError as exc:
-        return json.dumps({"error": str(exc)})
+_run_worker_observe = _make_worker_handler("observe", ["screen_text"])
+_run_worker_resolve_trust = _make_worker_handler("resolve_trust")
+_run_worker_send_prompt = _make_worker_handler("send_prompt", ["prompt"])
+_run_worker_restart = _make_worker_handler("restart")
+_run_worker_terminate = _make_worker_handler("terminate")
 
 
 def _run_worker_create(args: dict[str, Any]) -> str:
@@ -143,56 +184,11 @@ def _run_worker_get(args: dict[str, Any]) -> str:
     return json.dumps(worker.to_dict(), indent=2)
 
 
-def _run_worker_observe(args: dict[str, Any]) -> str:
-    from ..core.worker_registry import global_worker_registry
-    try:
-        worker = global_worker_registry().observe(str(args.get("worker_id", "")), str(args.get("screen_text", "")))
-        return json.dumps(worker.to_dict(), indent=2)
-    except KeyError as exc:
-        return json.dumps({"error": str(exc)})
-
-
-def _run_worker_resolve_trust(args: dict[str, Any]) -> str:
-    from ..core.worker_registry import global_worker_registry
-    try:
-        worker = global_worker_registry().resolve_trust(str(args.get("worker_id", "")))
-        return json.dumps(worker.to_dict(), indent=2)
-    except (KeyError, ValueError) as exc:
-        return json.dumps({"error": str(exc)})
-
-
 def _run_worker_await_ready(args: dict[str, Any]) -> str:
     from ..core.worker_registry import global_worker_registry
     try:
         snap = global_worker_registry().await_ready(str(args.get("worker_id", "")))
         return json.dumps({"worker_id": snap.worker_id, "status": snap.status.value, "ready": snap.ready, "blocked": snap.blocked, "replay_prompt_ready": snap.replay_prompt_ready, "last_error": snap.last_error})
-    except KeyError as exc:
-        return json.dumps({"error": str(exc)})
-
-
-def _run_worker_send_prompt(args: dict[str, Any]) -> str:
-    from ..core.worker_registry import global_worker_registry
-    try:
-        worker = global_worker_registry().send_prompt(str(args.get("worker_id", "")), args.get("prompt"))
-        return json.dumps(worker.to_dict(), indent=2)
-    except (KeyError, ValueError) as exc:
-        return json.dumps({"error": str(exc)})
-
-
-def _run_worker_restart(args: dict[str, Any]) -> str:
-    from ..core.worker_registry import global_worker_registry
-    try:
-        worker = global_worker_registry().restart(str(args.get("worker_id", "")))
-        return json.dumps(worker.to_dict(), indent=2)
-    except KeyError as exc:
-        return json.dumps({"error": str(exc)})
-
-
-def _run_worker_terminate(args: dict[str, Any]) -> str:
-    from ..core.worker_registry import global_worker_registry
-    try:
-        worker = global_worker_registry().terminate(str(args.get("worker_id", "")))
-        return json.dumps(worker.to_dict(), indent=2)
     except KeyError as exc:
         return json.dumps({"error": str(exc)})
 
@@ -212,43 +208,38 @@ def _run_team_create(args: dict[str, Any]) -> str:
 def _run_team_delete(args: dict[str, Any]) -> str:
     from ..core.team_cron_registry import global_team_registry
     try:
-        team = global_team_registry().delete(str(args.get("team_id", "")))
-        return json.dumps(team.to_dict(), indent=2)
+        return json.dumps(global_team_registry().delete(str(args.get("team_id", ""))).to_dict(), indent=2)
     except KeyError as exc:
         return json.dumps({"error": str(exc)})
 
 
 def _run_cron_create(args: dict[str, Any]) -> str:
     from ..core.team_cron_registry import global_cron_registry
-    entry = global_cron_registry().create(str(args.get("schedule", "")), str(args.get("prompt", "")), str(args.get("description", "")))
-    return json.dumps(entry.to_dict(), indent=2)
+    return json.dumps(global_cron_registry().create(str(args.get("schedule", "")), str(args.get("prompt", "")), str(args.get("description", ""))).to_dict(), indent=2)
 
 
 def _run_cron_delete(args: dict[str, Any]) -> str:
     from ..core.team_cron_registry import global_cron_registry
     try:
-        entry = global_cron_registry().delete(str(args.get("cron_id", "")))
-        return json.dumps(entry.to_dict(), indent=2)
+        return json.dumps(global_cron_registry().delete(str(args.get("cron_id", ""))).to_dict(), indent=2)
     except KeyError as exc:
         return json.dumps({"error": str(exc)})
 
 
 def _run_cron_list(args: dict[str, Any]) -> str:
     from ..core.team_cron_registry import global_cron_registry
-    entries = global_cron_registry().list(enabled_only=bool(args.get("enabled_only", False)))
-    return json.dumps([e.to_dict() for e in entries], indent=2)
+    return json.dumps([e.to_dict() for e in global_cron_registry().list(enabled_only=bool(args.get("enabled_only", False)))], indent=2)
 
 
 def _run_lsp(args: dict[str, Any]) -> str:
     from ..core.lsp_registry import global_lsp_registry
-    result = global_lsp_registry().dispatch(
+    return json.dumps(global_lsp_registry().dispatch(
         action=str(args.get("action", "")),
         path=str(args.get("path", "")),
         line=int(args.get("line", 0)),
         character=int(args.get("character", 0)),
         query=str(args.get("query", "")),
-    )
-    return json.dumps(result, indent=2)
+    ), indent=2)
 
 
 def _run_ask_user(args: dict[str, Any]) -> str:
@@ -362,7 +353,6 @@ class ToolRegistry:
 
         if self.mcp_manager:
             self._wire_mcp_lifecycle_tools()
-
         if self.mcp_manager:
             for spec in self.mcp_manager.tool_specs():
                 function = spec["function"]

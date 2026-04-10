@@ -242,6 +242,13 @@ class ProgressDisplay:
 
 # ---- Compact tool display (single-line dynamic) ----------------------------
 
+_PATH_TOOLS = frozenset({
+    "read_file", "Read", "write_file", "Write", "edit_file", "edit",
+    "read_excel_sheet", "list_excel_sheets", "excel_to_json",
+    "read_word_text", "read_word_paragraphs", "read_pptx", "read_pdf_text",
+})
+
+
 def compact_tool_start_label(name: str, arguments: str) -> str:
     """One-line label for a tool call, used as spinner text."""
     import json as _json
@@ -252,39 +259,20 @@ def compact_tool_start_label(name: str, arguments: str) -> str:
 
     icon = _TOOL_ICONS.get(name, "⚡")
 
-    if name in ("web_search",):
-        query = parsed.get("query", "?")
-        return f"{icon} {name}: {query}"
-    if name in ("web_fetch",):
-        url = parsed.get("url", "?")
-        return f"{icon} {name}: {_truncate(url, 55)}"
-    if name in ("read_file", "Read"):
-        path = parsed.get("path", "?")
-        return f"{icon} {name}: {path}"
-    if name in ("write_file", "Write"):
-        path = parsed.get("path", "?")
-        return f"{icon} {name}: {path}"
-    if name in ("edit_file", "edit"):
-        path = parsed.get("path", "?")
-        return f"{icon} {name}: {path}"
+    if name in _PATH_TOOLS:
+        return f"{icon} {name}: {parsed.get('path', '?')}"
     if name in ("bash", "Bash"):
-        cmd = _truncate(parsed.get("command", "?"), 55)
-        return f"{icon} $ {cmd}"
+        return f"{icon} $ {_truncate(parsed.get('command', '?'), 55)}"
+    if name in ("web_search",):
+        return f"{icon} {name}: {parsed.get('query', '?')}"
+    if name in ("web_fetch",):
+        return f"{icon} {name}: {_truncate(parsed.get('url', '?'), 55)}"
     if name in ("glob_search",):
         return f"{icon} glob: {parsed.get('pattern', '?')}"
     if name in ("grep_search",):
         return f"{icon} grep: {parsed.get('pattern', '?')}"
-    if name in ("read_excel_sheet", "list_excel_sheets", "excel_to_json"):
-        return f"{icon} {name}: {parsed.get('path', '?')}"
-    if name in ("read_word_text", "read_word_paragraphs"):
-        return f"{icon} {name}: {parsed.get('path', '?')}"
-    if name in ("read_pptx",):
-        return f"{icon} {name}: {parsed.get('path', '?')}"
-    if name in ("read_pdf_text",):
-        return f"{icon} {name}: {parsed.get('path', '?')}"
     if name == "agent":
-        desc = parsed.get("description", parsed.get("prompt", "?"))
-        return f"{icon} agent: {_truncate(str(desc), 50)}"
+        return f"{icon} agent: {_truncate(str(parsed.get('description', parsed.get('prompt', '?'))), 50)}"
     return f"{icon} {name}"
 
 
@@ -646,11 +634,15 @@ def _render_markdown_ansi(text: str) -> str:
     return "\n".join(output)
 
 
+_RE_INLINE_CODE = __import__("re").compile(r"`([^`]+)`")
+_RE_BOLD = __import__("re").compile(r"\*\*([^*]+)\*\*")
+_RE_ITALIC = __import__("re").compile(r"(?<!\*)\*([^*]+)\*(?!\*)")
+
+
 def _inline_format(text: str) -> str:
-    import re
-    text = re.sub(r"`([^`]+)`", rf"{THEME.emphasis}\1{RESET}", text)
-    text = re.sub(r"\*\*([^*]+)\*\*", rf"{BOLD}\1{RESET}", text)
-    text = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", rf"{ITALIC}\1{RESET}", text)
+    text = _RE_INLINE_CODE.sub(rf"{THEME.emphasis}\1{RESET}", text)
+    text = _RE_BOLD.sub(rf"{BOLD}\1{RESET}", text)
+    text = _RE_ITALIC.sub(rf"{ITALIC}\1{RESET}", text)
     return text
 
 
