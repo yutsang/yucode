@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.3] - 2026-04-11
+
+### Added
+- `ContextWindowExceededError` and `RetriesExhaustedError` in the structured error hierarchy
+- Sub-agent execution timeout (default 5 minutes) with structured timeout/error responses
+- Web fetch safety limits: 5 MB response cap, 10-redirect cap, 30s timeout
+- `CLAUDE.md` with repo-level commit authorship policy
+
+### Changed
+- All provider HTTP failure paths now raise `ProviderError` / `RetriesExhaustedError` instead of bare `RuntimeError`
+- Hardened tools with size limits, safety patterns, and output budgets
+- Fixed text-based tool call parsing and related quality issues
+- `agent` tool now uses `tool_error_response` helper and narrows `BaseException` to `Exception` so `KeyboardInterrupt`/`SystemExit` propagate
+- Tightened provider-parsing tests to assert on `ProviderError` directly
+
 ## [0.3.0] - 2026-04-08
 
 ### Added
