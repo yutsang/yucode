@@ -23,6 +23,7 @@ from typing import Any
 import pytest
 
 from coding_agent.config import ProviderConfig
+from coding_agent.core.errors import ProviderError
 from coding_agent.core.providers import (
     OpenAICompatibleProvider,
     _extract_content_text,
@@ -240,7 +241,7 @@ class TestTlsVerification:
             raise urllib.error.URLError(ssl.SSLCertVerificationError("CERTIFICATE_VERIFY_FAILED"))
 
         monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
-        with pytest.raises(Exception, match="provider.verify_tls: false"):
+        with pytest.raises(ProviderError, match="provider.verify_tls: false"):
             provider._do_complete([{"role": "user", "content": "hi"}], [], stream=False)
 
 
@@ -622,19 +623,19 @@ class TestNonOpenaiEnvelopeDetection:
     def test_gateway_envelope_raises(self):
         provider = _make_provider()
         payload = {"flag": 1, "code": 0, "msg": "invalid api key", "ts": 1234567890}
-        with pytest.raises(RuntimeError, match="non-OpenAI response"):
+        with pytest.raises(ProviderError, match="non-OpenAI response"):
             provider._parse_response_payload(payload, None)
 
     def test_gateway_envelope_includes_server_message(self):
         provider = _make_provider()
         payload = {"flag": 1, "code": 403, "msg": "auth failed", "ts": 99}
-        with pytest.raises(RuntimeError, match="auth failed"):
+        with pytest.raises(ProviderError, match="auth failed"):
             provider._parse_response_payload(payload, None)
 
     def test_gateway_envelope_includes_url(self):
         provider = _make_provider(base_url="https://my-api.example.com", chat_path="/v1/chat")
         payload = {"status": "error", "detail": "not found"}
-        with pytest.raises(RuntimeError, match="https://my-api.example.com/v1/chat"):
+        with pytest.raises(ProviderError, match="https://my-api.example.com/v1/chat"):
             provider._parse_response_payload(payload, None)
 
     def test_empty_choices_with_openai_keys_warns_not_raises(self, caplog):
@@ -650,7 +651,7 @@ class TestNonOpenaiEnvelopeDetection:
         provider = _make_provider()
         payload = {"code": -1, "msg": "rate limited"}
         events: list[dict] = []
-        with pytest.raises(RuntimeError, match="rate limited"):
+        with pytest.raises(ProviderError, match="rate limited"):
             provider._parse_response_payload(payload, events.append)
 
 

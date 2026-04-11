@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import json
 import threading
 from typing import TYPE_CHECKING, Any
 
+from ..core.errors import tool_error_response
 from . import RiskLevel, ToolDefinition, ToolSpec
 
 if TYPE_CHECKING:
@@ -47,10 +47,7 @@ def agent_tools(registry: ToolRegistry) -> list[ToolDefinition]:
     ]
 
 
-def _resolve_allowed_tools(
-    args: dict[str, Any],
-    config_disabled: list[str],
-) -> list[str] | None:
+def _resolve_allowed_tools(args: dict[str, Any]) -> list[str] | None:
     """Determine the tool whitelist from role or explicit list."""
     explicit = args.get("allowed_tools")
     if explicit:
@@ -70,7 +67,7 @@ def _resolve_allowed_tools(
 
 def _agent(registry: ToolRegistry, args: dict[str, Any]) -> str:
     prompt = str(args["prompt"])
-    allowed = _resolve_allowed_tools(args, list(registry.config.tools.disabled))
+    allowed = _resolve_allowed_tools(args)
 
     from ..core.runtime import AgentRuntime
     sub_config = registry.config
@@ -89,17 +86,17 @@ def _agent(registry: ToolRegistry, args: dict[str, Any]) -> str:
         )
 
     max_steps = registry.config.runtime.max_worker_steps
-    timeout = getattr(registry.config.runtime, "agent_timeout_seconds", _DEFAULT_AGENT_TIMEOUT)
+    timeout = _DEFAULT_AGENT_TIMEOUT
     sub_runtime = AgentRuntime(registry.workspace_root, sub_config, mcp_manager=registry.mcp_manager)
 
     result_holder: list[Any] = []
-    error_holder: list[BaseException] = []
+    error_holder: list[Exception] = []
 
     def _run() -> None:
         try:
             summary = sub_runtime.run_turn(prompt, max_steps_override=max_steps)
             result_holder.append(summary.final_text)
-        except BaseException as exc:
+        except Exception as exc:
             error_holder.append(exc)
 
     thread = threading.Thread(target=_run, daemon=True)
@@ -107,22 +104,18 @@ def _agent(registry: ToolRegistry, args: dict[str, Any]) -> str:
     thread.join(timeout=timeout)
 
     if thread.is_alive():
-        return json.dumps({
-            "error": f"Sub-agent timed out after {timeout}s",
-            "error_code": "agent_timeout",
-            "recoverable": True,
-            "prompt_snippet": prompt[:200],
-        }, indent=2)
+        return tool_error_response(
+            f"Sub-agent timed out after {timeout}s",
+            error_code="agent_timeout",
+        )
 
     if error_holder:
-        return json.dumps({
-            "error": f"Sub-agent failed: {error_holder[0]}",
-            "error_code": "agent_error",
-            "recoverable": True,
-        }, indent=2)
+        return tool_error_response(
+            f"Sub-agent failed: {error_holder[0]}",
+            error_code="agent_error",
+        )
 
-    return result_holder[0] if result_holder else json.dumps({
-        "error": "Sub-agent returned no output",
-        "error_code": "agent_empty",
-        "recoverable": True,
-    }, indent=2)
+    return result_holder[0] if result_holder else tool_error_response(
+        "Sub-agent returned no output",
+        error_code="agent_empty",
+    )

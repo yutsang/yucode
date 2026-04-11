@@ -198,7 +198,7 @@ class OpenAICompatibleProvider:
                     try:
                         data = json.loads(raw_body)
                     except json.JSONDecodeError as exc:
-                        raise RuntimeError(
+                        raise ProviderError(
                             f"Provider returned non-JSON response (first 200 chars): "
                             f"{raw_body[:200]!r}"
                         ) from exc
@@ -271,7 +271,7 @@ class OpenAICompatibleProvider:
             if not _looks_like_openai_response(payload):
                 detail = _extract_envelope_detail(payload)
                 hint = f" Server message: {detail}" if detail else ""
-                raise RuntimeError(
+                raise ProviderError(
                     f"The provider endpoint ({self._build_url()}) returned a non-OpenAI "
                     f"response. Payload keys: {sorted(payload.keys())}.{hint} "
                     "This usually means base_url, chat_path, or append_chat_path is pointing at a "
