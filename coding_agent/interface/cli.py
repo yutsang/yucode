@@ -558,12 +558,14 @@ class _InteractiveEventHandler:
         self._turn_start: float = 0
         self._current_iteration = 0
         self._text_started = False
+        self._in_coordinator: bool = False
 
     def __call__(self, event: dict[str, Any]) -> None:
         etype = event.get("type", "")
         if etype == "provider_info":
             pass
         elif etype == "phase_started":
+            self._in_coordinator = True
             phase = event.get("phase", "")
             attempt = event.get("attempt")
             label = phase.replace("_", " ").title()
@@ -588,7 +590,10 @@ class _InteractiveEventHandler:
             self._progress.set_thinking(f"Retrying (attempt {attempt})")
         elif etype == "iteration_started":
             self._current_iteration = event.get("iteration", 1)
-            if self._current_iteration == 1:
+            if self._current_iteration == 1 and not self._in_coordinator:
+                # Only reset turn state at the top level; inside a coordinator
+                # worker this would wrongly clear _text_started and cause the
+                # agent label to be printed mid-worker output.
                 self._turn_start = time.monotonic()
                 self._text_started = False
             self._progress.set_thinking(
@@ -608,14 +613,20 @@ class _InteractiveEventHandler:
             result_line = compact_tool_result_line(name, content, is_error=is_err)
             self._progress.finish_tool(result_line)
         elif etype == "assistant_delta":
-            self._progress.stop()
-            if not self._text_started:
-                print(agent_label(), end="")
-                self._text_started = True
-            if self.streaming:
-                delta = event.get("delta", "")
-                sys.stdout.write(delta)
-                sys.stdout.flush()
+            if self._in_coordinator:
+                # Worker sub-runtimes stream via this event too.  Suppress their
+                # intermediate output — the coordinator's final_text is what the
+                # user sees, delivered after `completed`.
+                pass
+            else:
+                self._progress.stop()
+                if not self._text_started:
+                    print(agent_label(), end="")
+                    self._text_started = True
+                if self.streaming:
+                    delta = event.get("delta", "")
+                    sys.stdout.write(delta)
+                    sys.stdout.flush()
         elif etype == "dedup_limit":
             self._progress.stop()
             tool = event.get("tool", "?")
@@ -637,7 +648,11 @@ class _InteractiveEventHandler:
             pass
         elif etype == "completed":
             self._progress.stop()
-            if not self._text_started:
+            was_coordinator = self._in_coordinator
+            self._in_coordinator = False
+            if not self._text_started and not was_coordinator:
+                # Non-coordinator, non-streaming: put the label here so the
+                # chat loop's format_assistant_text() lands right after it.
                 print(agent_label(), end="")
             print()
 

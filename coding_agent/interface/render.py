@@ -244,7 +244,12 @@ class ProgressDisplay:
     def set_thinking(self, label: str = "Thinking") -> None:
         """Show a 'Thinking' spinner (no done line above)."""
         if not _IS_STDERR_TTY:
-            return  # non-TTY: silent between tool calls
+            # Print phase/worker/retry labels so non-TTY logs show coordinator
+            # progress.  Skip generic "Thinking" noise between individual steps.
+            if label and not label.startswith("Thinking"):
+                sys.stderr.write(f"  \u25c6 {label}\n")
+                sys.stderr.flush()
+            return
         with self._lock:
             self._doing_label = label
             self._frame = 0

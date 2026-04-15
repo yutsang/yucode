@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import re
 import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -240,13 +241,55 @@ def _list_directory(registry: ToolRegistry, args: dict[str, Any]) -> str:
 
 
 def _grep_search(registry: ToolRegistry, args: dict[str, Any]) -> str:
-    command = ["rg", str(args["pattern"]), str(args.get("path", registry.workspace_root))]
+    pattern = str(args["pattern"])
+    search_path = str(args.get("path", registry.workspace_root))
+    command = ["rg", pattern, search_path]
     if args.get("glob"):
         command.extend(["--glob", str(args["glob"])])
     result = subprocess.run(command, cwd=registry.workspace_root, capture_output=True, text=True, check=False)
     if result.returncode not in {0, 1}:
         raise RuntimeError(result.stderr.strip() or "rg failed")
     output = result.stdout.strip()
+
+    if not output:
+        # Multi-word typo fallback: when an exact phrase returns nothing and the
+        # pattern contains multiple words, search for each token individually
+        # (case-insensitive, file-list only) so a single misspelling doesn't
+        # kill the whole query.  E.g. "queueing thoriy" still finds files that
+        # contain "queueing" even though "thoriy" ≠ "theory".
+        tokens = [t for t in re.split(r"\W+", pattern) if len(t) >= 3]
+        if len(tokens) >= 2:
+            partial: list[dict[str, Any]] = []
+            for token in tokens:
+                cmd = ["rg", "-i", "-l", token, search_path]
+                if args.get("glob"):
+                    cmd.extend(["--glob", str(args["glob"])])
+                r = subprocess.run(
+                    cmd, cwd=registry.workspace_root, capture_output=True, text=True, check=False
+                )
+                files = [f for f in r.stdout.strip().splitlines() if f][:10]
+                if files:
+                    rel: list[str] = []
+                    for f in files:
+                        try:
+                            rel.append(str(Path(f).relative_to(registry.workspace_root)))
+                        except ValueError:
+                            rel.append(f)
+                    partial.append({"term": token, "files": rel})
+            if partial:
+                return json.dumps(
+                    {
+                        "hint": (
+                            f"No exact match for '{pattern}'. "
+                            "Showing files that match individual terms "
+                            "(original query may contain a typo or misspelling)."
+                        ),
+                        "partial_matches": partial,
+                    },
+                    indent=2,
+                )
+        return output  # empty — let the agent know nothing was found
+
     if len(output) > _GREP_MAX_OUTPUT:
         truncated = output[:_GREP_MAX_OUTPUT]
         last_nl = truncated.rfind("\n")
