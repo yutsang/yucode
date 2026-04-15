@@ -9,6 +9,7 @@ Modeled after claw-code-main/rust/crates/claw-cli/src/render.rs.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -17,6 +18,16 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+# Strip ANSI CSI escape sequences to get the visible (printable) length of a
+# string.  Used when counting physical terminal rows to prevent wrap-induced
+# erase miscounts in ProgressDisplay.
+_ANSI_CSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _visible_len(s: str) -> int:
+    """Return the number of visible (non-ANSI) characters in *s*."""
+    return len(_ANSI_CSI_RE.sub("", s))
 
 # ---- Windows console support ------------------------------------------------
 
@@ -250,8 +261,13 @@ class ProgressDisplay:
                 sys.stderr.write(f"  \u25c6 {label}\n")
                 sys.stderr.flush()
             return
+        cols = shutil.get_terminal_size((80, 24)).columns
         with self._lock:
-            self._doing_label = label
+            self._doing_label = label[:max(10, cols - 12)]
+            # Clear the stale done-line so phase/worker transitions start as a
+            # single-line spinner.  This prevents the physical-row count from
+            # drifting when a long done-line previously wrapped across rows.
+            self._done_line = ""
             self._frame = 0
             self._spinning = True
         if not self._thread or not self._thread.is_alive():
@@ -284,6 +300,7 @@ class ProgressDisplay:
             time.sleep(self.INTERVAL)
 
     def _redraw(self) -> None:
+        cols = shutil.get_terminal_size((80, 24)).columns
         with self._lock:
             lines: list[str] = []
             if self._done_line:
@@ -291,9 +308,12 @@ class ProgressDisplay:
             if self._spinning and self._doing_label:
                 frame = _SPINNER_FRAMES[self._frame % len(_SPINNER_FRAMES)]
                 self._frame += 1
+                # Truncate label so the whole spinner line never wraps.
+                # 12 chars: 2 indent + 1 spinner + 1 space + 3 "..." + 5 ANSI margin
+                label = self._doing_label[:max(10, cols - 12)]
                 lines.append(
                     f"  {THEME.spinner_active}{frame}{RESET} "
-                    f"{DIM}{self._doing_label}...{RESET}"
+                    f"{DIM}{label}...{RESET}"
                 )
             elif not self._spinning and self._done_line:
                 pass
@@ -302,7 +322,13 @@ class ProgressDisplay:
         for line in lines:
             sys.stderr.write(line + "\n")
         sys.stderr.flush()
-        self._lines_on_screen = len(lines)
+        # Count *physical* rows (accounting for terminal wrap) so _erase moves
+        # the cursor up by the right number of rows rather than logical lines.
+        # Long done-lines that wrap would cause the display to drift downward
+        # one physical row per frame if we only counted logical lines.
+        self._lines_on_screen = sum(
+            max(1, (_visible_len(ln) + cols - 1) // cols) for ln in lines
+        )
 
     def _erase(self) -> None:
         if self._lines_on_screen > 0 and _IS_STDERR_TTY:
