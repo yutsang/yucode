@@ -48,6 +48,9 @@ EventCallback = Callable[[dict[str, Any]], None]
 
 _AUTO_COMPACT_ENV = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS"
 _DEFAULT_AUTO_COMPACT_THRESHOLD = 100_000
+# Hard cap on any single tool result to prevent context blowout (32 KB).
+# Large outputs (bash stdout, file reads) should use offset/limit instead.
+_MAX_TOOL_RESULT_BYTES = 32 * 1024
 
 
 def _parse_auto_compact_threshold() -> int:
@@ -255,7 +258,10 @@ class AgentRuntime:
             include_git_context=self.config.runtime.include_git_context,
             explicit_instruction_files=self.config.instruction_files,
         )
-        system_prompt = PromptAssembler(self.config, project_context).render()
+        prior_message_count = len(self.session.messages)
+        system_prompt = PromptAssembler(
+            self.config, project_context, resumed_messages=prior_message_count,
+        ).render()
         self.session.add_message(Message(role="user", content=prompt))
 
         max_steps = max_steps_override or self.config.runtime.max_iterations
@@ -263,6 +269,7 @@ class AgentRuntime:
         dedup_threshold = self.config.runtime.dedup_tool_threshold
         tool_call_count = 0
         dedup_counts: dict[tuple[str, str], int] = {}
+        dedup_blocks_this_turn = 0   # how many hard dedup stops have fired
         budget_exhausted = False
 
         summary = TurnSummary(final_text="", iterations=0)
@@ -354,13 +361,28 @@ class AgentRuntime:
                 dedup_counts[call_key] = dedup_counts.get(call_key, 0) + 1
 
                 if dedup_counts[call_key] >= dedup_threshold:
+                    dedup_blocks_this_turn += 1
+                    hint = (
+                        f" You have been hard-blocked {dedup_blocks_this_turn} time(s) "
+                        "this turn. Stop looping and answer with what you have."
+                        if dedup_blocks_this_turn > 1 else ""
+                    )
                     tool_result_content = json.dumps({
                         "error": (
-                            f"Tool `{tool_call.name}` called {dedup_threshold}+ times "
-                            "with identical arguments. Use different parameters, "
-                            "try a different approach, or stop and summarize what you found."
+                            f"HARD STOP: `{tool_call.name}` called {dedup_threshold}+ times "
+                            "with identical arguments — this is a hard limit you cannot bypass. "
+                            "You MUST do one of: (a) use different arguments, "
+                            "(b) switch to a different tool, or "
+                            f"(c) stop and answer the user with what you have.{hint}"
                         ),
+                        "error_code": "dedup_limit",
                     }, indent=2)
+                    if event_callback:
+                        event_callback({
+                            "type": "dedup_limit",
+                            "tool": tool_call.name,
+                            "blocks_this_turn": dedup_blocks_this_turn,
+                        })
                 elif tool_call_count >= max_tool_calls:
                     tool_result_content = json.dumps({
                         "error": (
@@ -632,6 +654,19 @@ class AgentRuntime:
                 f"Redacted {scan.redaction_count} secret(s): {', '.join(scan.matched_types)}",
             )
             output = scan.redacted_text
+
+        # Cap output size to prevent a single tool call from filling the context window.
+        if len(output.encode("utf-8", errors="replace")) > _MAX_TOOL_RESULT_BYTES:
+            truncated = output.encode("utf-8", errors="replace")[:_MAX_TOOL_RESULT_BYTES].decode("utf-8", errors="replace")
+            # Trim to last newline so we don't cut mid-line
+            last_nl = truncated.rfind("\n")
+            if last_nl > _MAX_TOOL_RESULT_BYTES // 2:
+                truncated = truncated[:last_nl]
+            output = (
+                truncated
+                + f"\n\n[Output capped at {_MAX_TOOL_RESULT_BYTES // 1024}KB. "
+                "Use offset/limit, a narrower glob/grep pattern, or read specific sections.]"
+            )
 
         if is_error:
             return tool_error_response(output, error_code="tool_error", recoverable=True)

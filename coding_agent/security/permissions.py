@@ -50,7 +50,13 @@ _READ_ONLY_COMMANDS = frozenset([
     "python -c", "python3 -c", "node -e",
 ])
 
-_MUTATING_INDICATORS = frozenset([">", ">>", "-i", "--in-place"])
+_MUTATING_INDICATORS = frozenset([
+    ">", ">>", "2>", "&>",   # output/error redirects
+    "-i", "--in-place",       # in-place edit flags (sed, perl, etc.)
+    ";", "&&", "||",          # command chaining — anything after ; could mutate
+    "$(", "`",                # subshell expansion — arbitrary code execution
+    "sudo",                   # privilege escalation
+])
 
 
 def resolve_permission_mode(label: str) -> PermissionMode:
@@ -326,7 +332,8 @@ def _is_read_only_command(command: str) -> bool:
     for indicator in _MUTATING_INDICATORS:
         if indicator in stripped:
             return False
-    first_token = stripped.split()[0] if stripped.split() else ""
+    parts = stripped.split()
+    first_token = parts[0] if parts else ""
     for prefix_len in (1, 2):
         tokens = stripped.split(None, prefix_len)
         prefix = " ".join(tokens[:prefix_len])

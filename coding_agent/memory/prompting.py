@@ -51,15 +51,22 @@ def discover_project_context(
 
 
 class PromptAssembler:
-    def __init__(self, config: AppConfig, project_context: ProjectContext) -> None:
+    def __init__(
+        self,
+        config: AppConfig,
+        project_context: ProjectContext,
+        *,
+        resumed_messages: int = 0,
+    ) -> None:
         self.config = config
         self.project_context = project_context
+        self.resumed_messages = resumed_messages
 
     def build_sections(self) -> list[str]:
         sections = [
             _intro_section(),
             _system_section(),
-            _doing_tasks_section(),
+            _doing_tasks_section(self.config.runtime.dedup_tool_threshold),
             _executing_actions_section(),
             SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
             self._environment_section(),
@@ -77,14 +84,18 @@ class PromptAssembler:
         return "\n\n".join(self.build_sections())
 
     def _environment_section(self) -> str:
-        return "\n".join(
-            [
-                "# Environment context",
-                f"- Working directory: {self.project_context.cwd}",
-                f"- Date: {self.project_context.current_date}",
-                f"- Platform: {platform.system()} {platform.release()}",
-            ]
-        )
+        lines = [
+            "# Environment context",
+            f"- Working directory: {self.project_context.cwd}",
+            f"- Date: {self.project_context.current_date}",
+            f"- Platform: {platform.system()} {platform.release()}",
+        ]
+        if self.resumed_messages > 0:
+            lines.append(
+                f"- Session: RESUMED — {self.resumed_messages} prior message(s) in context. "
+                "Do not re-introduce yourself. Continue from where you left off."
+            )
+        return "\n".join(lines)
 
     def _project_context_section(self) -> str:
         lines = ["# Project context"]
@@ -193,7 +204,14 @@ def _system_section() -> str:
     )
 
 
-def _doing_tasks_section() -> str:
+def _doing_tasks_section(dedup_threshold: int = 3) -> str:
+    # The runtime blocks the Nth identical call; so N-1 calls are permitted.
+    max_allowed = max(1, dedup_threshold - 1)
+    dedup_line = (
+        "- NEVER call the same tool with the same arguments more than once."
+        if max_allowed == 1 else
+        f"- NEVER call the same tool with the same arguments more than {max_allowed} times."
+    )
     return "\n".join(
         [
             "# Doing tasks",
@@ -203,7 +221,7 @@ def _doing_tasks_section() -> str:
             "- Use MCP tools when they are the best source of truth.",
             "",
             "# Tool usage limits (CRITICAL)",
-            "- NEVER call the same tool with the same arguments more than twice.",
+            dedup_line,
             "- You have a finite tool call budget per turn. Use calls wisely.",
             "- Prefer fewer, high-quality tool calls over many repetitive ones.",
             "- If a tool returns no useful data, do NOT retry with the same arguments.",

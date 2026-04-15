@@ -437,7 +437,7 @@ def app_config_from_dict(raw: dict[str, Any]) -> AppConfig:
     )
     runtime = RuntimeOptions(
         permission_mode=_coerce_permission_mode(runtime_raw.get("permission_mode", "workspace-write")),
-        max_iterations=_coerce_positive_int(runtime_raw.get("max_iterations", 12), "runtime.max_iterations"),
+        max_iterations=_coerce_positive_int(runtime_raw.get("max_iterations", 25), "runtime.max_iterations"),
         max_worker_steps=_coerce_positive_int(runtime_raw.get("max_worker_steps", 20), "runtime.max_worker_steps"),
         orchestration_mode=_coerce_orchestration_mode(runtime_raw.get("orchestration_mode", "auto")),
         parallel_workers=bool(runtime_raw.get("parallel_workers", False)),

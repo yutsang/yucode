@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
+
+_log = logging.getLogger("yucode.session")
 
 Role = Literal["system", "user", "assistant", "tool"]
 SESSION_VERSION = 1
@@ -233,6 +236,7 @@ class Session:
                     "model": data.get("model", ""),
                     "message_count": len(data.get("messages", [])),
                 })
-            except (json.JSONDecodeError, OSError):
+            except (json.JSONDecodeError, OSError) as exc:
+                _log.warning("Skipping corrupt session file %s: %s", f.name, exc)
                 continue
         return entries

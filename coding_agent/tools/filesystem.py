@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import RiskLevel, ToolDefinition, ToolSpec
@@ -48,6 +49,16 @@ def filesystem_tools(registry: ToolRegistry) -> list[ToolDefinition]:
                      "read-only", RiskLevel.LOW),
             lambda args: _grep_search(registry, args),
         ),
+        ToolDefinition(
+            ToolSpec(
+                "list_directory",
+                "List files and subdirectories in a workspace directory. "
+                "Returns each entry's name, type (file/dir), and size for files.",
+                {"type": "object", "properties": {"path": {"type": "string", "description": "Directory path relative to workspace root. Defaults to workspace root."}}, "required": []},
+                "read-only", RiskLevel.LOW,
+            ),
+            lambda args: _list_directory(registry, args),
+        ),
     ]
 
 
@@ -61,8 +72,37 @@ def _is_binary_file(path: Any) -> bool:
         return False
 
 
+def _find_similar_files(workspace: Path, path_arg: str) -> list[str]:
+    """Return up to 5 workspace-relative paths with similar names."""
+    name = Path(path_arg).name
+    if not name:
+        return []
+    stem = Path(name).stem
+    suffix = Path(name).suffix
+    seen: set[str] = set()
+    results: list[str] = []
+
+    def _collect(pattern: str) -> None:
+        for p in workspace.rglob(pattern):
+            rel = str(p.relative_to(workspace))
+            if rel not in seen:
+                seen.add(rel)
+                results.append(rel)
+
+    _collect(f"**/{name}")
+    if stem:
+        _collect(f"**/*{stem}*{suffix}" if suffix else f"**/*{stem}*")
+    return results[:5]
+
+
 def _read_file(registry: ToolRegistry, args: dict[str, Any]) -> str:
     path = registry._resolve_path(str(args["path"]))
+    if not path.exists():
+        similar = _find_similar_files(registry.workspace_root, str(args["path"]))
+        msg = f"File not found: `{path}`."
+        if similar:
+            msg += f" Did you mean: {', '.join(similar[:3])}?"
+        raise FileNotFoundError(msg)
     size = path.stat().st_size
     if size > MAX_READ_SIZE:
         raise ValueError(
@@ -117,11 +157,87 @@ def _edit_file(registry: ToolRegistry, args: dict[str, Any]) -> str:
     )
 
 
+def _glob_fuzzy_fallback(workspace: Path, pattern: str) -> list[dict[str, Any]]:
+    """Return alternative patterns that DO have matches when the original returns nothing."""
+    from pathlib import PurePosixPath
+    pure = PurePosixPath(pattern.replace("\\", "/"))
+    name = pure.name
+    stem = pure.stem
+    suffix = pure.suffix
+
+    results: list[dict[str, Any]] = []
+    tried: set[str] = {pattern}
+
+    def _probe(alt: str) -> None:
+        if alt in tried or len(results) >= 5:
+            return
+        tried.add(alt)
+        hits = sorted(str(p.relative_to(workspace)) for p in workspace.rglob(alt))[:5]
+        if hits:
+            results.append({"pattern": alt, "matches": hits})
+
+    if stem:
+        _probe(f"**/*{stem}*{suffix}" if suffix else f"**/*{stem}*")
+        _probe(f"**/{stem}*{suffix}" if suffix else f"**/{stem}*")
+    if name and ("/" in pattern or "\\" in pattern):
+        _probe(f"**/{name}")
+    if name:
+        _probe(f"**/{name.lower()}")
+        _probe(f"**/{name.upper()}")
+    if suffix and stem:
+        _probe(f"**/{stem}*")
+    return results
+
+
 def _glob_search(registry: ToolRegistry, args: dict[str, Any]) -> str:
     target = registry._resolve_path(str(args.get("target_directory", registry.workspace_root)))
     pattern = str(args["pattern"])
     matches = sorted(str(p.relative_to(registry.workspace_root)) for p in target.rglob(pattern))
-    return json.dumps(matches[:200], indent=2)
+    if matches:
+        return json.dumps(matches[:200], indent=2)
+
+    # No exact matches — try fuzzy alternatives so the model can recover without
+    # requiring the user to manually rephrase ("if not ok please find similar").
+    suggestions = _glob_fuzzy_fallback(registry.workspace_root, pattern)
+    result: dict[str, Any] = {"matches": []}
+    if suggestions:
+        result["hint"] = (
+            f"No files matched '{pattern}'. "
+            f"Similar patterns with results are listed in 'similar'."
+        )
+        result["similar"] = suggestions
+    else:
+        result["hint"] = f"No files matched '{pattern}' anywhere in the workspace."
+    return json.dumps(result, indent=2)
+
+
+def _list_directory(registry: ToolRegistry, args: dict[str, Any]) -> str:
+    raw = args.get("path", None)
+    path = registry._resolve_path(str(raw)) if raw else registry.workspace_root
+    if not path.exists():
+        similar = _find_similar_files(registry.workspace_root, str(raw or ""))
+        msg = f"Directory not found: `{path}`."
+        if similar:
+            msg += f" Similar paths: {', '.join(similar[:3])}."
+        raise FileNotFoundError(msg)
+    if not path.is_dir():
+        raise ValueError(f"`{path}` is a file, not a directory. Use read_file to read it.")
+    entries = []
+    for entry in sorted(path.iterdir(), key=lambda p: (p.is_file(), p.name.lower())):
+        if entry.name.startswith("."):
+            continue
+        row: dict[str, Any] = {"name": entry.name, "type": "file" if entry.is_file() else "dir"}
+        if entry.is_file():
+            try:
+                row["size"] = entry.stat().st_size
+            except OSError:
+                pass
+        entries.append(row)
+    try:
+        rel = str(path.relative_to(registry.workspace_root))
+    except ValueError:
+        rel = str(path)
+    return json.dumps({"path": rel or ".", "entries": entries, "count": len(entries)}, indent=2)
 
 
 def _grep_search(registry: ToolRegistry, args: dict[str, Any]) -> str:

@@ -18,6 +18,53 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+# ---- Windows console support ------------------------------------------------
+
+_IS_WIN = os.name == "nt"
+
+
+def _enable_windows_vt() -> None:
+    """Enable ANSI/VT escape processing on Windows 10+ consoles.
+
+    Without this, escape sequences print literally on legacy cmd.exe.
+    No-op on non-Windows and when VT mode is already active.
+    """
+    if not _IS_WIN:
+        return
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        for std_handle_id in (-11, -12):   # STD_OUTPUT_HANDLE, STD_ERROR_HANDLE
+            handle = kernel32.GetStdHandle(std_handle_id)
+            mode = ctypes.c_ulong()
+            if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                kernel32.SetConsoleMode(handle, mode.value | 0x0004)
+    except Exception:
+        pass
+
+
+_enable_windows_vt()
+
+# Unicode glyphs (braille, dingbats, …) are safe when:
+#   - not Windows at all, OR
+#   - running inside Windows Terminal (WT_SESSION is set), OR
+#   - Python UTF-8 mode / PYTHONUTF8, OR
+#   - the console code page is UTF-8 (cp65001)
+_enc = (getattr(sys.stdout, "encoding", None) or "").lower().replace("-", "")
+_UNICODE_SAFE = (
+    not _IS_WIN
+    or bool(os.environ.get("WT_SESSION"))
+    or bool(os.environ.get("PYTHONUTF8"))
+    or _enc in ("utf8", "utf-8", "65001")
+)
+
+# Symbols that may not render on legacy Windows consoles (cmd.exe / cp1252)
+_SYM_OK    = "✔" if _UNICODE_SAFE else "+"
+_SYM_ERR   = "✘" if _UNICODE_SAFE else "x"
+_SYM_WARN  = "⚠" if _UNICODE_SAFE else "!"
+_SYM_INFO  = "ℹ" if _UNICODE_SAFE else "i"
+_SYM_ARROW = "▸" if _UNICODE_SAFE else ">"
+
 
 def _get_version() -> str:
     try:
@@ -80,7 +127,12 @@ THEME = ColorTheme()
 
 # ---- Spinner ----------------------------------------------------------------
 
-_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+# Braille dots (U+28xx) are not in Consolas; use simple ASCII on legacy Windows.
+_SPINNER_FRAMES = (
+    ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    if _UNICODE_SAFE else
+    ["|", "/", "-", "\\"]
+)
 
 
 class Spinner:
@@ -111,9 +163,9 @@ class Spinner:
         if result_text:
             sys.stderr.write(result_text + "\n")
         elif success:
-            sys.stderr.write(f"  {THEME.success}✔{RESET} {DIM}{self._label}{RESET}\n")
+            sys.stderr.write(f"  {THEME.success}{_SYM_OK}{RESET} {DIM}{self._label}{RESET}\n")
         else:
-            sys.stderr.write(f"  {THEME.error}✘{RESET} {DIM}{self._label}{RESET}\n")
+            sys.stderr.write(f"  {THEME.error}{_SYM_ERR}{RESET} {DIM}{self._label}{RESET}\n")
         sys.stderr.flush()
 
     def update_label(self, label: str) -> None:
@@ -127,7 +179,7 @@ class Spinner:
             with self._lock:
                 label = self._label
             self._clear_line()
-            sys.stderr.write(f"  {THEME.spinner_active}{frame}{RESET} {DIM}{label}…{RESET}")
+            sys.stderr.write(f"  {THEME.spinner_active}{frame}{RESET} {DIM}{label}...{RESET}")
             sys.stderr.flush()
             time.sleep(self.INTERVAL)
 
@@ -219,7 +271,7 @@ class ProgressDisplay:
                 self._frame += 1
                 lines.append(
                     f"  {THEME.spinner_active}{frame}{RESET} "
-                    f"{DIM}{self._doing_label}…{RESET}"
+                    f"{DIM}{self._doing_label}...{RESET}"
                 )
             elif not self._spinning and self._done_line:
                 pass
@@ -267,6 +319,8 @@ def compact_tool_start_label(name: str, arguments: str) -> str:
         return f"{icon} {name}: {parsed.get('query', '?')}"
     if name in ("web_fetch",):
         return f"{icon} {name}: {_truncate(parsed.get('url', '?'), 55)}"
+    if name in ("list_directory",):
+        return f"{icon} ls: {parsed.get('path', '.')}"
     if name in ("glob_search",):
         return f"{icon} glob: {parsed.get('pattern', '?')}"
     if name in ("grep_search",):
@@ -280,8 +334,8 @@ def compact_tool_result_line(name: str, content: str, *, is_error: bool = False)
     """Single finished line: ✔/✘ + tool name + compact summary."""
     summary = _summarize_tool_result(name, content, is_error)
     if is_error:
-        return f"  {THEME.error}✘{RESET} {name} {DIM}{summary}{RESET}"
-    return f"  {THEME.success}✔{RESET} {name} {DIM}{summary}{RESET}"
+        return f"  {THEME.error}{_SYM_ERR}{RESET} {name} {DIM}{summary}{RESET}"
+    return f"  {THEME.success}{_SYM_OK}{RESET} {name} {DIM}{summary}{RESET}"
 
 
 # ---- Startup banner ---------------------------------------------------------
@@ -347,6 +401,7 @@ _TOOL_ICONS: dict[str, str] = {
     "edit_file": "🔧",
     "glob_search": "🔍",
     "grep_search": "🔎",
+    "list_directory": "📁",
     "bash": "💻",
     "web_fetch": "🌐",
     "web_search": "🔍",
@@ -392,10 +447,10 @@ def format_tool_call_start(name: str, arguments: str) -> str:
 
 def format_tool_result(name: str, content: str, *, is_error: bool = False) -> str:
     if is_error:
-        icon = f"{THEME.error}✘{RESET}"
+        icon = f"{THEME.error}{_SYM_ERR}{RESET}"
         label = f"{THEME.error}error{RESET}"
     else:
-        icon = f"{THEME.success}✔{RESET}"
+        icon = f"{THEME.success}{_SYM_OK}{RESET}"
         label = f"{THEME.success}done{RESET}"
 
     summary = _summarize_tool_result(name, content, is_error)
@@ -466,11 +521,35 @@ def _summarize_tool_result(name: str, content: str, is_error: bool) -> str:
             pass
         return _truncate(content, 80)
 
+    if name in ("list_directory",):
+        try:
+            parsed = _json.loads(content)
+            n = parsed.get("count", len(parsed.get("entries", [])))
+            return f"{n} entries"
+        except Exception:
+            pass
+        return _truncate(content, 80)
+
     if name in ("glob_search",):
         try:
-            matches = _json.loads(content)
-            if isinstance(matches, list):
-                return f"{len(matches)} matches"
+            parsed = _json.loads(content)
+            if isinstance(parsed, list):
+                n = len(parsed)
+                if n == 0:
+                    return "no matches"
+                if n <= 3:
+                    return ", ".join(parsed)
+                return f"{n} matches  ({parsed[0]}, …)"
+            if isinstance(parsed, dict):
+                # fuzzy-fallback format: {"matches": [], "hint": "...", "similar": [...]}
+                n = len(parsed.get("matches", []))
+                if n == 0:
+                    sim = parsed.get("similar", [])
+                    if sim:
+                        first_pat = sim[0].get("pattern", "?")
+                        return f"no matches — try: {first_pat}"
+                    return "no matches"
+                return f"{n} matches"
         except Exception:
             pass
         return _truncate(content, 80)
@@ -520,6 +599,10 @@ def _format_tool_detail(name: str, parsed: dict[str, Any], raw: str) -> str:
         if isinstance(cmd, str):
             cmd = _truncate(cmd, 80)
         return f"{THEME.warning}$ {cmd}{RESET}"
+
+    if name in ("list_directory",):
+        path = parsed.get("path", ".")
+        return f"{DIM}Listing {path}{RESET}"
 
     if name in ("glob_search",):
         pattern = parsed.get("pattern", "?")
@@ -705,14 +788,14 @@ def format_memory_display(
         "",
     ]
 
-    lines.append(f"  {THEME.brand}▸{RESET} {BOLD}Working Memory{RESET}")
+    lines.append(f"  {THEME.brand}{_SYM_ARROW}{RESET} {BOLD}Working Memory{RESET}")
     lines.append(f"    Messages in session:  {session_messages}")
     lines.append(f"    Estimated tokens:     {estimated_tokens:,}")
     if compaction_count:
         lines.append(f"    Compactions done:     {compaction_count}")
     lines.append("")
 
-    lines.append(f"  {THEME.brand}▸{RESET} {BOLD}Project Memory{RESET} (instruction files)")
+    lines.append(f"  {THEME.brand}{_SYM_ARROW}{RESET} {BOLD}Project Memory{RESET} (instruction files)")
     if instruction_files:
         for f in instruction_files:
             try:
@@ -726,7 +809,7 @@ def format_memory_display(
         lines.append(f"    {DIM}Create YUCODE.md to add project context.{RESET}")
     lines.append("")
 
-    lines.append(f"  {THEME.brand}▸{RESET} {BOLD}Skills{RESET}")
+    lines.append(f"  {THEME.brand}{_SYM_ARROW}{RESET} {BOLD}Skills{RESET}")
     if skills:
         for s in skills:
             name = getattr(s, "name", str(s))
@@ -736,7 +819,7 @@ def format_memory_display(
         lines.append(f"    {DIM}No skills discovered.{RESET}")
     lines.append("")
 
-    lines.append(f"  {THEME.brand}▸{RESET} {BOLD}Saved Sessions{RESET}")
+    lines.append(f"  {THEME.brand}{_SYM_ARROW}{RESET} {BOLD}Saved Sessions{RESET}")
     if sessions:
         for s in sessions[:5]:
             sid = s.get("id", "?")
@@ -752,7 +835,7 @@ def format_memory_display(
     if metrics:
         tools = metrics.get("tools", {})
         if tools:
-            lines.append(f"  {THEME.brand}▸{RESET} {BOLD}Tool Usage (this session){RESET}")
+            lines.append(f"  {THEME.brand}{_SYM_ARROW}{RESET} {BOLD}Tool Usage (this session){RESET}")
             for name, m in sorted(tools.items(), key=lambda x: x[1].get("call_count", 0), reverse=True)[:8]:
                 count = m.get("call_count", 0)
                 avg = m.get("avg_duration_ms", 0)
@@ -763,7 +846,7 @@ def format_memory_display(
 
         security = metrics.get("security_events", [])
         if security:
-            lines.append(f"  {THEME.brand}▸{RESET} {BOLD}Security Events{RESET}")
+            lines.append(f"  {THEME.brand}{_SYM_ARROW}{RESET} {BOLD}Security Events{RESET}")
             for ev in security[-5:]:
                 lines.append(f"    🛡️  {ev.get('event_type', '?')} → {ev.get('tool_name', '?')}: {ev.get('detail', '')[:60]}")
             lines.append("")
@@ -800,16 +883,16 @@ def section_header(title: str) -> str:
 
 
 def success(msg: str) -> str:
-    return f"  {THEME.success}✔{RESET} {msg}"
+    return f"  {THEME.success}{_SYM_OK}{RESET} {msg}"
 
 
 def error(msg: str) -> str:
-    return f"  {THEME.error}✘{RESET} {msg}"
+    return f"  {THEME.error}{_SYM_ERR}{RESET} {msg}"
 
 
 def warning(msg: str) -> str:
-    return f"  {THEME.warning}⚠{RESET} {msg}"
+    return f"  {THEME.warning}{_SYM_WARN}{RESET} {msg}"
 
 
 def info(msg: str) -> str:
-    return f"  {THEME.brand}ℹ{RESET} {msg}"
+    return f"  {THEME.brand}{_SYM_INFO}{RESET} {msg}"

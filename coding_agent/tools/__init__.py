@@ -47,6 +47,7 @@ _TOOL_ALIASES: dict[str, str] = {
     "edit": "edit_file",
     "glob": "glob_search",
     "grep": "grep_search",
+    "ls": "list_directory",
 }
 
 _STUB_PARAMS: dict[str, Any] = {"type": "object", "properties": {}}

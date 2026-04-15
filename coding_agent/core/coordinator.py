@@ -8,11 +8,14 @@ runs as a scoped sub-runtime with role-appropriate tools.
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any
+
+_log = logging.getLogger("yucode.coordinator")
 
 from ..config import AppConfig, ToolOptions
 from ..plugins.mcp import McpManager
@@ -48,6 +51,9 @@ _COMPLEXITY_KEYWORDS = [
     "optimize", "rewrite", "add feature", "multi-step", "across files",
     "entire codebase", "all files", "multiple files",
 ]
+
+# Conjunctions that suggest multi-part requests
+_MULTI_PART_RE = __import__("re").compile(r"\band\s+also\b|\bthen\s+also\b|\b(?:also|additionally)\s+\w", __import__("re").IGNORECASE)
 
 PLAN_PROMPT_TEMPLATE = """\
 You are a task planner for a coding agent. Analyze the user request and decompose it
@@ -117,10 +123,29 @@ class CoordinatorSummary:
 
 def is_complex_prompt(prompt: str) -> bool:
     """Heuristic: does the prompt look like it needs multi-phase orchestration?"""
+    import re
     lower = prompt.lower()
-    if len(lower.split()) < 8:
+
+    # These signals are strong enough to override any word-count gate.
+    # Explicit complexity keywords
+    if any(kw in lower for kw in _COMPLEXITY_KEYWORDS):
+        return True
+    # Multiple @ file references or source-file extensions → touches many files
+    if len(re.findall(r"@[\w./\\-]+|\w+\.(?:py|ts|js|go|rs|java|cpp|c|rb|sh|yaml|yml|json|toml)\b", prompt)) >= 2:
+        return True
+
+    # Weaker signals require a minimum word count to avoid false positives on
+    # very short prompts like "update and fix".
+    if len(lower.split()) < 6:
         return False
-    return any(kw in lower for kw in _COMPLEXITY_KEYWORDS)
+
+    # "and also / then also / additionally X" → clearly multi-part request
+    if _MULTI_PART_RE.search(prompt):
+        return True
+    # Three or more " and " conjunctions suggest a compound task
+    if lower.count(" and ") >= 3:
+        return True
+    return False
 
 
 class AdminCoordinator:
@@ -209,6 +234,14 @@ class AdminCoordinator:
             for r in work_results:
                 summary.usage.add(r.usage)
 
+            # Skip validation if the plan produced no measurable criteria —
+            # an empty criteria list causes the validator to hallucinate a pass.
+            if not plan.validation_criteria:
+                summary.final_text = self._compose_final(work_results, ValidationResult(passed=True))
+                if event_callback:
+                    event_callback({"type": "completed", "text": summary.final_text})
+                return summary
+
             if event_callback:
                 event_callback({"type": "phase_started", "phase": "validate"})
 
@@ -273,6 +306,11 @@ class AdminCoordinator:
         try:
             data = json.loads(response.text.strip())
         except json.JSONDecodeError:
+            _log.warning(
+                "Task planning returned non-JSON response; falling back to simple mode. "
+                "Response (first 200 chars): %s",
+                response.text[:200],
+            )
             return TaskPlan(is_simple=True, work_tasks=[prompt])
 
         return TaskPlan(
@@ -430,9 +468,11 @@ class AdminCoordinator:
         text = "\n\n".join(parts)
 
         if max_retries_reached:
-            text += (
+            note = (
                 f"\n\n[Note: Reached maximum retry depth "
-                f"({self.config.runtime.max_iterations}). "
-                f"Validation feedback: {validation.feedback}]"
+                f"({self.config.runtime.max_iterations})."
             )
+            if validation.feedback:
+                note += f" Validation feedback: {validation.feedback}"
+            text += note + "]"
         return text

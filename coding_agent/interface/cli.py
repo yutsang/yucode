@@ -21,6 +21,7 @@ from ..config import (
     remove_mcp_server_from_config,
     resolve_config_path,
 )
+from ..core.errors import AgentError
 from ..core.providers import OpenAICompatibleProvider
 from ..core.runtime import AgentRuntime
 from ..memory.skills import list_skills
@@ -602,7 +603,8 @@ class _InteractiveEventHandler:
         elif etype == "tool_result":
             name = event.get("name", "?")
             content = event.get("content", "")
-            is_err = '"error"' in content[:50]
+            _s = content.lstrip()
+            is_err = _s.startswith('{\n  "error"') or _s.startswith('{"error"')
             result_line = compact_tool_result_line(name, content, is_error=is_err)
             self._progress.finish_tool(result_line)
         elif etype == "assistant_delta":
@@ -614,6 +616,14 @@ class _InteractiveEventHandler:
                 delta = event.get("delta", "")
                 sys.stdout.write(delta)
                 sys.stdout.flush()
+        elif etype == "dedup_limit":
+            self._progress.stop()
+            tool = event.get("tool", "?")
+            blocks = event.get("blocks_this_turn", 1)
+            msg = f"Repeated call blocked: {tool}"
+            if blocks > 1:
+                msg += f" ({blocks}× this turn — agent may be stuck)"
+            print(render_warning(msg), file=sys.stderr)
         elif etype == "compaction":
             self._progress.stop()
             removed = event.get("removed", 0)
@@ -659,10 +669,19 @@ def _cli_event_callback(event: dict[str, Any]) -> None:
         arguments = event.get("arguments", "{}")
         label = compact_tool_start_label(name, arguments)
         progress.start_tool(label)
+    elif etype == "dedup_limit":
+        progress.stop()
+        tool = event.get("tool", "?")
+        blocks = event.get("blocks_this_turn", 1)
+        msg = f"Repeated call blocked: {tool}"
+        if blocks > 1:
+            msg += f" ({blocks}× this turn)"
+        print(render_warning(msg), file=sys.stderr)
     elif etype == "tool_result":
         name = event.get("name", "?")
         content = event.get("content", "")
-        is_err = '"error"' in content[:50]
+        _s = content.lstrip()
+        is_err = _s.startswith('{\n  "error"') or _s.startswith('{"error"')
         result_line = compact_tool_result_line(name, content, is_error=is_err)
         progress.finish_tool(result_line)
     elif etype == "assistant_delta":
@@ -913,10 +932,14 @@ def _run_interactive(args: argparse.Namespace) -> int:
                 print(format_assistant_text(summary.final_text))
             print()
             _auto_save(runtime)
-        except RuntimeError as exc:
+        except AgentError as exc:
+            handler._progress.stop()
             print(render_error(str(exc)))
+        except Exception as exc:
+            handler._progress.stop()
+            print(render_error(f"Unexpected error: {exc}"))
         except KeyboardInterrupt:
-            handler._stop_spinner(success=False)
+            handler._progress.stop()
             print(f"\n{render_warning('Interrupted.')}")
 
 
