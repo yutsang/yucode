@@ -10,8 +10,8 @@ from ..config import AppConfig
 from .skills import skill_summaries_for_prompt
 
 SYSTEM_PROMPT_DYNAMIC_BOUNDARY = "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__"
-MAX_INSTRUCTION_FILE_CHARS = 4_000
-MAX_TOTAL_INSTRUCTION_CHARS = 12_000
+MAX_INSTRUCTION_FILE_CHARS = 10_000
+MAX_TOTAL_INSTRUCTION_CHARS = 30_000
 
 
 @dataclass(frozen=True)
@@ -57,10 +57,12 @@ class PromptAssembler:
         project_context: ProjectContext,
         *,
         resumed_messages: int = 0,
+        estimated_tokens: int = 0,
     ) -> None:
         self.config = config
         self.project_context = project_context
         self.resumed_messages = resumed_messages
+        self.estimated_tokens = estimated_tokens
 
     def build_sections(self) -> list[str]:
         sections = [
@@ -94,6 +96,14 @@ class PromptAssembler:
             lines.append(
                 f"- Session: RESUMED — {self.resumed_messages} prior message(s) in context. "
                 "Do not re-introduce yourself. Continue from where you left off."
+            )
+        if self.estimated_tokens > 0:
+            threshold = self.config.runtime.compact_token_threshold
+            pct = min(100, int(self.estimated_tokens * 100 / threshold)) if threshold else 0
+            lines.append(
+                f"- Context usage: ~{self.estimated_tokens:,} estimated tokens "
+                f"({pct}% of compaction threshold). "
+                "Use concise tool calls; prefer targeted reads over broad ones."
             )
         return "\n".join(lines)
 
@@ -144,6 +154,8 @@ def discover_instruction_files(cwd: Path, explicit_paths: list[str]) -> list[Con
                 directory / "CLAW.local.md",
                 directory / ".claw" / "CLAW.md",
                 directory / ".claw" / "instructions.md",
+                directory / "CLAUDE.md",
+                directory / "CLAUDE.local.md",
             ]
         )
     for candidate in candidates:
@@ -226,6 +238,16 @@ def _doing_tasks_section(dedup_threshold: int = 3) -> str:
             "- Prefer fewer, high-quality tool calls over many repetitive ones.",
             "- If a tool returns no useful data, do NOT retry with the same arguments.",
             "- If you cannot find the answer after 3-4 tool calls, report what you found and STOP.",
+            "",
+            "# Workspace search (ALWAYS before web search)",
+            "When looking for a file, note, or topic in the project:",
+            "1. Use grep_search with content keywords — do NOT guess exact filenames.",
+            "2. If a catalog or index exists (wiki/index.md, index.md, README), read it first",
+            "   to find canonical page names and avoid creating duplicates.",
+            "3. Use glob_search with patterns like '**/*keyword*' to find files by name fragment.",
+            "4. Only fall back to web_search when the topic genuinely does not exist in workspace.",
+            "- When writing new files, follow any schema in instruction files (CLAUDE.md, YUCODE.md).",
+            "  Check for required frontmatter fields, section order, and link conventions.",
             "",
             "# Web research workflow",
             "When searching the web for information:",

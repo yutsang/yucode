@@ -15,12 +15,12 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-_log = logging.getLogger("yucode.coordinator")
-
 from ..config import AppConfig, ToolOptions
 from ..plugins.mcp import McpManager
 from .providers import OpenAICompatibleProvider
 from .session import Message, Usage
+
+_log = logging.getLogger("yucode.coordinator")
 
 EventCallback = Callable[[dict[str, Any]], None]
 
@@ -143,9 +143,7 @@ def is_complex_prompt(prompt: str) -> bool:
     if _MULTI_PART_RE.search(prompt):
         return True
     # Three or more " and " conjunctions suggest a compound task
-    if lower.count(" and ") >= 3:
-        return True
-    return False
+    return lower.count(" and ") >= 3
 
 
 class AdminCoordinator:

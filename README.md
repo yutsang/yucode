@@ -30,42 +30,95 @@ When the coordinator picks the multi-worker path, it runs four phases: **Plan** 
 ```mermaid
 flowchart TD
     User["User Prompt"] --> CLI["CLI / Bridge / Server"]
-    CLI --> Config["Load Config + Project Context"]
-    Config --> Orchestrate["AgentRuntime.orchestrate"]
-    Orchestrate -->|"auto: simple<br/>or mode = single"| SingleLoop
+    CLI --> Context["Load Config + Project Context\n(YUCODE.md · CLAUDE.md · skills)"]
+    Context --> Orchestrate["AgentRuntime.orchestrate"]
+    Orchestrate -->|"auto: simple\nor mode = single"| SingleLoop
 
     subgraph SingleLoop ["Single ReAct Loop"]
         direction TB
-        S1["AgentRuntime.run_turn"] --> S2["Provider.complete"]
+        S1["AgentRuntime.run_turn"] --> S2["Provider.complete\n(streaming or batch)"]
         S2 --> S3{"Response"}
         S3 -->|"text only"| S4["Final answer"]
-        S3 -->|"tool calls"| S5["PermissionPolicy"]
+        S3 -->|"tool calls"| S5["PermissionPolicy\n(5-level hierarchy)"]
         S5 --> S6["PreToolUse hooks"]
         S6 --> S7["ToolRegistry / MCP / Plugins"]
-        S7 --> S8["PostToolUse hooks"]
-        S8 --> S1
+        S7 --> S8["PostToolUse hooks\n+ secret redaction\n+ 32 KB size cap"]
+        S8 --> Dedup{"Dedup\ncheck"}
+        Dedup -->|"unique"| S1
+        Dedup -->|"repeat ≥ threshold"| HardStop["Hard stop:\nforce answer or switch tool"]
+        HardStop --> S1
     end
 
-    Orchestrate -->|"auto: complex<br/>or mode = multi"| Admin["AdminCoordinator"]
+    Orchestrate -->|"auto: complex\nor mode = multi"| Admin["AdminCoordinator"]
 
     subgraph MultiPhase ["Phased Workers"]
         direction TB
-        Admin --> Plan["Phase 1: Plan / Decompose"]
-        Plan --> Research["Phase 2: Research workers<br/>(read-only tools)"]
-        Research --> Work["Phase 3: Work workers<br/>(write tools)"]
-        Work --> Validate["Phase 4: Validate worker<br/>(read + bash)"]
+        Admin --> Plan["Phase 1: Plan / Decompose\n(LLM → JSON task list)"]
+        Plan --> Research["Phase 2: Research workers\n(read-only tools)"]
+        Research --> Work["Phase 3: Work workers\n(write tools)"]
+        Work --> Validate["Phase 4: Validate worker\n(read + bash)"]
         Validate -->|"pass"| Done["Result"]
         Validate -->|"fail & retry < max_iterations"| Work
         Validate -->|"fail & out of retries"| Done
     end
 
-    SingleLoop --> Compact["Optional compaction"]
-    MultiPhase --> Compact
-    Compact --> Save["Optional session save"]
-    Save --> Out["Return to caller"]
+    SingleLoop --> Budget{"Context\nbudget check"}
+    MultiPhase --> Budget
+    Budget -->|"tokens < mid-turn threshold"| Compact1["No compaction"]
+    Budget -->|"tokens ≥ mid-turn threshold"| Compact2["Mid-turn compaction\n(heuristic or LLM summary)"]
+    Compact1 --> PostCheck{"Post-turn\ncumulative check"}
+    Compact2 --> PostCheck
+    PostCheck -->|"cumulative < auto threshold"| Save["Optional session save\n(auto_save_session)"]
+    PostCheck -->|"cumulative ≥ auto threshold"| AutoCompact["Post-turn auto-compaction"]
+    AutoCompact --> Save
+    Save --> Out["Return to caller\n(resume via auto_resume_latest)"]
 ```
 
 Each scoped worker is itself a full `AgentRuntime` running the inner `Single ReAct Loop`, so the multi-worker phases inherit the same permission, hook, and tool-execution pipeline. There is no separate code path for "agent vs sub-agent" -- only the tool whitelist and role prompt change.
+
+### Project context and memory
+
+Before every turn the runtime assembles a system prompt from several sources, merged in priority order:
+
+| Source | Purpose |
+|---|---|
+| `YUCODE.md` / `CLAUDE.md` / `CLAW.md` | Per-project conventions, schemas, and workflow instructions |
+| `YUCODE.local.md` / `CLAUDE.local.md` | Local overrides not committed to git |
+| `.yucode/instructions.md` / `.claw/instructions.md` | Subdirectory-level rules |
+| `.claude/commands/*.md` / `.yucode/skills/<name>/SKILL.md` | Named skills / slash commands loadable via `load_skill` |
+
+All candidate paths are discovered by walking from the filesystem root down to the current working directory, so rules cascade naturally from global → project → subdirectory. The assembled prompt also includes current git status, estimated token usage, and a resume signal if prior messages are in context.
+
+### Tool safety and search
+
+The agent is given explicit search discipline in the system prompt: **workspace first, web second**. For any topic or file lookup it is instructed to use `grep_search` (content keywords) and `glob_search` (name patterns), and to read any existing index file (`wiki/index.md`, `README.md`, etc.) before falling back to `web_search`. When writing new files it checks loaded instruction files for required frontmatter, section structure, and link conventions.
+
+Additional runtime-enforced safety:
+- **32 KB tool result cap** -- prevents a single large file or search result from filling the context window; agent is directed to use `offset`/`limit` for targeted reads
+- **Dedup hard stop** -- identical tool call repeated ≥ `dedup_tool_threshold` times in one turn is blocked with an explicit "switch tools or answer" instruction
+- **Tool budget** -- a per-turn `max_tool_calls` ceiling prevents runaway loops
+- **Permission hierarchy** -- five levels (`read-only`, `workspace-write`, `danger-full-access`, `prompt`, `allow`) enforced at `PermissionPolicy`; bash commands are additionally scanned for mutation patterns (`;`, `&&`, `sudo`, redirect operators)
+
+### Context compaction (multi-layer)
+
+Long sessions are managed by two independent compaction layers so the context window never fills silently:
+
+| Layer | Trigger | Mechanism |
+|---|---|---|
+| Mid-turn | Start of each ReAct iteration when estimated tokens ≥ `compact_token_threshold` (default 60 000) | Drops oldest messages, preserves `compact_preserve_recent` (default 4) most recent; replaced by a summary injected as a system message |
+| Post-turn auto | After each turn when cumulative provider input tokens ≥ `YUCODE_AUTO_COMPACT_INPUT_TOKENS` (default 100 000) | Same drop-and-summarise, fires once per turn boundary |
+
+Both layers support two strategies: `heuristic` (structured timeline built from message metadata) and `llm` (a live provider call that writes a prose summary of what was dropped). Set `runtime.compact_strategy: llm` to enable the richer summaries.
+
+Compaction is always preceded by archiving the current message list to `~/.yucode/projects/<key>/archives/` so nothing is permanently lost.
+
+### Session continuity
+
+Sessions are persisted and resumed automatically:
+- `runtime.auto_save_session: true` (default) -- saves the full message history as `latest.json` after every turn
+- `runtime.auto_resume_latest: true` (default) -- loads `latest.json` at startup; the system prompt tells the agent it is in a resumed session and how many prior messages exist
+- Named saves: `/save <id>` and `yucode chat --resume <id>` for branching or long-term threads
+- On resume the startup banner shows session age and the first user message so you can tell at a glance which context you are continuing
 
 ### Provider-agnostic by design
 

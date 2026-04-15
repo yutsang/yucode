@@ -86,7 +86,7 @@ class RuntimeOptions:
     auto_save_session: bool = True
     auto_resume_latest: bool = True
     compact_preserve_recent: int = 4
-    compact_token_threshold: int = 10_000
+    compact_token_threshold: int = 60_000
     compact_strategy: CompactStrategy = "heuristic"
     error_strategy: ErrorStrategy = "resilient"
     shell_timeout_seconds: int = 30
@@ -446,7 +446,7 @@ def app_config_from_dict(raw: dict[str, Any]) -> AppConfig:
         auto_save_session=bool(runtime_raw.get("auto_save_session", True)),
         auto_resume_latest=bool(runtime_raw.get("auto_resume_latest", True)),
         compact_preserve_recent=_coerce_positive_int(runtime_raw.get("compact_preserve_recent", 4), "runtime.compact_preserve_recent"),
-        compact_token_threshold=_coerce_positive_int(runtime_raw.get("compact_token_threshold", 10000), "runtime.compact_token_threshold"),
+        compact_token_threshold=_coerce_positive_int(runtime_raw.get("compact_token_threshold", 60000), "runtime.compact_token_threshold"),
         compact_strategy=_coerce_compact_strategy(runtime_raw.get("compact_strategy", "heuristic")),
         error_strategy=_coerce_error_strategy(runtime_raw.get("error_strategy", "resilient")),
         shell_timeout_seconds=_coerce_positive_int(

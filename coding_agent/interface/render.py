@@ -21,6 +21,7 @@ from typing import Any
 # ---- Windows console support ------------------------------------------------
 
 _IS_WIN = os.name == "nt"
+_IS_STDERR_TTY = hasattr(sys.stderr, "isatty") and sys.stderr.isatty()
 
 
 def _enable_windows_vt() -> None:
@@ -213,6 +214,10 @@ class ProgressDisplay:
 
     def start_tool(self, label: str) -> None:
         """Begin spinning for a new tool."""
+        if not _IS_STDERR_TTY:
+            sys.stderr.write(f"  {DIM}→ {label}...{RESET}\n")
+            sys.stderr.flush()
+            return
         with self._lock:
             self._doing_label = label
             self._frame = 0
@@ -223,6 +228,10 @@ class ProgressDisplay:
 
     def finish_tool(self, result_line: str) -> None:
         """Mark current tool as done.  Its result becomes the new 'done' line."""
+        if not _IS_STDERR_TTY:
+            sys.stderr.write(result_line + "\n")
+            sys.stderr.flush()
+            return
         with self._lock:
             self._spinning = False
             self._done_line = result_line
@@ -234,6 +243,8 @@ class ProgressDisplay:
 
     def set_thinking(self, label: str = "Thinking") -> None:
         """Show a 'Thinking' spinner (no done line above)."""
+        if not _IS_STDERR_TTY:
+            return  # non-TTY: silent between tool calls
         with self._lock:
             self._doing_label = label
             self._frame = 0
@@ -244,6 +255,10 @@ class ProgressDisplay:
 
     def stop(self) -> None:
         """Stop all animation and clear progress lines from screen."""
+        if not _IS_STDERR_TTY:
+            self._done_line = ""
+            self._doing_label = ""
+            return
         with self._lock:
             self._spinning = False
         if self._thread:
@@ -254,6 +269,8 @@ class ProgressDisplay:
         self._doing_label = ""
 
     def _animate(self) -> None:
+        if not _IS_STDERR_TTY:
+            return
         while True:
             with self._lock:
                 if not self._spinning:
@@ -283,13 +300,13 @@ class ProgressDisplay:
         self._lines_on_screen = len(lines)
 
     def _erase(self) -> None:
-        if self._lines_on_screen > 0:
+        if self._lines_on_screen > 0 and _IS_STDERR_TTY:
             sys.stderr.write(
                 f"\x1b[{self._lines_on_screen}A"
                 f"\x1b[J"
             )
             sys.stderr.flush()
-            self._lines_on_screen = 0
+        self._lines_on_screen = 0
 
 
 # ---- Compact tool display (single-line dynamic) ----------------------------
@@ -367,12 +384,12 @@ def startup_banner(
     if session_info:
         lines.append(f"  {THEME.brand}│{RESET}  {DIM}session{RESET}     {session_info}")
 
-    yucode_md = workspace / "YUCODE.md"
-    claw_md = workspace / "CLAW.md"
-    if yucode_md.is_file():
-        lines.append(f"  {THEME.brand}│{RESET}  {DIM}memory{RESET}      YUCODE.md loaded")
-    elif claw_md.is_file():
-        lines.append(f"  {THEME.brand}│{RESET}  {DIM}memory{RESET}      CLAW.md loaded")
+    _instruction_candidates = ["YUCODE.md", "CLAW.md", "CLAUDE.md"]
+    _loaded = [n for n in _instruction_candidates if (workspace / n).is_file()]
+    if _loaded:
+        lines.append(
+            f"  {THEME.brand}│{RESET}  {DIM}memory{RESET}      {', '.join(_loaded)} loaded"
+        )
 
     lines.extend([
         f"  {THEME.brand}│{RESET}",

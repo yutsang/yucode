@@ -230,11 +230,19 @@ class Session:
         for f in sorted(sessions_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
             try:
                 data = json.loads(f.read_text(encoding="utf-8"))
+                messages = data.get("messages", [])
+                title = ""
+                for m in messages:
+                    if isinstance(m, dict) and m.get("role") == "user":
+                        raw = (m.get("content") or "").strip()
+                        title = raw[:80] + ("…" if len(raw) > 80 else "")
+                        break
                 entries.append({
                     "id": f.stem,
                     "created_at": data.get("created_at", 0),
                     "model": data.get("model", ""),
-                    "message_count": len(data.get("messages", [])),
+                    "message_count": len(messages),
+                    "title": title,
                 })
             except (json.JSONDecodeError, OSError) as exc:
                 _log.warning("Skipping corrupt session file %s: %s", f.name, exc)

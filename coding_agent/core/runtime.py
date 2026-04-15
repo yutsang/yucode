@@ -46,7 +46,8 @@ _log = logging.getLogger("yucode.runtime")
 
 EventCallback = Callable[[dict[str, Any]], None]
 
-_AUTO_COMPACT_ENV = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS"
+_AUTO_COMPACT_ENV = "YUCODE_AUTO_COMPACT_INPUT_TOKENS"
+_AUTO_COMPACT_ENV_LEGACY = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS"
 _DEFAULT_AUTO_COMPACT_THRESHOLD = 100_000
 # Hard cap on any single tool result to prevent context blowout (32 KB).
 # Large outputs (bash stdout, file reads) should use offset/limit instead.
@@ -54,7 +55,10 @@ _MAX_TOOL_RESULT_BYTES = 32 * 1024
 
 
 def _parse_auto_compact_threshold() -> int:
-    raw = os.environ.get(_AUTO_COMPACT_ENV, "").strip()
+    raw = (
+        os.environ.get(_AUTO_COMPACT_ENV, "").strip()
+        or os.environ.get(_AUTO_COMPACT_ENV_LEGACY, "").strip()
+    )
     if not raw:
         return _DEFAULT_AUTO_COMPACT_THRESHOLD
     try:
@@ -133,6 +137,8 @@ class AgentRuntime:
         self._compaction_config = CompactionConfig(
             preserve_recent_messages=config.runtime.compact_preserve_recent,
             max_estimated_tokens=config.runtime.compact_token_threshold,
+            strategy=config.runtime.compact_strategy,
+            llm_compactor=self._make_llm_compactor() if config.runtime.compact_strategy == "llm" else None,
         )
         self._auto_compact_threshold = _parse_auto_compact_threshold()
         audit_logger = AuditLogger(self.workspace_root, enabled=config.audit.enabled)
@@ -260,7 +266,10 @@ class AgentRuntime:
         )
         prior_message_count = len(self.session.messages)
         system_prompt = PromptAssembler(
-            self.config, project_context, resumed_messages=prior_message_count,
+            self.config,
+            project_context,
+            resumed_messages=prior_message_count,
+            estimated_tokens=self.estimated_tokens(),
         ).render()
         self.session.add_message(Message(role="user", content=prompt))
 
@@ -469,6 +478,41 @@ class AgentRuntime:
     # ------------------------------------------------------------------
     # Compaction
     # ------------------------------------------------------------------
+
+    def _make_llm_compactor(self):  # type: ignore[return]
+        """Return a callable that uses the provider to summarise dropped messages."""
+        provider = self.provider
+
+        def _compactor(messages: list[dict]) -> str:
+            parts = []
+            for m in messages[:30]:
+                role = m.get("role", "?")
+                content = str(m.get("content") or "")
+                # Summarise long tool results inline rather than dumping them
+                if role == "tool" and len(content) > 300:
+                    content = content[:300] + "…"
+                parts.append(f"[{role}]: {content[:400]}")
+                for tc in m.get("tool_calls", []):
+                    parts.append(f"  tool_call {tc.get('name', '?')}({tc.get('arguments', '')[:120]})")
+            transcript = "\n".join(parts)
+            prompt = (
+                "Summarise the following conversation fragment for a coding agent. "
+                "Keep: user goals, files modified/read, decisions made, tool results that matter. "
+                "Drop: verbose reasoning and redundant tool calls. "
+                "Be concise but complete — the agent will continue work from this summary.\n\n"
+                + transcript
+            )
+            try:
+                response = provider.complete(
+                    [{"role": "user", "content": prompt}],
+                    tools=[],
+                )
+                return response.text
+            except Exception as exc:  # noqa: BLE001
+                _log.warning("LLM compactor failed, falling back to heuristic: %s", exc)
+                return ""
+
+        return _compactor
 
     def compact(self, config: CompactionConfig | None = None) -> CompactionResult:
         msg_count = len(self.session.messages)

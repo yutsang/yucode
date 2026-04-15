@@ -628,6 +628,11 @@ class _InteractiveEventHandler:
             self._progress.stop()
             removed = event.get("removed", 0)
             print(render_info(f"Compacted {removed} messages to free context"))
+        elif etype == "auto_compaction":
+            self._progress.stop()
+            removed = event.get("removed", 0)
+            tokens = event.get("cumulative_input_tokens", 0)
+            print(render_info(f"Auto-compacted {removed} messages ({tokens:,} cumulative input tokens)"))
         elif etype == "usage":
             pass
         elif etype == "completed":
@@ -684,6 +689,11 @@ def _cli_event_callback(event: dict[str, Any]) -> None:
         is_err = _s.startswith('{\n  "error"') or _s.startswith('{"error"')
         result_line = compact_tool_result_line(name, content, is_error=is_err)
         progress.finish_tool(result_line)
+    elif etype == "auto_compaction":
+        progress.stop()
+        removed = event.get("removed", 0)
+        tokens = event.get("cumulative_input_tokens", 0)
+        print(render_info(f"Auto-compacted {removed} messages ({tokens:,} cumulative input tokens)"))
     elif etype == "assistant_delta":
         pass
     elif etype == "completed":
@@ -862,6 +872,34 @@ def _make_completer(workspace: Path):
     return completer
 
 
+def _format_session_resume_info(session: Any) -> str:
+    """Build a human-readable resume label from a session object."""
+    msg_count = len(session.messages)
+    # Find first user message for context
+    first_user = ""
+    for m in session.messages:
+        if m.role == "user":
+            raw = (m.content or "").strip()
+            first_user = raw[:50] + ("…" if len(raw) > 50 else "")
+            break
+    age = ""
+    if hasattr(session, "created_at") and session.created_at:
+        import time as _time
+        secs = _time.time() - session.created_at
+        if secs < 3600:
+            age = f"{int(secs // 60)}m ago"
+        elif secs < 86400:
+            age = f"{int(secs // 3600)}h ago"
+        else:
+            age = f"{int(secs // 86400)}d ago"
+    parts = [f"{msg_count} msgs"]
+    if age:
+        parts.append(age)
+    if first_user:
+        parts.append(f'"{first_user}"')
+    return "resumed: " + " · ".join(parts)
+
+
 def _run_interactive(args: argparse.Namespace) -> int:
     from .commands import InputKind, parse_input
 
@@ -882,7 +920,7 @@ def _run_interactive(args: argparse.Namespace) -> int:
     elif config.runtime.auto_resume_latest:
         session = _try_auto_resume(workspace, config)
         if session:
-            session_info = f"auto-resumed latest ({len(session.messages)} msgs)"
+            session_info = _format_session_resume_info(session)
 
     prompter = InteractivePermissionPrompter() if config.runtime.permission_mode == "prompt" else None
     runtime = AgentRuntime(workspace, config, session=session, permission_prompter=prompter)
@@ -1074,7 +1112,16 @@ def _handle_slash_command_interactive(command: str, arguments: str, config: Any,
         else:
             print(section_header("Saved Sessions"))
             for s in sessions[:10]:
-                print(f"  💾 {s['id']}  {DIM}model={s.get('model', '?')}  msgs={s['message_count']}{RESET}")
+                secs = time.time() - float(s.get("created_at") or 0)
+                if secs < 3600:
+                    age = f"{int(secs // 60)}m ago"
+                elif secs < 86400:
+                    age = f"{int(secs // 3600)}h ago"
+                else:
+                    age = f"{int(secs // 86400)}d ago"
+                title = s.get("title", "")
+                title_part = f'  "{title[:40]}"' if title else ""
+                print(f"  💾 {s['id']:12s}  {DIM}{age:8s}  {s['message_count']} msgs{title_part}{RESET}")
             if arguments.strip():
                 sid = arguments.strip()
                 try:

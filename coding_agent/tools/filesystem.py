@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import subprocess
 from pathlib import Path
@@ -212,7 +213,7 @@ def _glob_search(registry: ToolRegistry, args: dict[str, Any]) -> str:
 
 
 def _list_directory(registry: ToolRegistry, args: dict[str, Any]) -> str:
-    raw = args.get("path", None)
+    raw = args.get("path")
     path = registry._resolve_path(str(raw)) if raw else registry.workspace_root
     if not path.exists():
         similar = _find_similar_files(registry.workspace_root, str(raw or ""))
@@ -228,10 +229,8 @@ def _list_directory(registry: ToolRegistry, args: dict[str, Any]) -> str:
             continue
         row: dict[str, Any] = {"name": entry.name, "type": "file" if entry.is_file() else "dir"}
         if entry.is_file():
-            try:
+            with contextlib.suppress(OSError):
                 row["size"] = entry.stat().st_size
-            except OSError:
-                pass
         entries.append(row)
     try:
         rel = str(path.relative_to(registry.workspace_root))
