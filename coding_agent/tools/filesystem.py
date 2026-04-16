@@ -275,6 +275,18 @@ def _grep_rel(workspace: Path, files: list[str]) -> list[str]:
     return result
 
 
+def _ngrams(word: str, n: int = 4) -> list[str]:
+    """Unique n-grams from *word* in insertion order; used for fuzzy fallback on garbled queries."""
+    seen: set[str] = set()
+    result: list[str] = []
+    for i in range(len(word) - n + 1):
+        gram = word[i : i + n]
+        if gram not in seen:
+            seen.add(gram)
+            result.append(gram)
+    return result
+
+
 def _grep_search(registry: ToolRegistry, args: dict[str, Any]) -> str:
     pattern = str(args["pattern"])
     search_path = str(args.get("path", registry.workspace_root))
@@ -320,6 +332,28 @@ def _grep_search(registry: ToolRegistry, args: dict[str, Any]) -> str:
                 if files:
                     partial.append({"term": prefix + "…", "files": _grep_rel(registry.workspace_root, files)})
                     break  # stop at first successful prefix
+
+            # N-gram fallback: for heavily garbled words where all prefixes fail,
+            # try 4-char sliding windows. Even a severely garbled word shares small
+            # substrings with the real term ("uein" appears in both "queingthoery"
+            # and "queueing"). Aggregate votes across grams — files that match 2+
+            # distinct n-grams are strong candidates.
+            if not partial and len(token) >= 7:
+                file_votes: dict[str, int] = {}
+                for gram in _ngrams(token, 4)[:12]:
+                    cmd = ["rg", "-i", "-l", gram, search_path]
+                    if args.get("glob"):
+                        cmd.extend(["--glob", str(args["glob"])])
+                    r = subprocess.run(
+                        cmd, cwd=registry.workspace_root, capture_output=True, text=True, check=False
+                    )
+                    for f in (f for f in r.stdout.strip().splitlines() if f):
+                        key = _grep_rel(registry.workspace_root, [f])[0]
+                        file_votes[key] = file_votes.get(key, 0) + 1
+                top = sorted(file_votes, key=lambda f: -file_votes[f])
+                top = [f for f in top if file_votes[f] >= 2][:5] or top[:3]
+                if top:
+                    partial.append({"term": f"{token[:5]}… (fuzzy)", "files": top})
 
         if partial:
             return json.dumps(
