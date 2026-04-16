@@ -581,6 +581,8 @@ class _InteractiveEventHandler:
         self._current_iteration = 0
         self._text_started = False
         self._in_coordinator: bool = False
+        self._tool_calls_this_turn: bool = False  # any tool call in current turn
+        self._text_buf: str = ""                  # buffered assistant text, pending flush
 
     def __call__(self, event: dict[str, Any]) -> None:
         etype = event.get("type", "")
@@ -621,18 +623,19 @@ class _InteractiveEventHandler:
                 # agent label to be printed mid-worker output.
                 self._turn_start = time.monotonic()
                 self._text_started = False
+                self._tool_calls_this_turn = False
+                self._text_buf = ""
             if not self._in_coordinator:
-                # Restart the spinner on every iteration so the user can see
-                # the agent is still processing between tool results and the
-                # next LLM response.  Without this the display is frozen/static
-                # during the LLM thinking phase, which looks like a hang.
-                # The tool_call event will update the label as soon as the
-                # next tool fires.
                 self._progress.set_thinking("Thinking")
         elif etype == "tool_call":
             name = event.get("name", "?")
             arguments = event.get("arguments", "{}")
             label = compact_tool_start_label(name, arguments)
+            # Discard any text buffered before this tool call (intermediate reasoning).
+            # The final response will be printed by the chat loop from summary.final_text.
+            self._tool_calls_this_turn = True
+            self._text_buf = ""
+            self._text_started = False
             self._progress.start_tool(label)
         elif etype == "tool_result":
             name = event.get("name", "?")
@@ -642,20 +645,16 @@ class _InteractiveEventHandler:
             result_line = compact_tool_result_line(name, content, is_error=is_err)
             self._progress.finish_tool(result_line)
         elif etype == "assistant_delta":
-            if self._in_coordinator:
-                # Worker sub-runtimes stream via this event too.  Suppress their
-                # intermediate output — the coordinator's final_text is what the
-                # user sees, delivered after `completed`.
+            if self._in_coordinator or self._tool_calls_this_turn:
+                # Suppress intermediate text: coordinator workers stream via this
+                # event but we only show the final coordinator result; similarly,
+                # text that precedes or follows tool calls is interim reasoning
+                # that the user doesn't need to see.
                 pass
             else:
-                self._progress.stop()
-                if not self._text_started:
-                    print(agent_label(), end="")
-                    self._text_started = True
-                if self.streaming:
-                    delta = event.get("delta", "")
-                    sys.stdout.write(delta)
-                    sys.stdout.flush()
+                # Buffer text until we know whether tool calls will follow.
+                # Flushed in the `completed` handler if no tool calls occurred.
+                self._text_buf += event.get("delta", "")
         elif etype == "dedup_limit":
             self._progress.stop()
             tool = event.get("tool", "?")
@@ -688,10 +687,12 @@ class _InteractiveEventHandler:
             self._progress.stop()
             was_coordinator = self._in_coordinator
             self._in_coordinator = False
-            if not self._text_started and not was_coordinator:
-                # Non-coordinator, non-streaming: put the label here so the
-                # chat loop's format_assistant_text() lands right after it.
+            # Flush buffered text — only present when no tool calls occurred this turn.
+            if self._text_buf and not was_coordinator:
                 print(agent_label(), end="")
+                print(format_assistant_text(self._text_buf))
+                self._text_started = True
+                self._text_buf = ""
             print()
 
 
@@ -1074,8 +1075,6 @@ def _run_interactive(args: argparse.Namespace) -> int:
                 ), file=sys.stderr)
             if not handler._text_started:
                 print(agent_label(), end="")
-                print(format_assistant_text(summary.final_text))
-            elif not config.provider.stream:
                 print(format_assistant_text(summary.final_text))
             print()
             _auto_save(runtime)

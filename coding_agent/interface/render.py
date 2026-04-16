@@ -296,7 +296,10 @@ class ProgressDisplay:
             with self._lock:
                 if not self._spinning:
                     break
-            self._redraw()
+            try:
+                self._redraw()
+            except Exception:  # noqa: BLE001
+                pass  # never let a render error kill the animation thread
             time.sleep(self.INTERVAL)
 
     def _redraw(self) -> None:
