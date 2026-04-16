@@ -6,6 +6,7 @@ if the optional dependency is missing, telling the model how to install it.
 
 from __future__ import annotations
 
+import contextlib
 import json
 from typing import TYPE_CHECKING, Any
 
@@ -308,10 +309,8 @@ def _get_visibility_state(ws: Any) -> tuple[set[int], set[int]]:
             hidden_rows.add(int(row_num))
     for col_letter, cd in ws.column_dimensions.items():
         if cd.hidden:
-            try:
+            with contextlib.suppress(Exception):
                 hidden_cols.add(column_index_from_string(col_letter))
-            except Exception:
-                pass
     return hidden_rows, hidden_cols
 
 
