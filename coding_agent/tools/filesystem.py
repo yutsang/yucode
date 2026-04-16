@@ -265,10 +265,21 @@ def _list_directory(registry: ToolRegistry, args: dict[str, Any]) -> str:
     return json.dumps({"path": rel or ".", "entries": entries, "count": len(entries)}, indent=2)
 
 
+def _grep_rel(workspace: Path, files: list[str]) -> list[str]:
+    result: list[str] = []
+    for f in files:
+        with contextlib.suppress(ValueError):
+            result.append(str(Path(f).relative_to(workspace)))
+            continue
+        result.append(f)
+    return result
+
+
 def _grep_search(registry: ToolRegistry, args: dict[str, Any]) -> str:
     pattern = str(args["pattern"])
     search_path = str(args.get("path", registry.workspace_root))
-    command = ["rg", pattern, search_path]
+    # -i: case-insensitive by default — avoids missing "Queueing" when searching "queueing"
+    command = ["rg", "-i", pattern, search_path]
     if args.get("glob"):
         command.extend(["--glob", str(args["glob"])])
     result = subprocess.run(command, cwd=registry.workspace_root, capture_output=True, text=True, check=False)
@@ -277,42 +288,51 @@ def _grep_search(registry: ToolRegistry, args: dict[str, Any]) -> str:
     output = result.stdout.strip()
 
     if not output:
-        # Multi-word typo fallback: when an exact phrase returns nothing and the
-        # pattern contains multiple words, search for each token individually
-        # (case-insensitive, file-list only) so a single misspelling doesn't
-        # kill the whole query.  E.g. "queueing thoriy" still finds files that
-        # contain "queueing" even though "thoriy" ≠ "theory".
         tokens = [t for t in re.split(r"\W+", pattern) if len(t) >= 3]
+        partial: list[dict[str, Any]] = []
+
         if len(tokens) >= 2:
-            partial: list[dict[str, Any]] = []
+            # Multi-word: try each token separately so one misspelled word
+            # doesn't kill the whole query.
             for token in tokens:
                 cmd = ["rg", "-i", "-l", token, search_path]
                 if args.get("glob"):
                     cmd.extend(["--glob", str(args["glob"])])
-                r = subprocess.run(
-                    cmd, cwd=registry.workspace_root, capture_output=True, text=True, check=False
-                )
+                r = subprocess.run(cmd, cwd=registry.workspace_root, capture_output=True, text=True, check=False)
                 files = [f for f in r.stdout.strip().splitlines() if f][:10]
                 if files:
-                    rel: list[str] = []
-                    for f in files:
-                        try:
-                            rel.append(str(Path(f).relative_to(registry.workspace_root)))
-                        except ValueError:
-                            rel.append(f)
-                    partial.append({"term": token, "files": rel})
-            if partial:
-                return json.dumps(
-                    {
-                        "hint": (
-                            f"No exact match for '{pattern}'. "
-                            "Showing files that match individual terms "
-                            "(original query may contain a typo or misspelling)."
-                        ),
-                        "partial_matches": partial,
-                    },
-                    indent=2,
-                )
+                    partial.append({"term": token, "files": _grep_rel(registry.workspace_root, files)})
+
+        elif len(tokens) == 1:
+            # Single word: the case-insensitive search above already failed, so
+            # try progressively shorter prefixes to catch trailing-char typos
+            # (e.g. "websrach" → "websrac…" → "websra…" until a match is found).
+            token = tokens[0]
+            for trim in range(1, min(4, len(token) - 2)):
+                prefix = token[:-trim]
+                if len(prefix) < 4:
+                    break
+                cmd = ["rg", "-i", "-l", prefix, search_path]
+                if args.get("glob"):
+                    cmd.extend(["--glob", str(args["glob"])])
+                r = subprocess.run(cmd, cwd=registry.workspace_root, capture_output=True, text=True, check=False)
+                files = [f for f in r.stdout.strip().splitlines() if f][:10]
+                if files:
+                    partial.append({"term": prefix + "…", "files": _grep_rel(registry.workspace_root, files)})
+                    break  # stop at first successful prefix
+
+        if partial:
+            return json.dumps(
+                {
+                    "hint": (
+                        f"No exact match for '{pattern}'. "
+                        "Showing files that match individual terms "
+                        "(original query may contain a typo or misspelling)."
+                    ),
+                    "partial_matches": partial,
+                },
+                indent=2,
+            )
         return output  # empty — let the agent know nothing was found
 
     if len(output) > _GREP_MAX_OUTPUT:
