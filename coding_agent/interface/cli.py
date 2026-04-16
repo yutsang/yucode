@@ -61,7 +61,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", dest="config_path")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    subparsers.add_parser("init-config", help="Interactive wizard to create/edit all settings in config.yml.").set_defaults(handler=handle_init_config)
+    _init_cfg = subparsers.add_parser("init-config", help="Interactive wizard to create/edit all settings in config.yml.")
+    _init_cfg.add_argument("--defaults", "-y", action="store_true", help="Write default config without prompting.")
+    _init_cfg.set_defaults(handler=handle_init_config)
     subparsers.add_parser("show-config", help="Print the active config.").set_defaults(handler=handle_show_config)
     subparsers.add_parser("config-path", help="Print the active config path.").set_defaults(handler=handle_config_path)
     subparsers.add_parser("bridge", help="Start the JSONL bridge used by VS Code.").set_defaults(handler=handle_bridge)
@@ -318,6 +320,16 @@ def handle_init_config(args: argparse.Namespace) -> int:
     path = resolve_config_path(args.config_path)
     config_missing = not path.exists()
     ensure_default_config(path)
+
+    # --defaults / -y: just ensure the file exists with defaults, skip the wizard
+    if getattr(args, "defaults", False):
+        if config_missing:
+            print(f"  Created default config at {path}")
+        else:
+            print(f"  Config already exists at {path} (unchanged)")
+        print("  Edit it directly or re-run without --defaults to use the wizard.")
+        return 0
+
     raw: dict[str, Any] = {}
     with suppress(Exception):
         raw = load_yaml(path.read_text(encoding="utf-8")) or {}
@@ -512,8 +524,12 @@ def handle_init(args: argparse.Namespace) -> int:
     print(f"\n  Project initialized at {target}")
     print("\n  Getting started:")
     print("    1. Set YUCODE_API_KEY in .env or edit ~/.yucode/settings.yml")
+    print("       (or run: yucode init-config --defaults  to write a template config)")
     print("    2. Edit YUCODE.md to describe your project conventions")
     print(f"    3. Run: yucode chat --workspace {target}")
+    print()
+    print("  Note: do NOT run `pip install .` from this directory.")
+    print("        To install/update yucode, run: pip install yucode-agent")
     print()
     return 0
 
@@ -1693,6 +1709,27 @@ def handle_doctor(args: argparse.Namespace) -> int:
     except Exception:
         sandbox_info["summary"] = "Sandbox detection unavailable"
     checks.append(sandbox_info)
+
+    # Workspace Python-project check: yucode works in any directory, but running
+    # `pip install .` here will fail if there is no pyproject.toml / setup.py.
+    has_pyproject = (workspace / "pyproject.toml").is_file()
+    has_setup = (workspace / "setup.py").is_file() or (workspace / "setup.cfg").is_file()
+    if has_pyproject or has_setup:
+        checks.append({
+            "name": "workspace_python_project",
+            "status": "ok",
+            "summary": "Python project detected (pyproject.toml / setup.py present).",
+        })
+    else:
+        checks.append({
+            "name": "workspace_python_project",
+            "status": "info",
+            "summary": (
+                "No pyproject.toml or setup.py in workspace — yucode works fine here. "
+                "Do NOT run `pip install .` from this directory; "
+                "install yucode itself with `pip install yucode-agent` from any other directory."
+            ),
+        })
 
     all_ok = all(c["status"] in ("ok", "info") for c in checks)
 
