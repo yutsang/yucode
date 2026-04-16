@@ -316,6 +316,9 @@ class OpenAICompatibleProvider:
         usage = Usage()
         chunk_count = 0
         saw_non_openai_stream_payload = False
+        # Filter ensures <tool_call> blocks are never forwarded to the terminal
+        # while still being collected in text_parts for end-of-stream parsing.
+        stream_filter = _TextToolCallFilter()
         for raw_line in response:
             line = raw_line.decode("utf-8", errors="replace").strip()
             if not line or not line.startswith("data:"):
@@ -350,8 +353,9 @@ class OpenAICompatibleProvider:
             content = _extract_content_text(delta.get("content"))
             if content:
                 text_parts.append(content)
-                if stream_callback:
-                    stream_callback({"type": "assistant_delta", "delta": content})
+                to_emit = stream_filter.push(content)
+                if to_emit and stream_callback:
+                    stream_callback({"type": "assistant_delta", "delta": to_emit})
             for tool_call_delta in delta.get("tool_calls", []):
                 index = int(tool_call_delta.get("index", 0))
                 function_delta = tool_call_delta.get("function", {})
@@ -383,6 +387,12 @@ class OpenAICompatibleProvider:
                 "your base_url, chat_path, and append_chat_path are correct.",
                 category="provider_empty_stream",
             )
+
+        # Flush any text still in the filter buffer (e.g. content after the
+        # last </tool_call> tag that didn't fill a full safe-emit window).
+        tail = stream_filter.flush()
+        if tail and stream_callback:
+            stream_callback({"type": "assistant_delta", "delta": tail})
 
         tool_calls = [
             ToolCall(id=item["id"], name=item["name"], arguments=item["arguments"])
@@ -426,6 +436,105 @@ _RE_FUNCTION_CALL_TAG = re.compile(
 )
 
 
+def _fix_json_control_chars(text: str) -> str:
+    """Escape literal control characters inside JSON string values.
+
+    Local/quantised models (e.g. Qwen3) sometimes embed raw newlines inside
+    JSON string values — invalid JSON that ``json.loads`` rejects.  This
+    walks the text character-by-character, tracks string context, and escapes
+    ``\\n``, ``\\r``, ``\\t`` only when they appear inside a string literal.
+    """
+    result: list[str] = []
+    in_string = False
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if c == "\\" and in_string:
+            # Keep existing escape sequence intact
+            result.append(c)
+            i += 1
+            if i < len(text):
+                result.append(text[i])
+                i += 1
+            continue
+        if c == '"':
+            in_string = not in_string
+            result.append(c)
+        elif in_string:
+            if c == "\n":
+                result.append("\\n")
+            elif c == "\r":
+                result.append("\\r")
+            elif c == "\t":
+                result.append("\\t")
+            else:
+                result.append(c)
+        else:
+            result.append(c)
+        i += 1
+    return "".join(result)
+
+
+class _TextToolCallFilter:
+    """Buffers streaming text so ``<tool_call>`` / ``<function_call>`` blocks
+    are never forwarded to the ``assistant_delta`` callback.
+
+    The full text (including tool-call blocks) is still accumulated in
+    ``text_parts`` so that ``_extract_text_tool_calls`` can parse them at the
+    end of the stream.  This filter only governs what reaches the terminal.
+    """
+
+    _OPEN_TAGS: tuple[str, ...] = ("<tool_call>", "<function_call>")
+    _CLOSE: dict[str, str] = {
+        "<tool_call>": "</tool_call>",
+        "<function_call>": "</function_call>",
+    }
+    _MAX_OPEN_LEN: int = max(len(t) for t in _OPEN_TAGS)
+
+    def __init__(self) -> None:
+        self._buf = ""
+        self._open_tag = ""  # empty = not inside a suppressed block
+
+    def push(self, chunk: str) -> str:
+        """Accept a new streaming chunk; return text safe to emit."""
+        self._buf += chunk
+        return self._drain(flush_all=False)
+
+    def flush(self) -> str:
+        """Call at end of stream; return any remaining safe text."""
+        return self._drain(flush_all=True)
+
+    def _drain(self, flush_all: bool) -> str:
+        parts: list[str] = []
+        while True:
+            if not self._open_tag:
+                nearest, found = len(self._buf), ""
+                for tag in self._OPEN_TAGS:
+                    pos = self._buf.find(tag)
+                    if pos != -1 and pos < nearest:
+                        nearest, found = pos, tag
+                if found:
+                    parts.append(self._buf[:nearest])
+                    self._buf = self._buf[nearest:]
+                    self._open_tag = found
+                    # continue to look for the close tag
+                else:
+                    safe = len(self._buf) if flush_all else max(0, len(self._buf) - self._MAX_OPEN_LEN)
+                    parts.append(self._buf[:safe])
+                    self._buf = self._buf[safe:]
+                    break
+            else:
+                close = self._CLOSE[self._open_tag]
+                cpos = self._buf.find(close)
+                if cpos != -1:
+                    self._buf = self._buf[cpos + len(close):]
+                    self._open_tag = ""
+                    # continue to handle text after the close tag
+                else:
+                    break  # close tag hasn't arrived yet
+        return "".join(parts)
+
+
 def _extract_text_tool_calls(text: str) -> tuple[str, list[ToolCall]]:
     """Parse tool calls embedded as text (e.g. ``<tool_call>{...}</tool_call>``).
 
@@ -433,16 +542,25 @@ def _extract_text_tool_calls(text: str) -> tuple[str, list[ToolCall]]:
     function-calling API and instead emit tool calls as XML-wrapped JSON in the
     assistant message content.  This function extracts them, returning the
     cleaned text and a list of ToolCall objects.
+
+    If the embedded JSON contains literal newlines inside string values
+    (a common Qwen3/local-model artefact), ``_fix_json_control_chars`` is
+    tried as a second-chance parse before giving up.
     """
     calls: list[ToolCall] = []
     cleaned = text
 
     for pattern in (_RE_TOOL_CALL_TAG, _RE_FUNCTION_CALL_TAG):
         for match in pattern.finditer(text):
+            raw_json = match.group(1)
             try:
-                data = json.loads(match.group(1))
+                data = json.loads(raw_json)
             except json.JSONDecodeError:
-                continue
+                # Second chance: escape literal control chars inside strings
+                try:
+                    data = json.loads(_fix_json_control_chars(raw_json))
+                except json.JSONDecodeError:
+                    continue
             name = data.get("name", "")
             if not name:
                 continue
