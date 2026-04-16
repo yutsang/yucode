@@ -59,7 +59,13 @@ from .render import (
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="yucode", description="YuCode coding agent CLI.")
     parser.add_argument("--config", dest="config_path")
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    # Top-level flags so `yucode` (no subcommand) can accept --workspace etc.
+    parser.add_argument("--workspace", default=".", help="Workspace directory (default: current dir).")
+    parser.add_argument("--model", default=None, help="Override the chat model.")
+    parser.add_argument("--permission-mode", default=None,
+                        choices=["read-only", "workspace-write", "danger-full-access", "prompt", "allow"])
+    parser.set_defaults(handler=handle_default)
+    subparsers = parser.add_subparsers(dest="command", required=False)
 
     _init_cfg = subparsers.add_parser("init-config", help="Interactive wizard to create/edit all settings in config.yml.")
     _init_cfg.add_argument("--defaults", "-y", action="store_true", help="Write default config without prompting.")
@@ -761,12 +767,33 @@ def _cli_event_callback(event: dict[str, Any]) -> None:
 _cli_event_callback._progress = ProgressDisplay()  # type: ignore[attr-defined]
 
 
+def handle_default(args: argparse.Namespace) -> int:
+    """Entry point for bare `yucode` with no subcommand — start interactive mode."""
+    if not _ensure_api_key(args.config_path):
+        return 1
+    import argparse as _ap
+    interactive_args = _ap.Namespace(
+        workspace=getattr(args, "workspace", "."),
+        config_path=args.config_path,
+        resume=None,
+        model=getattr(args, "model", None),
+        allowed_tools=None,
+        permission_mode=getattr(args, "permission_mode", None),
+    )
+    return _run_interactive(interactive_args)
+
+
 def handle_chat(args: argparse.Namespace) -> int:
     if not _ensure_api_key(args.config_path):
         return 1
-    if args.prompt is not None:
-        return _run_single_turn(args)
-    return _run_interactive(args)
+    if args.prompt is None:
+        print(render_error(
+            "`yucode chat` requires a prompt.\n"
+            "  Usage:  yucode chat \"<your task>\"\n"
+            "  For interactive mode run:  yucode"
+        ), file=sys.stderr)
+        return 1
+    return _run_single_turn(args)
 
 
 def _apply_cli_overrides(config: Any, args: argparse.Namespace) -> Any:
@@ -1025,6 +1052,10 @@ def _run_interactive(args: argparse.Namespace) -> int:
             return 0
         if not line:
             continue
+        if line.lower() in ("exit", "quit", "bye"):
+            _auto_save(runtime)
+            print(render_info("Bye."))
+            return 0
         parsed = parse_input(line, workspace)
         if parsed.kind == InputKind.SLASH:
             _dispatch_slash_interactive(parsed, config, workspace, runtime)
