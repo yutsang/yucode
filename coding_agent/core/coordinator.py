@@ -336,6 +336,7 @@ class AdminCoordinator:
                     "type": "worker_spawned",
                     "role": role.value,
                     "task_index": i,
+                    "total_tasks": len(tasks),
                     "task": task[:200],
                 })
             full_prompt = f"{context}\n\n{task}" if context else task

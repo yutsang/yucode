@@ -575,7 +575,10 @@ class _InteractiveEventHandler:
         elif etype == "worker_spawned":
             role = event.get("role", "?")
             task = event.get("task", "")[:60]
-            self._progress.set_thinking(f"Worker [{role}]: {task}")
+            idx = event.get("task_index", 0) + 1
+            total = event.get("total_tasks", 1)
+            counter = f" {idx}/{total}" if total > 1 else ""
+            self._progress.set_thinking(f"Worker [{role}{counter}]: {task}")
         elif etype == "validation_result":
             self._progress.stop()
             passed = event.get("passed", False)
@@ -596,10 +599,16 @@ class _InteractiveEventHandler:
                 # agent label to be printed mid-worker output.
                 self._turn_start = time.monotonic()
                 self._text_started = False
-            self._progress.set_thinking(
-                "Thinking" if self._current_iteration == 1
-                else f"Thinking (iter {self._current_iteration})"
-            )
+            if not self._in_coordinator:
+                # In coordinator mode keep the worker/tool label in the spinner
+                # rather than overwriting it with generic "Thinking (iter N)".
+                # Keeping the label also prevents set_thinking from clearing
+                # the done-line that shows the last tool result (e.g. web_search
+                # results that should stay visible between iterations).
+                self._progress.set_thinking(
+                    "Thinking" if self._current_iteration == 1
+                    else f"Thinking (iter {self._current_iteration})"
+                )
         elif etype == "tool_call":
             name = event.get("name", "?")
             arguments = event.get("arguments", "{}")
@@ -671,7 +680,10 @@ def _cli_event_callback(event: dict[str, Any]) -> None:
     elif etype == "worker_spawned":
         role = event.get("role", "?")
         task = event.get("task", "")[:60]
-        progress.set_thinking(f"Worker [{role}]: {task}")
+        idx = event.get("task_index", 0) + 1
+        total = event.get("total_tasks", 1)
+        counter = f" {idx}/{total}" if total > 1 else ""
+        progress.set_thinking(f"Worker [{role}{counter}]: {task}")
     elif etype == "validation_result":
         progress.stop()
         passed = event.get("passed", False)
