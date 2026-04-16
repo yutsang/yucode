@@ -621,12 +621,13 @@ class _InteractiveEventHandler:
                 # agent label to be printed mid-worker output.
                 self._turn_start = time.monotonic()
                 self._text_started = False
-            if not self._in_coordinator and self._current_iteration == 1:
-                # Only set the spinner on the first iteration.  On later
-                # iterations the spinner already shows the last tool result
-                # (e.g. "✔ web_search: 5 results") which is far more useful
-                # than a generic "Thinking (iter N)" label.  The tool_call
-                # event will update it again as soon as the next tool fires.
+            if not self._in_coordinator:
+                # Restart the spinner on every iteration so the user can see
+                # the agent is still processing between tool results and the
+                # next LLM response.  Without this the display is frozen/static
+                # during the LLM thinking phase, which looks like a hang.
+                # The tool_call event will update the label as soon as the
+                # next tool fires.
                 self._progress.set_thinking("Thinking")
         elif etype == "tool_call":
             name = event.get("name", "?")
@@ -724,6 +725,10 @@ def _cli_event_callback(event: dict[str, Any]) -> None:
     elif etype == "retry_started":
         attempt = event.get("attempt", "?")
         progress.set_thinking(f"Retrying (attempt {attempt})")
+    elif etype == "iteration_started":
+        # Show "Thinking" spinner between tool results and the next LLM response
+        # so the user knows the agent is still active (not hung).
+        progress.set_thinking("Thinking")
     elif etype == "tool_call":
         name = event.get("name", "?")
         arguments = event.get("arguments", "{}")

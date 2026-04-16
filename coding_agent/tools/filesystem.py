@@ -305,6 +305,23 @@ def _grep_search(registry: ToolRegistry, args: dict[str, Any]) -> str:
         partial: list[dict[str, Any]] = []
         glob_arg = args.get("glob")
 
+        # ---- Filename search (fast: lists files, no content reading) ----
+        r_all = subprocess.run(
+            ["rg", "--files", search_path],
+            cwd=registry.workspace_root, capture_output=True, text=True, check=False,
+        )
+        all_paths = [p for p in r_all.stdout.strip().splitlines() if p]
+        for tok in tokens[:4]:
+            if len(tok) < 4:
+                continue
+            name_hits = [p for p in all_paths if tok.lower() in p.lower()][:8]
+            if name_hits:
+                partial.append({
+                    "term": tok,
+                    "source": "filename",
+                    "files": _grep_rel(registry.workspace_root, name_hits),
+                })
+
         if len(tokens) >= 2:
             # Multi-word: search each token in parallel, returning content snippets
             # so the AI sees matching lines rather than bare file paths.
