@@ -457,7 +457,7 @@ class TestHybridFallback:
         )
         call_count = 0
 
-        def fake_do_complete(self, messages, tools, *, stream, stream_callback=None):
+        def fake_do_complete(self, messages, tools, *, stream, stream_callback=None, cancel_event=None):
             nonlocal call_count
             call_count += 1
             from coding_agent.core.session import AssistantResponse, Usage
@@ -484,7 +484,7 @@ class TestHybridFallback:
         )
         call_count = 0
 
-        def fake_do_complete(self, messages, tools, *, stream, stream_callback=None):
+        def fake_do_complete(self, messages, tools, *, stream, stream_callback=None, cancel_event=None):
             nonlocal call_count
             call_count += 1
             from coding_agent.core.session import AssistantResponse, Usage
@@ -507,7 +507,7 @@ class TestHybridFallback:
         )
         streams_used: list[bool] = []
 
-        def fake_do_complete(self, messages, tools, *, stream, stream_callback=None):
+        def fake_do_complete(self, messages, tools, *, stream, stream_callback=None, cancel_event=None):
             streams_used.append(stream)
             from coding_agent.core.session import AssistantResponse, Usage
             return AssistantResponse(text="non-stream", tool_calls=[], usage=Usage(input_tokens=1))
@@ -529,7 +529,7 @@ class TestHybridFallback:
         )
         call_count = 0
 
-        def fake_do_complete(self, messages, tools, *, stream, stream_callback=None):
+        def fake_do_complete(self, messages, tools, *, stream, stream_callback=None, cancel_event=None):
             nonlocal call_count
             call_count += 1
             from coding_agent.core.session import AssistantResponse, Usage
@@ -552,7 +552,7 @@ class TestHybridFallback:
         )
         call_count = 0
 
-        def fake_do_complete(self, messages, tools, *, stream, stream_callback=None):
+        def fake_do_complete(self, messages, tools, *, stream, stream_callback=None, cancel_event=None):
             nonlocal call_count
             call_count += 1
             from coding_agent.core.session import AssistantResponse, Usage

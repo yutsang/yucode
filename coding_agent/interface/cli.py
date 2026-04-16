@@ -1086,6 +1086,7 @@ def _run_interactive(args: argparse.Namespace) -> int:
             handler._progress.stop()
             print(render_error(f"Unexpected error: {exc}"))
         except KeyboardInterrupt:
+            runtime.cancel()
             handler._progress.stop()
             print(f"\n{render_warning('Interrupted.')}")
 

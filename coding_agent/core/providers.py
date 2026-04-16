@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import logging
+import queue
 import re
 import ssl
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -138,9 +140,14 @@ class OpenAICompatibleProvider:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
         stream_callback: StreamCallback | None = None,
+        *,
+        cancel_event: threading.Event | None = None,
     ) -> AssistantResponse:
         use_stream = self.config.streaming_mode != "no_stream"
-        response = self._do_complete(messages, tools, stream=use_stream, stream_callback=stream_callback)
+        response = self._do_complete(
+            messages, tools, stream=use_stream,
+            stream_callback=stream_callback, cancel_event=cancel_event,
+        )
 
         if (
             self.config.streaming_mode == "hybrid"
@@ -154,7 +161,10 @@ class OpenAICompatibleProvider:
                     "type": "fallback",
                     "message": "Streaming returned no usable response; retrying without streaming.",
                 })
-            response = self._do_complete(messages, tools, stream=False, stream_callback=stream_callback)
+            response = self._do_complete(
+                messages, tools, stream=False,
+                stream_callback=stream_callback, cancel_event=cancel_event,
+            )
 
         return response
 
@@ -165,6 +175,7 @@ class OpenAICompatibleProvider:
         *,
         stream: bool,
         stream_callback: StreamCallback | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> AssistantResponse:
         body: dict[str, Any] = {
             "model": self.config.model,
@@ -193,7 +204,9 @@ class OpenAICompatibleProvider:
             try:
                 with urllib.request.urlopen(request, timeout=self.config.request_timeout_seconds, context=context) as response:
                     if stream:
-                        return self._parse_streaming_response(response, stream_callback)
+                        return self._parse_streaming_response(
+                            response, stream_callback, cancel_event=cancel_event,
+                        )
                     raw_body = response.read().decode("utf-8")
                     try:
                         data = json.loads(raw_body)
@@ -310,6 +323,8 @@ class OpenAICompatibleProvider:
         self,
         response: Any,
         stream_callback: StreamCallback | None,
+        *,
+        cancel_event: threading.Event | None = None,
     ) -> AssistantResponse:
         text_parts: list[str] = []
         tool_call_accumulator: dict[int, dict[str, str]] = {}
@@ -319,70 +334,111 @@ class OpenAICompatibleProvider:
         # Filter ensures <tool_call> blocks are never forwarded to the terminal
         # while still being collected in text_parts for end-of-stream parsing.
         stream_filter = _TextToolCallFilter()
-        try:
-            for raw_line in response:
-                line = raw_line.decode("utf-8", errors="replace").strip()
-                if not line or not line.startswith("data:"):
-                    continue
-                payload_text = line[5:].strip()
-                if payload_text == "[DONE]":
-                    break
-                try:
-                    payload = json.loads(payload_text)
-                except json.JSONDecodeError:
-                    _log.debug("Skipping non-JSON SSE chunk: %s", payload_text[:120])
-                    continue
-                if not isinstance(payload, dict):
-                    continue
-                if not _looks_like_openai_response(payload):
-                    if not saw_non_openai_stream_payload:
-                        detail = _extract_envelope_detail(payload)
-                        hint = f" Server message: {detail}" if detail else ""
-                        _emit_warning(
-                            stream_callback,
-                            f"Streaming response from {self._build_url()} returned a non-OpenAI "
-                            f"SSE payload. Payload keys: {sorted(payload.keys())}.{hint} "
-                            "This provider may not support OpenAI-style streaming; "
-                            "try setting `provider.streaming_mode: no_stream`.",
-                            category="provider_streaming_non_openai",
-                        )
-                        saw_non_openai_stream_payload = True
-                    continue
-                chunk_count += 1
-                choice = payload.get("choices", [{}])[0]
-                delta = choice.get("delta", {})
-                content = _extract_content_text(delta.get("content"))
-                if content:
-                    text_parts.append(content)
-                    to_emit = stream_filter.push(content)
-                    if to_emit and stream_callback:
-                        stream_callback({"type": "assistant_delta", "delta": to_emit})
-                for tool_call_delta in delta.get("tool_calls", []):
-                    index = int(tool_call_delta.get("index", 0))
-                    function_delta = tool_call_delta.get("function", {})
-                    slot = tool_call_accumulator.setdefault(
-                        index,
-                        {
-                            "id": tool_call_delta.get("id") or f"tool_{uuid4().hex[:8]}",
-                            "name": "",
-                            "arguments": "",
-                        },
+
+        # Run the blocking socket read in a daemon thread so the main thread
+        # stays responsive to Ctrl+C (KeyboardInterrupt) and stall timeouts.
+        _q: queue.Queue[tuple[str, Any]] = queue.Queue()
+
+        def _reader() -> None:
+            try:
+                for raw_line in response:
+                    _q.put(("line", raw_line))
+                _q.put(("done", None))
+            except Exception as exc:  # noqa: BLE001
+                _q.put(("error", exc))
+
+        threading.Thread(target=_reader, daemon=True).start()
+
+        _POLL = 0.1          # seconds between cancel/stall checks
+        _STALL = 120.0       # seconds of silence before giving up
+        idle = 0.0
+
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                raise ProviderError("Cancelled by user", recoverable=True)
+            try:
+                kind, data = _q.get(timeout=_POLL)
+            except queue.Empty:
+                idle += _POLL
+                if idle >= _STALL:
+                    raise ProviderError(
+                        f"Stream stalled: no data received for {_STALL:.0f}s. "
+                        "The provider may have hung. Try again or set "
+                        "provider.streaming_mode: no_stream.",
+                        recoverable=True,
                     )
-                    if tool_call_delta.get("id"):
-                        slot["id"] = tool_call_delta["id"]
-                    slot["name"] += function_delta.get("name", "")
-                    slot["arguments"] += function_delta.get("arguments", "")
-                raw_usage = payload.get("usage") or {}
-                if stream_callback and raw_usage:
-                    stream_callback({"type": "usage", "usage": raw_usage})
-                if raw_usage:
-                    _merge_usage_max(usage, raw_usage)
-        except OSError as exc:
-            raise ProviderError(
-                f"Stream read error: {exc}. "
-                "Try increasing provider.request_timeout_seconds or set provider.streaming_mode: no_stream.",
-                recoverable=True,
-            ) from exc
+                continue
+            idle = 0.0
+            if kind == "done":
+                break
+            if kind == "error":
+                exc = data
+                if isinstance(exc, OSError):
+                    raise ProviderError(
+                        f"Stream read error: {exc}. "
+                        "Try increasing provider.request_timeout_seconds or "
+                        "set provider.streaming_mode: no_stream.",
+                        recoverable=True,
+                    ) from exc
+                raise exc
+            # kind == "line"
+            raw_line = data
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line or not line.startswith("data:"):
+                continue
+            payload_text = line[5:].strip()
+            if payload_text == "[DONE]":
+                break
+            try:
+                payload = json.loads(payload_text)
+            except json.JSONDecodeError:
+                _log.debug("Skipping non-JSON SSE chunk: %s", payload_text[:120])
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if not _looks_like_openai_response(payload):
+                if not saw_non_openai_stream_payload:
+                    detail = _extract_envelope_detail(payload)
+                    hint = f" Server message: {detail}" if detail else ""
+                    _emit_warning(
+                        stream_callback,
+                        f"Streaming response from {self._build_url()} returned a non-OpenAI "
+                        f"SSE payload. Payload keys: {sorted(payload.keys())}.{hint} "
+                        "This provider may not support OpenAI-style streaming; "
+                        "try setting `provider.streaming_mode: no_stream`.",
+                        category="provider_streaming_non_openai",
+                    )
+                    saw_non_openai_stream_payload = True
+                continue
+            chunk_count += 1
+            choice = payload.get("choices", [{}])[0]
+            delta = choice.get("delta", {})
+            content = _extract_content_text(delta.get("content"))
+            if content:
+                text_parts.append(content)
+                to_emit = stream_filter.push(content)
+                if to_emit and stream_callback:
+                    stream_callback({"type": "assistant_delta", "delta": to_emit})
+            for tool_call_delta in delta.get("tool_calls", []):
+                index = int(tool_call_delta.get("index", 0))
+                function_delta = tool_call_delta.get("function", {})
+                slot = tool_call_accumulator.setdefault(
+                    index,
+                    {
+                        "id": tool_call_delta.get("id") or f"tool_{uuid4().hex[:8]}",
+                        "name": "",
+                        "arguments": "",
+                    },
+                )
+                if tool_call_delta.get("id"):
+                    slot["id"] = tool_call_delta["id"]
+                slot["name"] += function_delta.get("name", "")
+                slot["arguments"] += function_delta.get("arguments", "")
+            raw_usage = payload.get("usage") or {}
+            if stream_callback and raw_usage:
+                stream_callback({"type": "usage", "usage": raw_usage})
+            if raw_usage:
+                _merge_usage_max(usage, raw_usage)
 
         if chunk_count == 0 and not saw_non_openai_stream_payload:
             _emit_warning(

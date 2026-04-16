@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import os
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -149,6 +150,7 @@ class AgentRuntime:
         self.metrics = MetricsCollector(audit_logger=audit_logger)
 
         self._plugins_initialized = False
+        self._cancel_event = threading.Event()
 
     def _ensure_plugins_initialized(self) -> None:
         if self._plugins_initialized:
@@ -165,6 +167,10 @@ class AgentRuntime:
                 self.plugin_registry.shutdown_plugins()
             except Exception as exc:
                 _log.warning("Plugin shutdown failed: %s", exc)
+
+    def cancel(self) -> None:
+        """Signal any in-progress provider stream to stop at its next poll interval."""
+        self._cancel_event.set()
 
     @classmethod
     def from_workspace(
@@ -277,6 +283,8 @@ class AgentRuntime:
         ).render()
         self.session.add_message(Message(role="user", content=prompt))
 
+        self._cancel_event.clear()
+
         max_steps = max_steps_override or self.config.runtime.max_iterations
         max_tool_calls = self.config.runtime.max_tool_calls
         dedup_threshold = self.config.runtime.dedup_tool_threshold
@@ -316,6 +324,7 @@ class AgentRuntime:
                     self.session.provider_messages(system_prompt),
                     self.tools.definitions_for_provider(),
                     stream_callback=event_callback,
+                    cancel_event=self._cancel_event,
                 )
             except Exception as exc:
                 _log.error("Provider call failed: %s", exc)
