@@ -9,7 +9,7 @@ import pytest
 from coding_agent import __version__
 from coding_agent.config.settings import _resolve_api_key, is_dangerous_mode
 from coding_agent.core.errors import AgentError, tool_error_response
-from coding_agent.core.runtime import _MAX_STUCK_DEDUP_BLOCKS
+from coding_agent.core.runtime import _MAX_CONSECUTIVE_READONLY, _MAX_STUCK_DEDUP_BLOCKS
 from coding_agent.core.session import Message, ToolCall
 from coding_agent.core.summary_compression import SummaryCompressionBudget, compress_summary
 from coding_agent.memory.compact import CompactionConfig, compact_session, should_compact
@@ -142,6 +142,12 @@ def test_max_stuck_dedup_blocks_constant() -> None:
     assert _MAX_STUCK_DEDUP_BLOCKS > 0
 
 
+def test_max_consecutive_readonly_constant() -> None:
+    """_MAX_CONSECUTIVE_READONLY must be a positive integer and larger than dedup threshold."""
+    assert isinstance(_MAX_CONSECUTIVE_READONLY, int)
+    assert _MAX_CONSECUTIVE_READONLY > 0
+
+
 def test_compress_summary_deduplicates_case_insensitively() -> None:
     lines = ["Pending work: fix bug", "pending work: fix bug", "Other note"]
     result = compress_summary("\n".join(lines))
@@ -187,3 +193,26 @@ def test_tool_registry_unknown_tool_still_raises(tmp_path: Path) -> None:
     reg = _make_registry(tmp_path)
     with pytest.raises(KeyError, match="NonExistentTool"):
         reg.execute("NonExistentTool", {})
+
+
+# --- system prompt content ---
+
+
+def test_system_prompt_contains_table_unit_guidance(tmp_path: Path) -> None:
+    """The rendered system prompt must instruct the model to look for units in table headers."""
+    from coding_agent.config import AppConfig
+    from coding_agent.memory.prompting import ProjectContext, PromptAssembler
+    ctx = ProjectContext(cwd=tmp_path, current_date="2026-01-01", git_status=None, git_diff=None, instruction_files=[])
+    prompt = PromptAssembler(AppConfig(), ctx).render()
+    assert "header" in prompt.lower() and "unit" in prompt.lower(), (
+        "System prompt should mention reading headers for units in tables"
+    )
+
+
+def test_system_prompt_contains_complex_task_guidance(tmp_path: Path) -> None:
+    """The rendered system prompt must include guidance for multi-step task planning."""
+    from coding_agent.config import AppConfig
+    from coding_agent.memory.prompting import ProjectContext, PromptAssembler
+    ctx = ProjectContext(cwd=tmp_path, current_date="2026-01-01", git_status=None, git_diff=None, instruction_files=[])
+    prompt = PromptAssembler(AppConfig(), ctx).render()
+    assert "plan" in prompt.lower(), "System prompt should mention writing a plan for complex tasks"

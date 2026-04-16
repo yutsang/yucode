@@ -54,6 +54,8 @@ _DEFAULT_AUTO_COMPACT_THRESHOLD = 100_000
 _MAX_TOOL_RESULT_BYTES = 32 * 1024
 # After this many dedup blocks in one turn, the agent is stuck: force-stop.
 _MAX_STUCK_DEDUP_BLOCKS = 3
+# After this many consecutive read-only tool calls with no write/exec, nudge the agent.
+_MAX_CONSECUTIVE_READONLY = 8
 
 
 def _parse_auto_compact_threshold() -> int:
@@ -283,6 +285,7 @@ class AgentRuntime:
         dedup_blocks_this_turn = 0   # how many hard dedup stops have fired
         _last_dedup_tool = ""        # most recently blocked tool name
         budget_exhausted = False
+        consecutive_readonly_calls = 0  # read-only calls with no write/exec in between
 
         summary = TurnSummary(final_text="", iterations=0)
         for iteration in range(1, max_steps + 1):
@@ -417,6 +420,25 @@ class AgentRuntime:
                         tool_call.name, tool_call.arguments,
                     )
                     tool_call_count += 1
+                    # Track whether this call mutated state or was read-only
+                    try:
+                        perm = self.tools.permission_for(tool_call.name)
+                    except KeyError:
+                        perm = "unknown"
+                    if perm == "read-only":
+                        consecutive_readonly_calls += 1
+                    else:
+                        consecutive_readonly_calls = 0
+                    # Nudge the model once when it crosses the read-only threshold
+                    if consecutive_readonly_calls == _MAX_CONSECUTIVE_READONLY:
+                        tool_result_content = (
+                            tool_result_content
+                            + f"\n\n[Advisory: {consecutive_readonly_calls} consecutive "
+                            "read-only calls without writing or executing anything. "
+                            "If you have gathered enough information, act on it now — "
+                            "write files, run commands, or answer the user. "
+                            "Avoid reading more unless strictly necessary.]"
+                        )
 
                 tool_message = Message(
                     role="tool",

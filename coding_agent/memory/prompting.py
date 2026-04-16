@@ -264,6 +264,22 @@ def _doing_tasks_section(dedup_threshold: int = 3) -> str:
             "- Prefer fewer, targeted searches over many broad ones.",
             "- When fetching, pass a 'prompt' parameter describing what to extract.",
             "- NEVER call web_search more than 5 times total in one turn.",
+            "",
+            "# Reading tables and structured data",
+            "When a file contains a table (markdown, CSV, TSV, spreadsheet export):",
+            "- ALWAYS read the header row first — it defines what each column means.",
+            "- Column headers often carry units: 'Price (USD)', 'weight_kg', 'Speed [m/s]'.",
+            "  Report every value WITH its unit. Never quote a bare number from a table.",
+            "- If a footer, legend, or note row specifies units, read it before reporting values.",
+            "- When units are ambiguous or missing from headers, say so explicitly.",
+            "",
+            "# Complex multi-step tasks",
+            "Before starting a task with 3+ steps:",
+            "1. Write out a brief plan listing the steps in order.",
+            "2. Execute one step, verify it completed, then move to the next.",
+            "3. If you have been reading files for several calls without writing or running",
+            "   anything, stop — synthesize what you have and act, or ask the user.",
+            "4. Do not re-read files you already have in context.",
         ]
     )
 
