@@ -288,29 +288,107 @@ def _ngrams(word: str, n: int = 4) -> list[str]:
     return result
 
 
+def _rg(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str] | None:
+    """Run ripgrep; return None if rg is not installed (e.g. Windows without it on PATH)."""
+    try:
+        return subprocess.run(
+            ["rg", *args], cwd=cwd, capture_output=True, text=True, check=False,
+        )
+    except FileNotFoundError:
+        return None
+
+
+def _py_grep_lines(
+    pattern: str,
+    search_path: Path,
+    workspace_root: Path,
+    *,
+    glob_filter: str | None = None,
+    files_only: bool = False,
+    max_lines: int = 300,
+) -> list[str]:
+    """Pure-Python content search used when rg is not available."""
+    try:
+        regex = re.compile(pattern, re.IGNORECASE)
+    except re.error:
+        regex = re.compile(re.escape(pattern), re.IGNORECASE)
+    results: list[str] = []
+    seen_files: set[str] = set()
+    for filepath in sorted(search_path.rglob("*")):
+        if len(results) >= max_lines:
+            break
+        if not filepath.is_file() or ".git" in filepath.parts:
+            continue
+        if glob_filter and not filepath.match(glob_filter):
+            continue
+        try:
+            if filepath.stat().st_size > 1_000_000:
+                continue
+            text = filepath.read_text(encoding="utf-8", errors="ignore")
+        except (OSError, PermissionError):
+            continue
+        try:
+            rel = str(filepath.relative_to(workspace_root)).replace("\\", "/")
+        except ValueError:
+            rel = str(filepath).replace("\\", "/")
+        if files_only:
+            for line_text in text.splitlines():
+                if regex.search(line_text):
+                    if rel not in seen_files:
+                        seen_files.add(rel)
+                        results.append(str(filepath))
+                    break
+        else:
+            for lineno, line_text in enumerate(text.splitlines(), 1):
+                if regex.search(line_text):
+                    results.append(f"{rel}:{lineno}:{line_text}")
+                    if len(results) >= max_lines:
+                        break
+    return results
+
+
+def _py_list_files(search_path: Path) -> list[str]:
+    """Pure-Python file listing used when rg is not available (replaces rg --files)."""
+    return [
+        str(fp)
+        for fp in sorted(search_path.rglob("*"))
+        if fp.is_file() and ".git" not in fp.parts
+    ]
+
+
 def _grep_search(registry: ToolRegistry, args: dict[str, Any]) -> str:
     pattern = str(args["pattern"])
     search_path = str(args.get("path", registry.workspace_root))
-    # -i: case-insensitive by default — avoids missing "Queueing" when searching "queueing"
-    command = ["rg", "-i", pattern, search_path]
-    if args.get("glob"):
-        command.extend(["--glob", str(args["glob"])])
-    result = subprocess.run(command, cwd=registry.workspace_root, capture_output=True, text=True, check=False)
-    if result.returncode not in {0, 1}:
-        raise RuntimeError(result.stderr.strip() or "rg failed")
-    output = result.stdout.strip()
+    glob_arg = args.get("glob")
+
+    # Primary search: case-insensitive. Falls back to pure Python if rg is absent.
+    rg_cmd: list[str] = ["-i", pattern, search_path]
+    if glob_arg:
+        rg_cmd.extend(["--glob", str(glob_arg)])
+    r = _rg(rg_cmd, registry.workspace_root)
+    if r is not None:
+        if r.returncode not in {0, 1}:
+            raise RuntimeError(r.stderr.strip() or "rg failed")
+        output = r.stdout.strip()
+    else:
+        output = "\n".join(
+            _py_grep_lines(
+                pattern, Path(search_path), registry.workspace_root,
+                glob_filter=str(glob_arg) if glob_arg else None,
+            )
+        )
 
     if not output:
         tokens = [t for t in re.split(r"\W+", pattern) if len(t) >= 3]
         partial: list[dict[str, Any]] = []
-        glob_arg = args.get("glob")
 
-        # ---- Filename search (fast: lists files, no content reading) ----
-        r_all = subprocess.run(
-            ["rg", "--files", search_path],
-            cwd=registry.workspace_root, capture_output=True, text=True, check=False,
+        # ---- Filename search (fast: no content reading) ----
+        r_all = _rg(["--files", search_path], registry.workspace_root)
+        all_paths = (
+            [p for p in r_all.stdout.strip().splitlines() if p]
+            if r_all is not None
+            else _py_list_files(Path(search_path))
         )
-        all_paths = [p for p in r_all.stdout.strip().splitlines() if p]
         for tok in tokens[:4]:
             if len(tok) < 4:
                 continue
@@ -323,18 +401,22 @@ def _grep_search(registry: ToolRegistry, args: dict[str, Any]) -> str:
                 })
 
         if len(tokens) >= 2:
-            # Multi-word: search each token in parallel, returning content snippets
-            # so the AI sees matching lines rather than bare file paths.
+            # Multi-word: search each token in parallel, returning content snippets.
             def _search_one_token(tok: str) -> tuple[str, list[str], str]:
-                cmd = ["rg", "-i", "--with-filename", "-n", tok, search_path]
+                rg_args = ["-i", "--with-filename", "-n", tok, search_path]
                 if glob_arg:
-                    cmd.extend(["--glob", str(glob_arg)])
-                r = subprocess.run(cmd, cwd=registry.workspace_root, capture_output=True, text=True, check=False)
-                raw = [ln for ln in r.stdout.strip().splitlines() if ln][:15]
+                    rg_args.extend(["--glob", str(glob_arg)])
+                tr = _rg(rg_args, registry.workspace_root)
+                if tr is not None:
+                    raw = [ln for ln in tr.stdout.strip().splitlines() if ln][:15]
+                else:
+                    raw = _py_grep_lines(
+                        tok, Path(search_path), registry.workspace_root,
+                        glob_filter=str(glob_arg) if glob_arg else None,
+                    )[:15]
                 files: list[str] = []
                 seen: set[str] = set()
                 for line in raw:
-                    # rg --with-filename -n format: "path:linenum:content"
                     parts = line.split(":", 2)
                     if len(parts) >= 3 and parts[0] not in seen:
                         seen.add(parts[0])
@@ -350,19 +432,23 @@ def _grep_search(registry: ToolRegistry, args: dict[str, Any]) -> str:
                         partial.append(entry)
 
         elif len(tokens) == 1:
-            # Single word: the case-insensitive search above already failed, so
-            # try progressively shorter prefixes to catch trailing-char typos
-            # (e.g. "websrach" → "websrac…" → "websra…" until a match is found).
+            # Single word: try progressively shorter prefixes for typo tolerance.
             token = tokens[0]
             for trim in range(1, min(4, len(token) - 2)):
                 prefix = token[:-trim]
                 if len(prefix) < 4:
                     break
-                cmd = ["rg", "-i", "--with-filename", "-n", prefix, search_path]
+                rg_args = ["-i", "--with-filename", "-n", prefix, search_path]
                 if glob_arg:
-                    cmd.extend(["--glob", str(glob_arg)])
-                r = subprocess.run(cmd, cwd=registry.workspace_root, capture_output=True, text=True, check=False)
-                raw = [ln for ln in r.stdout.strip().splitlines() if ln][:15]
+                    rg_args.extend(["--glob", str(glob_arg)])
+                pr = _rg(rg_args, registry.workspace_root)
+                if pr is not None:
+                    raw = [ln for ln in pr.stdout.strip().splitlines() if ln][:15]
+                else:
+                    raw = _py_grep_lines(
+                        prefix, Path(search_path), registry.workspace_root,
+                        glob_filter=str(glob_arg) if glob_arg else None,
+                    )[:15]
                 files = []
                 seen_pfx: set[str] = set()
                 for line in raw:
@@ -375,20 +461,24 @@ def _grep_search(registry: ToolRegistry, args: dict[str, Any]) -> str:
                     if raw:
                         entry["matches"] = "\n".join(raw)
                     partial.append(entry)
-                    break  # stop at first successful prefix
+                    break
 
-            # N-gram fallback: run all 4-char sliding windows in parallel.
-            # Even a severely garbled word shares small substrings with the real
-            # term; files matching 2+ distinct grams are strong candidates.
+            # N-gram fallback: parallel 4-char sliding windows.
             if not partial and len(token) >= 7:
                 grams = _ngrams(token, 4)[:12]
 
                 def _search_one_gram(gram: str) -> list[str]:
-                    cmd = ["rg", "-i", "-l", gram, search_path]
+                    rg_args = ["-i", "-l", gram, search_path]
                     if glob_arg:
-                        cmd.extend(["--glob", str(glob_arg)])
-                    r = subprocess.run(cmd, cwd=registry.workspace_root, capture_output=True, text=True, check=False)
-                    return [f for f in r.stdout.strip().splitlines() if f]
+                        rg_args.extend(["--glob", str(glob_arg)])
+                    gr = _rg(rg_args, registry.workspace_root)
+                    if gr is not None:
+                        return [f for f in gr.stdout.strip().splitlines() if f]
+                    return _py_grep_lines(
+                        gram, Path(search_path), registry.workspace_root,
+                        glob_filter=str(glob_arg) if glob_arg else None,
+                        files_only=True,
+                    )
 
                 file_votes: dict[str, int] = {}
                 with ThreadPoolExecutor(max_workers=min(len(grams), 6)) as pool:
