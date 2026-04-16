@@ -991,12 +991,27 @@ def _run_interactive(args: argparse.Namespace) -> int:
     except ImportError:
         pass
 
+    from ..memory.prompting import MAX_INSTRUCTION_FILE_CHARS, MAX_TOTAL_INSTRUCTION_CHARS, discover_instruction_files
+    _ifiles = discover_instruction_files(workspace, config.instruction_files or [])
+    _remaining = MAX_TOTAL_INSTRUCTION_CHARS
+    _ifile_labels: list[str] = []
+    for _f in _ifiles:
+        _cap = min(MAX_INSTRUCTION_FILE_CHARS, _remaining)
+        _name = _f.path.name
+        if _cap <= 0:
+            _ifile_labels.append(f"{_name}[dropped]")
+        elif len(_f.content) > _cap:
+            _ifile_labels.append(f"{_name}[truncated]")
+        else:
+            _ifile_labels.append(_name)
+        _remaining -= min(_cap, len(_f.content))
     print(startup_banner(
         workspace,
         model=config.provider.model or "(not set)",
         provider=config.provider.name or config.provider.type,
         permission_mode=config.runtime.permission_mode,
         session_info=session_info,
+        instruction_files=_ifile_labels or None,
     ))
 
     handler = _InteractiveEventHandler(streaming=config.provider.streaming_mode != "no_stream")

@@ -394,6 +394,7 @@ def startup_banner(
     provider: str,
     permission_mode: str,
     session_info: str = "",
+    instruction_files: list[str] | None = None,
 ) -> str:
     cwd = str(workspace)
     home = str(Path.home())
@@ -415,11 +416,9 @@ def startup_banner(
     if session_info:
         lines.append(f"  {THEME.brand}│{RESET}  {DIM}session{RESET}     {session_info}")
 
-    _instruction_candidates = ["YUCODE.md", "CLAW.md", "CLAUDE.md"]
-    _loaded = [n for n in _instruction_candidates if (workspace / n).is_file()]
-    if _loaded:
+    if instruction_files:
         lines.append(
-            f"  {THEME.brand}│{RESET}  {DIM}memory{RESET}      {', '.join(_loaded)} loaded"
+            f"  {THEME.brand}│{RESET}  {DIM}memory{RESET}      {', '.join(instruction_files)}"
         )
 
     lines.extend([

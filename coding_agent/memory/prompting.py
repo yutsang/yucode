@@ -119,13 +119,17 @@ class PromptAssembler:
         parts = ["# Instruction files"]
         remaining = MAX_TOTAL_INSTRUCTION_CHARS
         for item in self.project_context.instruction_files:
-            content = item.content[: min(MAX_INSTRUCTION_FILE_CHARS, remaining)]
-            if not content:
-                break
-            parts.extend([f"## {item.path}", content])
+            cap = min(MAX_INSTRUCTION_FILE_CHARS, remaining)
+            if cap <= 0:
+                parts.append(f"## {item.path} [DROPPED — instruction budget exhausted]")
+                continue
+            content = item.content[:cap]
+            truncated = len(item.content) > cap
+            header = f"## {item.path}"
+            if truncated:
+                header += f" [TRUNCATED — showing {cap:,}/{len(item.content):,} chars]"
+            parts.extend([header, content])
             remaining -= len(content)
-            if remaining <= 0:
-                break
         return "\n".join(parts)
 
     def _config_section(self) -> str:
@@ -142,7 +146,10 @@ def discover_instruction_files(cwd: Path, explicit_paths: list[str]) -> list[Con
     candidates: list[Path] = []
     for explicit in explicit_paths:
         candidates.append(Path(explicit).expanduser())
-    directories = list(cwd.parents)[::-1] + [cwd]
+    # Workspace-first: project-level files take priority over global/parent configs.
+    # Root-to-cwd order would let a large parent-dir YUCODE.md fill the budget
+    # before the project's own CLAUDE.md even loads.
+    directories = [cwd] + list(reversed(list(cwd.parents)))
     for directory in directories:
         candidates.extend(
             [
