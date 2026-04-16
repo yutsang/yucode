@@ -28,9 +28,14 @@ def filesystem_tools(registry: ToolRegistry) -> list[ToolDefinition]:
             lambda args: _read_file(registry, args),
         ),
         ToolDefinition(
-            ToolSpec("write_file", "Write a text file in the workspace.",
-                     {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]},
-                     "workspace-write", RiskLevel.MEDIUM),
+            ToolSpec(
+                "write_file",
+                "Write (or overwrite) a text file in the workspace. "
+                "Use a workspace-relative path (e.g. 'wiki/note.md'). "
+                "The 'content' parameter must be the full file text — never null or empty unless you intend a blank file.",
+                {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]},
+                "workspace-write", RiskLevel.MEDIUM,
+            ),
             lambda args: _write_file(registry, args),
         ),
         ToolDefinition(
@@ -128,7 +133,13 @@ def _read_file(registry: ToolRegistry, args: dict[str, Any]) -> str:
 
 def _write_file(registry: ToolRegistry, args: dict[str, Any]) -> str:
     path = registry._resolve_path(str(args["path"]))
-    content = str(args["content"])
+    raw_content = args.get("content")
+    if raw_content is None:
+        raise ValueError(
+            "write_file: 'content' must be a string, not null. "
+            "Provide the full file text as a string."
+        )
+    content = str(raw_content)
     if len(content.encode("utf-8")) > MAX_WRITE_SIZE:
         raise ValueError(
             f"Content size exceeds limit ({MAX_WRITE_SIZE:,} bytes). "
@@ -136,8 +147,19 @@ def _write_file(registry: ToolRegistry, args: dict[str, Any]) -> str:
         )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
+    actual_size = path.stat().st_size
+    expected_size = len(content.encode("utf-8"))
+    if actual_size == 0 and expected_size > 0:
+        raise OSError(
+            f"Write appeared to succeed but `{path}` is empty "
+            f"({expected_size:,} bytes expected). Check disk space or permissions."
+        )
+    try:
+        rel = str(path.relative_to(registry.workspace_root))
+    except ValueError:
+        rel = str(path)
     num_lines = content.count("\n") + 1
-    return f"Wrote {path} ({num_lines} lines)"
+    return f"Wrote {rel} ({num_lines} lines, {actual_size:,} bytes)"
 
 
 def _edit_file(registry: ToolRegistry, args: dict[str, Any]) -> str:
@@ -151,10 +173,13 @@ def _edit_file(registry: ToolRegistry, args: dict[str, Any]) -> str:
     count = text.count(old) if replace_all else 1
     updated = text.replace(old, new) if replace_all else text.replace(old, new, 1)
     path.write_text(updated, encoding="utf-8")
-    # Return a snippet showing the change context
+    try:
+        rel = str(path.relative_to(registry.workspace_root))
+    except ValueError:
+        rel = str(path)
     lines_changed = new.count("\n") + 1
     return (
-        f"Edited {path} ({count} replacement{'s' if count > 1 else ''}, "
+        f"Edited {rel} ({count} replacement{'s' if count > 1 else ''}, "
         f"{lines_changed} line{'s' if lines_changed > 1 else ''} in new text)"
     )
 
