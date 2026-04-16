@@ -319,63 +319,70 @@ class OpenAICompatibleProvider:
         # Filter ensures <tool_call> blocks are never forwarded to the terminal
         # while still being collected in text_parts for end-of-stream parsing.
         stream_filter = _TextToolCallFilter()
-        for raw_line in response:
-            line = raw_line.decode("utf-8", errors="replace").strip()
-            if not line or not line.startswith("data:"):
-                continue
-            payload_text = line[5:].strip()
-            if payload_text == "[DONE]":
-                break
-            try:
-                payload = json.loads(payload_text)
-            except json.JSONDecodeError:
-                _log.debug("Skipping non-JSON SSE chunk: %s", payload_text[:120])
-                continue
-            if not isinstance(payload, dict):
-                continue
-            if not _looks_like_openai_response(payload):
-                if not saw_non_openai_stream_payload:
-                    detail = _extract_envelope_detail(payload)
-                    hint = f" Server message: {detail}" if detail else ""
-                    _emit_warning(
-                        stream_callback,
-                        f"Streaming response from {self._build_url()} returned a non-OpenAI "
-                        f"SSE payload. Payload keys: {sorted(payload.keys())}.{hint} "
-                        "This provider may not support OpenAI-style streaming; "
-                        "try setting `provider.streaming_mode: no_stream`.",
-                        category="provider_streaming_non_openai",
+        try:
+            for raw_line in response:
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line or not line.startswith("data:"):
+                    continue
+                payload_text = line[5:].strip()
+                if payload_text == "[DONE]":
+                    break
+                try:
+                    payload = json.loads(payload_text)
+                except json.JSONDecodeError:
+                    _log.debug("Skipping non-JSON SSE chunk: %s", payload_text[:120])
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                if not _looks_like_openai_response(payload):
+                    if not saw_non_openai_stream_payload:
+                        detail = _extract_envelope_detail(payload)
+                        hint = f" Server message: {detail}" if detail else ""
+                        _emit_warning(
+                            stream_callback,
+                            f"Streaming response from {self._build_url()} returned a non-OpenAI "
+                            f"SSE payload. Payload keys: {sorted(payload.keys())}.{hint} "
+                            "This provider may not support OpenAI-style streaming; "
+                            "try setting `provider.streaming_mode: no_stream`.",
+                            category="provider_streaming_non_openai",
+                        )
+                        saw_non_openai_stream_payload = True
+                    continue
+                chunk_count += 1
+                choice = payload.get("choices", [{}])[0]
+                delta = choice.get("delta", {})
+                content = _extract_content_text(delta.get("content"))
+                if content:
+                    text_parts.append(content)
+                    to_emit = stream_filter.push(content)
+                    if to_emit and stream_callback:
+                        stream_callback({"type": "assistant_delta", "delta": to_emit})
+                for tool_call_delta in delta.get("tool_calls", []):
+                    index = int(tool_call_delta.get("index", 0))
+                    function_delta = tool_call_delta.get("function", {})
+                    slot = tool_call_accumulator.setdefault(
+                        index,
+                        {
+                            "id": tool_call_delta.get("id") or f"tool_{uuid4().hex[:8]}",
+                            "name": "",
+                            "arguments": "",
+                        },
                     )
-                    saw_non_openai_stream_payload = True
-                continue
-            chunk_count += 1
-            choice = payload.get("choices", [{}])[0]
-            delta = choice.get("delta", {})
-            content = _extract_content_text(delta.get("content"))
-            if content:
-                text_parts.append(content)
-                to_emit = stream_filter.push(content)
-                if to_emit and stream_callback:
-                    stream_callback({"type": "assistant_delta", "delta": to_emit})
-            for tool_call_delta in delta.get("tool_calls", []):
-                index = int(tool_call_delta.get("index", 0))
-                function_delta = tool_call_delta.get("function", {})
-                slot = tool_call_accumulator.setdefault(
-                    index,
-                    {
-                        "id": tool_call_delta.get("id") or f"tool_{uuid4().hex[:8]}",
-                        "name": "",
-                        "arguments": "",
-                    },
-                )
-                if tool_call_delta.get("id"):
-                    slot["id"] = tool_call_delta["id"]
-                slot["name"] += function_delta.get("name", "")
-                slot["arguments"] += function_delta.get("arguments", "")
-            raw_usage = payload.get("usage") or {}
-            if stream_callback and raw_usage:
-                stream_callback({"type": "usage", "usage": raw_usage})
-            if raw_usage:
-                _merge_usage_max(usage, raw_usage)
+                    if tool_call_delta.get("id"):
+                        slot["id"] = tool_call_delta["id"]
+                    slot["name"] += function_delta.get("name", "")
+                    slot["arguments"] += function_delta.get("arguments", "")
+                raw_usage = payload.get("usage") or {}
+                if stream_callback and raw_usage:
+                    stream_callback({"type": "usage", "usage": raw_usage})
+                if raw_usage:
+                    _merge_usage_max(usage, raw_usage)
+        except OSError as exc:
+            raise ProviderError(
+                f"Stream read error: {exc}. "
+                "Try increasing provider.request_timeout_seconds or set provider.streaming_mode: no_stream.",
+                recoverable=True,
+            ) from exc
 
         if chunk_count == 0 and not saw_non_openai_stream_payload:
             _emit_warning(
