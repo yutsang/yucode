@@ -6,7 +6,8 @@ import os
 from coding_agent import __version__
 from coding_agent.config.settings import _resolve_api_key, is_dangerous_mode
 from coding_agent.core.errors import AgentError, tool_error_response
-from coding_agent.core.session import Message
+from coding_agent.core.session import Message, ToolCall
+from coding_agent.core.summary_compression import SummaryCompressionBudget, compress_summary
 from coding_agent.memory.compact import CompactionConfig, compact_session, should_compact
 from coding_agent.security.permissions import PermissionPolicy
 
@@ -72,3 +73,69 @@ def test_compaction_preserves_recent_messages() -> None:
     assert result.removed_message_count > 0
     assert result.compacted_messages[0].role == "system"
     assert len(result.compacted_messages) == 3
+
+
+def test_compaction_never_splits_tool_use_result_pair() -> None:
+    """The compaction boundary must not leave a tool-result orphaned at preserved[0]."""
+    tc = ToolCall(id="c1", name="read_file", arguments='{"path": "foo.py"}')
+    messages = [
+        Message(role="user", content="x" * 400),
+        Message(role="assistant", content="", tool_calls=[tc]),  # tool-use
+        Message(role="tool", content="file contents", tool_call_id="c1"),  # tool-result
+        Message(role="user", content="x" * 400),
+        Message(role="assistant", content="done"),
+    ]
+    # With preserve_recent=2, naive keep_from=3 would put the tool-result at preserved[0]
+    config = CompactionConfig(preserve_recent_messages=2, max_estimated_tokens=50)
+    result = compact_session(messages, config)
+    # The first preserved message must never be a tool-result
+    first_preserved = result.compacted_messages[1]  # [0] is the system summary
+    assert first_preserved.role != "tool", (
+        f"First preserved message must not be a tool-result, got role={first_preserved.role!r}"
+    )
+
+
+# --- summary compression priority scoring ---
+
+
+def test_compress_summary_headers_survive_prose() -> None:
+    """When budget is tight, headers and bullets outlast plain prose."""
+    lines = [
+        "# Main heading",          # score 4
+        "Some prose sentence.",     # score 1
+        "More prose here.",         # score 1
+        "- bullet point A",         # score 2
+    ]
+    summary = "\n".join(lines)
+    # Budget allows only 2 lines
+    budget = SummaryCompressionBudget(max_chars=50, max_lines=2)
+    result = compress_summary(summary, budget)
+    kept = result.summary
+    assert "# Main heading" in kept, "Header should survive tight budget"
+    assert "- bullet point A" in kept, "Bullet should survive tight budget"
+
+
+def test_compress_summary_restores_reading_order() -> None:
+    """Lines kept by priority scoring are output in original document order."""
+    lines = [
+        "# Section A",      # score 4, index 0
+        "prose line one",   # score 1, index 1
+        "## Section B",     # score 3, index 2
+        "prose line two",   # score 1, index 3
+    ]
+    summary = "\n".join(lines)
+    budget = SummaryCompressionBudget(max_chars=500, max_lines=3)
+    result = compress_summary(summary, budget)
+    kept_lines = [ln for ln in result.summary.splitlines() if ln and not ln.startswith("[")]
+    positions = {line: i for i, line in enumerate(kept_lines)}
+    # Section A (score 4) should appear before Section B (score 3) in output
+    assert positions["# Section A"] < positions["## Section B"]
+
+
+def test_compress_summary_deduplicates_case_insensitively() -> None:
+    lines = ["Pending work: fix bug", "pending work: fix bug", "Other note"]
+    result = compress_summary("\n".join(lines))
+    kept = [ln for ln in result.summary.splitlines() if ln and not ln.startswith("[")]
+    assert result.removed_duplicate_lines == 1
+    # Only one of the duplicate pair should appear
+    assert sum(1 for ln in kept if "pending work" in ln.lower()) == 1

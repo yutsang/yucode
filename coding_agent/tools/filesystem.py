@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 MAX_READ_SIZE = 10 * 1024 * 1024   # 10 MB
 MAX_WRITE_SIZE = 10 * 1024 * 1024  # 10 MB
 _BINARY_PROBE_SIZE = 8192
-_GREP_MAX_OUTPUT = 64 * 1024       # 64 KB max grep output
+_GREP_MAX_LINES = 250              # max grep output lines — models think in lines, not bytes
 
 
 def filesystem_tools(registry: ToolRegistry) -> list[ToolDefinition]:
@@ -369,12 +369,12 @@ def _grep_search(registry: ToolRegistry, args: dict[str, Any]) -> str:
             )
         return output  # empty — let the agent know nothing was found
 
-    if len(output) > _GREP_MAX_OUTPUT:
-        truncated = output[:_GREP_MAX_OUTPUT]
-        last_nl = truncated.rfind("\n")
-        if last_nl > 0:
-            truncated = truncated[:last_nl]
-        line_count = output.count("\n")
-        shown = truncated.count("\n")
-        return f"{truncated}\n\n[Output truncated: showing {shown}/{line_count} lines. Narrow your search with --glob or a more specific pattern.]"
+    lines = output.splitlines()
+    if len(lines) > _GREP_MAX_LINES:
+        total = len(lines)
+        return (
+            "\n".join(lines[:_GREP_MAX_LINES])
+            + f"\n\n[Output truncated: showing {_GREP_MAX_LINES}/{total} lines."
+            " Narrow your search with --glob or a more specific pattern.]"
+        )
     return output

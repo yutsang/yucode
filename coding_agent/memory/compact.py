@@ -101,6 +101,13 @@ def compact_session(
     prefix_len = _compacted_prefix_len(messages)
     existing_summary = _extract_existing_summary(messages[0]) if prefix_len else None
     keep_from = max(len(messages) - cfg.preserve_recent_messages, prefix_len)
+
+    # Never split a tool-use call from its tool-result(s) at the compaction
+    # boundary — an orphaned tool-result at preserved[0] confuses the model
+    # and violates the API message format requirements.
+    while keep_from > prefix_len and messages[keep_from].role == "tool":
+        keep_from -= 1
+
     removed = messages[prefix_len:keep_from]
     preserved = messages[keep_from:]
 

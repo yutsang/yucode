@@ -27,6 +27,18 @@ class SummaryCompressionResult:
     truncated: bool = False
 
 
+def _line_score(line: str) -> int:
+    """Structural importance score for a summary line (higher = survives budget cuts first)."""
+    stripped = line.lstrip()
+    if stripped.startswith("# "):
+        return 4
+    if stripped.startswith(("## ", "### ")):
+        return 3
+    if stripped and stripped[0] in ("-", "*", "+"):
+        return 2
+    return 1
+
+
 def compress_summary(
     summary: str,
     budget: SummaryCompressionBudget | None = None,
@@ -52,19 +64,27 @@ def compress_summary(
             seen_lower.add(lower)
         normalized.append(trimmed)
 
-    selected: list[str] = []
+    # Score each line by structural importance so high-signal content
+    # (headers, bullets) survives budget cuts before prose does.
+    scored = [(i, line, _line_score(line)) for i, line in enumerate(normalized)]
+    priority_order = sorted(scored, key=lambda x: -x[2])  # stable: ties keep original order
+
+    selected_indices: set[int] = set()
     char_count = 0
     omitted = 0
 
-    for line in normalized:
-        if len(selected) >= b.max_lines:
+    for orig_idx, line, _score in priority_order:
+        if len(selected_indices) >= b.max_lines:
             omitted += 1
             continue
-        if char_count + len(line) + 1 > b.max_chars and selected:
+        if char_count + len(line) + 1 > b.max_chars and selected_indices:
             omitted += 1
             continue
-        selected.append(line)
+        selected_indices.add(orig_idx)
         char_count += len(line) + 1
+
+    # Restore original reading order
+    selected = [line for i, line in enumerate(normalized) if i in selected_indices]
 
     if omitted > 0:
         selected.append(f"[{omitted} line(s) omitted]")

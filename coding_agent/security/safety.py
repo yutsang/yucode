@@ -73,32 +73,57 @@ class SafetyVerdict:
     level: str = "safe"
 
 
+def _check_destructive_fs(command: str) -> SafetyVerdict | None:
+    for pattern, reason in _DANGEROUS_FS_PATTERNS:
+        if pattern.search(command):
+            return SafetyVerdict(blocked=True, reason=reason, level="critical")
+    return None
+
+
+def _check_exfiltration(command: str) -> SafetyVerdict | None:
+    for pattern, reason in _EXFILTRATION_PATTERNS:
+        if pattern.search(command):
+            return SafetyVerdict(blocked=True, reason=reason, level="critical")
+    return None
+
+
+def _check_dangerous_git(command: str) -> SafetyVerdict | None:
+    for pattern, reason in _DANGEROUS_GIT_PATTERNS:
+        if pattern.search(command):
+            return SafetyVerdict(warning=True, reason=reason, level="high")
+    return None
+
+
+def _check_bypass_flags(command: str) -> SafetyVerdict | None:
+    for pattern, reason in _BYPASS_PATTERNS:
+        if pattern.search(command):
+            return SafetyVerdict(warning=True, reason=reason, level="high")
+    return None
+
+
+def _check_warn_patterns(command: str) -> SafetyVerdict | None:
+    for pattern, reason in _WARN_PATTERNS:
+        if pattern.search(command):
+            return SafetyVerdict(warning=True, reason=reason, level="medium")
+    return None
+
+
 def check_bash_safety(command: str) -> SafetyVerdict:
     """Inspect a shell command for dangerous patterns.
 
     Returns a SafetyVerdict indicating whether the command should be blocked,
     warned about, or allowed. Blocked commands should not be executed.
     """
-    for pattern, reason in _DANGEROUS_FS_PATTERNS:
-        if pattern.search(command):
-            return SafetyVerdict(blocked=True, reason=reason, level="critical")
-
-    for pattern, reason in _EXFILTRATION_PATTERNS:
-        if pattern.search(command):
-            return SafetyVerdict(blocked=True, reason=reason, level="critical")
-
-    for pattern, reason in _DANGEROUS_GIT_PATTERNS:
-        if pattern.search(command):
-            return SafetyVerdict(warning=True, reason=reason, level="high")
-
-    for pattern, reason in _BYPASS_PATTERNS:
-        if pattern.search(command):
-            return SafetyVerdict(warning=True, reason=reason, level="high")
-
-    for pattern, reason in _WARN_PATTERNS:
-        if pattern.search(command):
-            return SafetyVerdict(warning=True, reason=reason, level="medium")
-
+    for check in (
+        _check_destructive_fs,
+        _check_exfiltration,
+        _check_dangerous_git,
+        _check_bypass_flags,
+        _check_warn_patterns,
+    ):
+        verdict = check(command)
+        if verdict is not None:
+            return verdict
     return SafetyVerdict()
 
 
