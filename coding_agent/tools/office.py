@@ -39,7 +39,7 @@ def office_tools(registry: ToolRegistry) -> list[ToolDefinition]:
         ToolDefinition(
             ToolSpec(
                 "list_excel_sheets",
-                "List all sheet names in an Excel (.xlsx) file.",
+                "List visible sheet names in an Excel (.xlsx) file. Hidden sheets are excluded.",
                 {
                     "type": "object",
                     "properties": {"path": {"type": "string", "description": "Path to .xlsx file."}},
@@ -49,6 +49,26 @@ def office_tools(registry: ToolRegistry) -> list[ToolDefinition]:
                 RiskLevel.LOW,
             ),
             lambda args: _list_excel_sheets(registry, args),
+        ),
+        ToolDefinition(
+            ToolSpec(
+                "inspect_excel_sheets",
+                "Scan all visible sheets in an Excel file. Returns each sheet's name, "
+                "estimated row count, column headers, and sample rows. "
+                "Call this before read_excel_sheet when you need to identify which sheet "
+                "contains the data the user is looking for.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Path to .xlsx file."},
+                        "sample_rows": {"type": "integer", "description": "Data rows to sample per sheet (default 3)."},
+                    },
+                    "required": ["path"],
+                },
+                "read-only",
+                RiskLevel.LOW,
+            ),
+            lambda args: _inspect_excel_sheets(registry, args),
         ),
         ToolDefinition(
             ToolSpec(
@@ -274,31 +294,70 @@ def _require(module: str, package: str, pip_extra: str) -> Any:
         ) from exc
 
 
+def _get_visibility_state(ws: Any) -> tuple[set[int], set[int]]:
+    """Return (hidden_row_numbers_1based, hidden_col_indices_1based).
+
+    Requires a fully-loaded Worksheet (not ReadOnlyWorksheet) so that
+    row_dimensions and column_dimensions are available.
+    """
+    from openpyxl.utils import column_index_from_string
+    hidden_rows: set[int] = set()
+    hidden_cols: set[int] = set()
+    for row_num, rd in ws.row_dimensions.items():
+        if rd.hidden:
+            hidden_rows.add(int(row_num))
+    for col_letter, cd in ws.column_dimensions.items():
+        if cd.hidden:
+            try:
+                hidden_cols.add(column_index_from_string(col_letter))
+            except Exception:
+                pass
+    return hidden_rows, hidden_cols
+
+
 def _read_excel_sheet(registry: ToolRegistry, args: dict[str, Any]) -> str:
     openpyxl = _require("openpyxl", "openpyxl>=3.1", "excel")
     path = registry._resolve_path(str(args["path"]))
-    wb = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
+    wb = openpyxl.load_workbook(str(path), data_only=True)
     sheet_name = args.get("sheet")
     ws = wb[sheet_name] if sheet_name else wb.active
     max_rows = int(args.get("max_rows", 500))
-    rows = []
-    for i, row in enumerate(ws.iter_rows(values_only=True)):
-        if i >= max_rows + 1:
+    hidden_rows, hidden_cols = _get_visibility_state(ws)
+    rows: list[list[str]] = []
+    skipped = 0
+    for row_cells in ws.iter_rows():
+        if not row_cells:
+            continue
+        row_num = row_cells[0].row
+        if row_num in hidden_rows:
+            skipped += 1
+            continue
+        if len(rows) >= max_rows + 1:
             break
-        rows.append([str(c) if c is not None else "" for c in row])
+        rows.append([
+            str(c.value) if c.value is not None else ""
+            for c in row_cells if c.column not in hidden_cols
+        ])
     wb.close()
     if not rows:
         return json.dumps({"headers": [], "rows": []})
-    return json.dumps({"headers": rows[0], "rows": rows[1:]})
+    result: dict[str, Any] = {"headers": rows[0], "rows": rows[1:]}
+    if skipped or hidden_cols:
+        result["note"] = f"Skipped {skipped} hidden row(s) and {len(hidden_cols)} hidden column(s)."
+    return json.dumps(result)
 
 
 def _list_excel_sheets(registry: ToolRegistry, args: dict[str, Any]) -> str:
     openpyxl = _require("openpyxl", "openpyxl>=3.1", "excel")
     path = registry._resolve_path(str(args["path"]))
     wb = openpyxl.load_workbook(str(path), read_only=True)
-    sheets = wb.sheetnames
+    visible = [ws.title for ws in wb.worksheets if ws.sheet_state == "visible"]
+    hidden_count = sum(1 for ws in wb.worksheets if ws.sheet_state != "visible")
     wb.close()
-    return json.dumps({"sheets": sheets})
+    result: dict[str, Any] = {"sheets": visible}
+    if hidden_count:
+        result["hidden_sheets_count"] = hidden_count
+    return json.dumps(result)
 
 
 def _write_excel_cell(registry: ToolRegistry, args: dict[str, Any]) -> str:
@@ -317,22 +376,33 @@ def _write_excel_cell(registry: ToolRegistry, args: dict[str, Any]) -> str:
 def _excel_to_json(registry: ToolRegistry, args: dict[str, Any]) -> str:
     openpyxl = _require("openpyxl", "openpyxl>=3.1", "excel")
     path = registry._resolve_path(str(args["path"]))
-    wb = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
+    wb = openpyxl.load_workbook(str(path), data_only=True)
     sheet_name = args.get("sheet")
     ws = wb[sheet_name] if sheet_name else wb.active
     max_rows = int(args.get("max_rows", 500))
-    rows = list(ws.iter_rows(values_only=True))
+    hidden_rows, hidden_cols = _get_visibility_state(ws)
+    rows: list[list[str]] = []
+    for row_cells in ws.iter_rows():
+        if not row_cells:
+            continue
+        if row_cells[0].row in hidden_rows:
+            continue
+        if len(rows) >= max_rows + 1:
+            break
+        rows.append([
+            str(c.value) if c.value is not None else ""
+            for c in row_cells if c.column not in hidden_cols
+        ])
     wb.close()
     if not rows:
         return "[]"
-    headers = [str(h) if h is not None else f"col_{i}" for i, h in enumerate(rows[0])]
+    headers = [str(h) if h else f"col_{i}" for i, h in enumerate(rows[0])]
     result = []
-    for row in rows[1:max_rows + 1]:
-        record = {}
-        for j, val in enumerate(row):
-            key = headers[j] if j < len(headers) else f"col_{j}"
-            record[key] = str(val) if val is not None else ""
-        result.append(record)
+    for row in rows[1:]:
+        result.append({
+            headers[j] if j < len(headers) else f"col_{j}": v
+            for j, v in enumerate(row)
+        })
     return json.dumps(result, indent=2)
 
 
@@ -471,15 +541,23 @@ def _write_pptx_from_template(registry: ToolRegistry, args: dict[str, Any]) -> s
 def _read_excel_preview(registry: ToolRegistry, args: dict[str, Any]) -> str:
     openpyxl = _require("openpyxl", "openpyxl>=3.1", "excel")
     path = registry._resolve_path(str(args["path"]))
-    wb = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
+    wb = openpyxl.load_workbook(str(path), data_only=True)
     sheet_name = args.get("sheet")
     ws = wb[sheet_name] if sheet_name else wb.active
     max_rows = int(args.get("max_rows", 20))
-    rows = []
-    for i, row in enumerate(ws.iter_rows(values_only=True)):
-        if i >= max_rows + 1:
+    hidden_rows, hidden_cols = _get_visibility_state(ws)
+    rows: list[list[str]] = []
+    for row_cells in ws.iter_rows():
+        if not row_cells:
+            continue
+        if row_cells[0].row in hidden_rows:
+            continue
+        if len(rows) >= max_rows + 1:
             break
-        rows.append([str(c) if c is not None else "" for c in row])
+        rows.append([
+            str(c.value) if c.value is not None else ""
+            for c in row_cells if c.column not in hidden_cols
+        ])
     wb.close()
     if not rows:
         return json.dumps({"headers": [], "rows": [], "schema": []})
@@ -498,6 +576,51 @@ def _read_excel_preview(registry: ToolRegistry, args: dict[str, Any]) -> str:
         "schema": schema,
         "preview": data[:10],
     })
+
+
+def _inspect_excel_sheets(registry: ToolRegistry, args: dict[str, Any]) -> str:
+    openpyxl = _require("openpyxl", "openpyxl>=3.1", "excel")
+    path = registry._resolve_path(str(args["path"]))
+    wb = openpyxl.load_workbook(str(path), data_only=True)
+    sample_rows = int(args.get("sample_rows", 3))
+    sheets_info = []
+    hidden_count = 0
+    for ws in wb.worksheets:
+        if ws.sheet_state != "visible":
+            hidden_count += 1
+            continue
+        hidden_rows, hidden_cols = _get_visibility_state(ws)
+        rows: list[list[str]] = []
+        for row_cells in ws.iter_rows():
+            if not row_cells:
+                continue
+            if row_cells[0].row in hidden_rows:
+                continue
+            rows.append([
+                str(c.value) if c.value is not None else ""
+                for c in row_cells if c.column not in hidden_cols
+            ])
+            if len(rows) >= sample_rows + 1:
+                break
+        headers = rows[0] if rows else []
+        samples = rows[1:] if len(rows) > 1 else []
+        total = max(0, (ws.max_row or 1) - 1 - len(hidden_rows))
+        entry: dict[str, Any] = {
+            "name": ws.title,
+            "estimated_data_rows": total,
+            "headers": headers,
+            "sample": samples,
+        }
+        if hidden_rows:
+            entry["hidden_rows"] = len(hidden_rows)
+        if hidden_cols:
+            entry["hidden_cols"] = len(hidden_cols)
+        sheets_info.append(entry)
+    wb.close()
+    result: dict[str, Any] = {"sheets": sheets_info}
+    if hidden_count:
+        result["hidden_sheets"] = hidden_count
+    return json.dumps(result, indent=2)
 
 
 def _is_numeric(value: str) -> bool:
