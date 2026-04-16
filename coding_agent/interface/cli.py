@@ -599,16 +599,13 @@ class _InteractiveEventHandler:
                 # agent label to be printed mid-worker output.
                 self._turn_start = time.monotonic()
                 self._text_started = False
-            if not self._in_coordinator:
-                # In coordinator mode keep the worker/tool label in the spinner
-                # rather than overwriting it with generic "Thinking (iter N)".
-                # Keeping the label also prevents set_thinking from clearing
-                # the done-line that shows the last tool result (e.g. web_search
-                # results that should stay visible between iterations).
-                self._progress.set_thinking(
-                    "Thinking" if self._current_iteration == 1
-                    else f"Thinking (iter {self._current_iteration})"
-                )
+            if not self._in_coordinator and self._current_iteration == 1:
+                # Only set the spinner on the first iteration.  On later
+                # iterations the spinner already shows the last tool result
+                # (e.g. "✔ web_search: 5 results") which is far more useful
+                # than a generic "Thinking (iter N)" label.  The tool_call
+                # event will update it again as soon as the next tool fires.
+                self._progress.set_thinking("Thinking")
         elif etype == "tool_call":
             name = event.get("name", "?")
             arguments = event.get("arguments", "{}")
