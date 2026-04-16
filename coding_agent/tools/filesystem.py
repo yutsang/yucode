@@ -4,6 +4,7 @@ import contextlib
 import json
 import re
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -302,18 +303,23 @@ def _grep_search(registry: ToolRegistry, args: dict[str, Any]) -> str:
     if not output:
         tokens = [t for t in re.split(r"\W+", pattern) if len(t) >= 3]
         partial: list[dict[str, Any]] = []
+        glob_arg = args.get("glob")
 
         if len(tokens) >= 2:
-            # Multi-word: try each token separately so one misspelled word
+            # Multi-word: search each token in parallel so one misspelled word
             # doesn't kill the whole query.
-            for token in tokens:
-                cmd = ["rg", "-i", "-l", token, search_path]
-                if args.get("glob"):
-                    cmd.extend(["--glob", str(args["glob"])])
+            def _search_one_token(tok: str) -> tuple[str, list[str]]:
+                cmd = ["rg", "-i", "-l", tok, search_path]
+                if glob_arg:
+                    cmd.extend(["--glob", str(glob_arg)])
                 r = subprocess.run(cmd, cwd=registry.workspace_root, capture_output=True, text=True, check=False)
                 files = [f for f in r.stdout.strip().splitlines() if f][:10]
-                if files:
-                    partial.append({"term": token, "files": _grep_rel(registry.workspace_root, files)})
+                return tok, _grep_rel(registry.workspace_root, files)
+
+            with ThreadPoolExecutor(max_workers=min(len(tokens), 4)) as pool:
+                for tok, rel_files in pool.map(_search_one_token, tokens):
+                    if rel_files:
+                        partial.append({"term": tok, "files": rel_files})
 
         elif len(tokens) == 1:
             # Single word: the case-insensitive search above already failed, so
@@ -325,31 +331,33 @@ def _grep_search(registry: ToolRegistry, args: dict[str, Any]) -> str:
                 if len(prefix) < 4:
                     break
                 cmd = ["rg", "-i", "-l", prefix, search_path]
-                if args.get("glob"):
-                    cmd.extend(["--glob", str(args["glob"])])
+                if glob_arg:
+                    cmd.extend(["--glob", str(glob_arg)])
                 r = subprocess.run(cmd, cwd=registry.workspace_root, capture_output=True, text=True, check=False)
                 files = [f for f in r.stdout.strip().splitlines() if f][:10]
                 if files:
                     partial.append({"term": prefix + "…", "files": _grep_rel(registry.workspace_root, files)})
                     break  # stop at first successful prefix
 
-            # N-gram fallback: for heavily garbled words where all prefixes fail,
-            # try 4-char sliding windows. Even a severely garbled word shares small
-            # substrings with the real term ("uein" appears in both "queingthoery"
-            # and "queueing"). Aggregate votes across grams — files that match 2+
-            # distinct n-grams are strong candidates.
+            # N-gram fallback: run all 4-char sliding windows in parallel.
+            # Even a severely garbled word shares small substrings with the real
+            # term; files matching 2+ distinct grams are strong candidates.
             if not partial and len(token) >= 7:
-                file_votes: dict[str, int] = {}
-                for gram in _ngrams(token, 4)[:12]:
+                grams = _ngrams(token, 4)[:12]
+
+                def _search_one_gram(gram: str) -> list[str]:
                     cmd = ["rg", "-i", "-l", gram, search_path]
-                    if args.get("glob"):
-                        cmd.extend(["--glob", str(args["glob"])])
-                    r = subprocess.run(
-                        cmd, cwd=registry.workspace_root, capture_output=True, text=True, check=False
-                    )
-                    for f in (f for f in r.stdout.strip().splitlines() if f):
-                        key = _grep_rel(registry.workspace_root, [f])[0]
-                        file_votes[key] = file_votes.get(key, 0) + 1
+                    if glob_arg:
+                        cmd.extend(["--glob", str(glob_arg)])
+                    r = subprocess.run(cmd, cwd=registry.workspace_root, capture_output=True, text=True, check=False)
+                    return [f for f in r.stdout.strip().splitlines() if f]
+
+                file_votes: dict[str, int] = {}
+                with ThreadPoolExecutor(max_workers=min(len(grams), 6)) as pool:
+                    for gram_files in pool.map(_search_one_gram, grams):
+                        for f in gram_files:
+                            key = _grep_rel(registry.workspace_root, [f])[0]
+                            file_votes[key] = file_votes.get(key, 0) + 1
                 top = sorted(file_votes, key=lambda f: -file_votes[f])
                 top = [f for f in top if file_votes[f] >= 2][:5] or top[:3]
                 if top:

@@ -286,6 +286,7 @@ class AgentRuntime:
         _last_dedup_tool = ""        # most recently blocked tool name
         budget_exhausted = False
         consecutive_readonly_calls = 0  # read-only calls with no write/exec in between
+        _tool_cache: dict[tuple[str, str], str] = {}  # within-turn cache for read-only tools
 
         summary = TurnSummary(final_text="", iterations=0)
         for iteration in range(1, max_steps + 1):
@@ -416,11 +417,21 @@ class AgentRuntime:
                     }, indent=2)
                     budget_exhausted = True
                 else:
-                    tool_result_content = self._execute_tool(
-                        tool_call.name, tool_call.arguments,
-                    )
-                    tool_call_count += 1
-                    # Track whether this call mutated state or was read-only
+                    cached = _tool_cache.get(call_key)
+                    if cached is not None:
+                        tool_result_content = cached
+                    else:
+                        tool_result_content = self._execute_tool(
+                            tool_call.name, tool_call.arguments,
+                        )
+                        tool_call_count += 1
+                        # Cache read-only results to skip redundant re-reads within this turn
+                        try:
+                            if self.tools.permission_for(tool_call.name) == "read-only":
+                                _tool_cache[call_key] = tool_result_content
+                        except KeyError:
+                            pass
+                    # Track read-only streak (cache hits still count as reads)
                     try:
                         perm = self.tools.permission_for(tool_call.name)
                     except KeyError:
