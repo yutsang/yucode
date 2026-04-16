@@ -52,6 +52,8 @@ _DEFAULT_AUTO_COMPACT_THRESHOLD = 100_000
 # Hard cap on any single tool result to prevent context blowout (32 KB).
 # Large outputs (bash stdout, file reads) should use offset/limit instead.
 _MAX_TOOL_RESULT_BYTES = 32 * 1024
+# After this many dedup blocks in one turn, the agent is stuck: force-stop.
+_MAX_STUCK_DEDUP_BLOCKS = 3
 
 
 def _parse_auto_compact_threshold() -> int:
@@ -279,6 +281,7 @@ class AgentRuntime:
         tool_call_count = 0
         dedup_counts: dict[tuple[str, str], int] = {}
         dedup_blocks_this_turn = 0   # how many hard dedup stops have fired
+        _last_dedup_tool = ""        # most recently blocked tool name
         budget_exhausted = False
 
         summary = TurnSummary(final_text="", iterations=0)
@@ -371,18 +374,27 @@ class AgentRuntime:
 
                 if dedup_counts[call_key] >= dedup_threshold:
                     dedup_blocks_this_turn += 1
-                    hint = (
-                        f" You have been hard-blocked {dedup_blocks_this_turn} time(s) "
-                        "this turn. Stop looping and answer with what you have."
-                        if dedup_blocks_this_turn > 1 else ""
-                    )
+                    _last_dedup_tool = tool_call.name
+                    if dedup_blocks_this_turn >= _MAX_STUCK_DEDUP_BLOCKS:
+                        escalation = (
+                            f" FINAL WARNING ({dedup_blocks_this_turn}/{_MAX_STUCK_DEDUP_BLOCKS}): "
+                            "The system will force-stop after this response. "
+                            "You MUST provide your final answer NOW — no more tool calls."
+                        )
+                    elif dedup_blocks_this_turn > 1:
+                        escalation = (
+                            f" You have been hard-blocked {dedup_blocks_this_turn} time(s) "
+                            "this turn. Stop looping and answer with what you have."
+                        )
+                    else:
+                        escalation = ""
                     tool_result_content = json.dumps({
                         "error": (
                             f"HARD STOP: `{tool_call.name}` called {dedup_threshold}+ times "
                             "with identical arguments — this is a hard limit you cannot bypass. "
                             "You MUST do one of: (a) use different arguments, "
                             "(b) switch to a different tool, or "
-                            f"(c) stop and answer the user with what you have.{hint}"
+                            f"(c) stop and answer the user with what you have.{escalation}"
                         ),
                         "error_code": "dedup_limit",
                     }, indent=2)
@@ -420,6 +432,31 @@ class AgentRuntime:
                         "tool_call_id": tool_call.id,
                         "content": tool_result_content,
                     })
+
+        # -------------------------------------------------------
+        # Forced exit: the model is clearly stuck in a dedup loop
+        # -------------------------------------------------------
+        if dedup_blocks_this_turn >= _MAX_STUCK_DEDUP_BLOCKS:
+            last_text = ""
+            for msg in reversed(summary.assistant_messages):
+                if msg.content and msg.content.strip():
+                    last_text = msg.content
+                    break
+            summary.final_text = (
+                (last_text + "\n\n" if last_text else "")
+                + f"[Stopped: `{_last_dedup_tool}` was repeatedly blocked "
+                f"({dedup_blocks_this_turn}×) in one turn. The agent appears stuck. "
+                "Rephrase your request or use /clear to start fresh.]"
+            )
+            if event_callback:
+                event_callback({
+                    "type": "stuck_exit",
+                    "tool": _last_dedup_tool,
+                    "blocks": dedup_blocks_this_turn,
+                })
+            self.metrics.record_session(summary.iterations, summary.usage)
+            self._maybe_auto_compact(summary, event_callback)
+            return summary
 
         last_text = ""
         for msg in reversed(summary.assistant_messages):

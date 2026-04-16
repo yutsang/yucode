@@ -6,6 +6,7 @@ import os
 from coding_agent import __version__
 from coding_agent.config.settings import _resolve_api_key, is_dangerous_mode
 from coding_agent.core.errors import AgentError, tool_error_response
+from coding_agent.core.runtime import _MAX_STUCK_DEDUP_BLOCKS
 from coding_agent.core.session import Message, ToolCall
 from coding_agent.core.summary_compression import SummaryCompressionBudget, compress_summary
 from coding_agent.memory.compact import CompactionConfig, compact_session, should_compact
@@ -130,6 +131,12 @@ def test_compress_summary_restores_reading_order() -> None:
     positions = {line: i for i, line in enumerate(kept_lines)}
     # Section A (score 4) should appear before Section B (score 3) in output
     assert positions["# Section A"] < positions["## Section B"]
+
+
+def test_max_stuck_dedup_blocks_constant() -> None:
+    """_MAX_STUCK_DEDUP_BLOCKS must be a positive integer — it guards the forced-exit path."""
+    assert isinstance(_MAX_STUCK_DEDUP_BLOCKS, int)
+    assert _MAX_STUCK_DEDUP_BLOCKS > 0
 
 
 def test_compress_summary_deduplicates_case_insensitively() -> None:

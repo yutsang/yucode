@@ -641,6 +641,15 @@ class _InteractiveEventHandler:
             if blocks > 1:
                 msg += f" ({blocks}× this turn — agent may be stuck)"
             print(render_warning(msg), file=sys.stderr)
+        elif etype == "stuck_exit":
+            self._progress.stop()
+            tool = event.get("tool", "?")
+            blocks = event.get("blocks", 0)
+            print(render_warning(
+                f"Agent stuck on `{tool}` ({blocks}× blocked) — force-stopped.\n"
+                "  Tip: rephrase your request, use /clear to reset, or break the task into smaller steps."
+            ), file=sys.stderr)
+            print()
         elif etype == "compaction":
             self._progress.stop()
             removed = event.get("removed", 0)
@@ -706,6 +715,15 @@ def _cli_event_callback(event: dict[str, Any]) -> None:
         if blocks > 1:
             msg += f" ({blocks}× this turn)"
         print(render_warning(msg), file=sys.stderr)
+    elif etype == "stuck_exit":
+        progress.stop()
+        tool = event.get("tool", "?")
+        blocks = event.get("blocks", 0)
+        print(render_warning(
+            f"Agent stuck on `{tool}` ({blocks}× blocked) — force-stopped.\n"
+            "  Tip: rephrase your request or break the task into smaller steps."
+        ), file=sys.stderr)
+        print()
     elif etype == "tool_result":
         name = event.get("name", "?")
         content = event.get("content", "")
