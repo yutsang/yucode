@@ -306,20 +306,31 @@ def _grep_search(registry: ToolRegistry, args: dict[str, Any]) -> str:
         glob_arg = args.get("glob")
 
         if len(tokens) >= 2:
-            # Multi-word: search each token in parallel so one misspelled word
-            # doesn't kill the whole query.
-            def _search_one_token(tok: str) -> tuple[str, list[str]]:
-                cmd = ["rg", "-i", "-l", tok, search_path]
+            # Multi-word: search each token in parallel, returning content snippets
+            # so the AI sees matching lines rather than bare file paths.
+            def _search_one_token(tok: str) -> tuple[str, list[str], str]:
+                cmd = ["rg", "-i", "--with-filename", "-n", tok, search_path]
                 if glob_arg:
                     cmd.extend(["--glob", str(glob_arg)])
                 r = subprocess.run(cmd, cwd=registry.workspace_root, capture_output=True, text=True, check=False)
-                files = [f for f in r.stdout.strip().splitlines() if f][:10]
-                return tok, _grep_rel(registry.workspace_root, files)
+                raw = [ln for ln in r.stdout.strip().splitlines() if ln][:15]
+                files: list[str] = []
+                seen: set[str] = set()
+                for line in raw:
+                    # rg --with-filename -n format: "path:linenum:content"
+                    parts = line.split(":", 2)
+                    if len(parts) >= 3 and parts[0] not in seen:
+                        seen.add(parts[0])
+                        files.append(parts[0])
+                return tok, _grep_rel(registry.workspace_root, files[:10]), "\n".join(raw)
 
             with ThreadPoolExecutor(max_workers=min(len(tokens), 4)) as pool:
-                for tok, rel_files in pool.map(_search_one_token, tokens):
+                for tok, rel_files, snippet in pool.map(_search_one_token, tokens):
                     if rel_files:
-                        partial.append({"term": tok, "files": rel_files})
+                        entry: dict[str, Any] = {"term": tok, "files": rel_files}
+                        if snippet:
+                            entry["matches"] = snippet
+                        partial.append(entry)
 
         elif len(tokens) == 1:
             # Single word: the case-insensitive search above already failed, so
@@ -330,13 +341,23 @@ def _grep_search(registry: ToolRegistry, args: dict[str, Any]) -> str:
                 prefix = token[:-trim]
                 if len(prefix) < 4:
                     break
-                cmd = ["rg", "-i", "-l", prefix, search_path]
+                cmd = ["rg", "-i", "--with-filename", "-n", prefix, search_path]
                 if glob_arg:
                     cmd.extend(["--glob", str(glob_arg)])
                 r = subprocess.run(cmd, cwd=registry.workspace_root, capture_output=True, text=True, check=False)
-                files = [f for f in r.stdout.strip().splitlines() if f][:10]
+                raw = [ln for ln in r.stdout.strip().splitlines() if ln][:15]
+                files = []
+                seen_pfx: set[str] = set()
+                for line in raw:
+                    parts = line.split(":", 2)
+                    if len(parts) >= 3 and parts[0] not in seen_pfx:
+                        seen_pfx.add(parts[0])
+                        files.append(parts[0])
                 if files:
-                    partial.append({"term": prefix + "…", "files": _grep_rel(registry.workspace_root, files)})
+                    entry = {"term": prefix + "…", "files": _grep_rel(registry.workspace_root, files[:10])}
+                    if raw:
+                        entry["matches"] = "\n".join(raw)
+                    partial.append(entry)
                     break  # stop at first successful prefix
 
             # N-gram fallback: run all 4-char sliding windows in parallel.
@@ -368,7 +389,7 @@ def _grep_search(registry: ToolRegistry, args: dict[str, Any]) -> str:
                 {
                     "hint": (
                         f"No exact match for '{pattern}'. "
-                        "Showing files that match individual terms "
+                        "Showing matching content for individual terms "
                         "(original query may contain a typo or misspelling)."
                     ),
                     "partial_matches": partial,
