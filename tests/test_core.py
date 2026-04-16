@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
+
+import pytest
 
 from coding_agent import __version__
 from coding_agent.config.settings import _resolve_api_key, is_dangerous_mode
@@ -146,3 +149,41 @@ def test_compress_summary_deduplicates_case_insensitively() -> None:
     assert result.removed_duplicate_lines == 1
     # Only one of the duplicate pair should appear
     assert sum(1 for ln in kept if "pending work" in ln.lower()) == 1
+
+
+# --- tool name resolution (camelCase ↔ snake_case) ---
+
+
+def _make_registry(tmp_path: Path):
+    """Build a minimal ToolRegistry for name-resolution tests."""
+    from coding_agent.config import AppConfig
+    from coding_agent.tools import ToolRegistry
+    cfg = AppConfig()
+    return ToolRegistry(workspace_root=tmp_path, config=cfg)
+
+
+def test_tool_registry_resolves_camel_web_search(tmp_path: Path) -> None:
+    """WebSearch (camelCase) must resolve to the registered web_search tool."""
+    reg = _make_registry(tmp_path)
+    assert reg.has_tool("WebSearch"), "WebSearch should resolve to web_search"
+
+
+def test_tool_registry_resolves_camel_web_fetch(tmp_path: Path) -> None:
+    reg = _make_registry(tmp_path)
+    assert reg.has_tool("WebFetch"), "WebFetch should resolve to web_fetch"
+
+
+def test_tool_registry_execute_camel_name_does_not_raise(tmp_path: Path) -> None:
+    """Calling execute() with WebSearch must not raise KeyError."""
+    reg = _make_registry(tmp_path)
+    # web_search requires a 'query' arg; an empty query is fine for a registry test
+    try:
+        reg.execute("WebSearch", {"query": "test"})
+    except KeyError as exc:
+        pytest.fail(f"execute('WebSearch', ...) raised KeyError: {exc}")
+
+
+def test_tool_registry_unknown_tool_still_raises(tmp_path: Path) -> None:
+    reg = _make_registry(tmp_path)
+    with pytest.raises(KeyError, match="NonExistentTool"):
+        reg.execute("NonExistentTool", {})

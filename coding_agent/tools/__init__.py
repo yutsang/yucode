@@ -407,19 +407,35 @@ class ToolRegistry:
             for tool in self._tools.values()
         ]
 
+    def _build_name_index(self) -> None:
+        """Map stripped-lowercase name → canonical for camelCase/snake_case resolution.
+
+        e.g. "WebSearch" and "web_search" both normalize to "websearch" → "web_search".
+        """
+        self._name_index: dict[str, str] = {
+            name.lower().replace("_", ""): name for name in self._tools
+        }
+
+    def _resolve_name(self, tool_name: str) -> str:
+        """Return the canonical registered name, handling camelCase/snake_case variants."""
+        if tool_name in self._tools:
+            return tool_name
+        return self._name_index.get(tool_name.lower().replace("_", ""), tool_name)
+
     def permission_for(self, tool_name: str) -> PermissionMode:
-        return self._tools[tool_name].spec.permission
+        return self._tools[self._resolve_name(tool_name)].spec.permission
 
     def risk_level_for(self, tool_name: str) -> RiskLevel:
-        return self._tools[tool_name].spec.risk_level
+        return self._tools[self._resolve_name(tool_name)].spec.risk_level
 
     def has_tool(self, tool_name: str) -> bool:
-        return tool_name in self._tools
+        return self._resolve_name(tool_name) in self._tools
 
     def execute(self, tool_name: str, arguments: dict[str, Any]) -> str:
-        if tool_name not in self._tools:
+        name = self._resolve_name(tool_name)
+        if name not in self._tools:
             raise KeyError(f"Unknown tool: {tool_name}")
-        return self._tools[tool_name].handler(arguments)
+        return self._tools[name].handler(arguments)
 
     def list_names(self) -> list[str]:
         return sorted(self._tools)
@@ -451,6 +467,7 @@ class ToolRegistry:
         if self.config.tools.disabled:
             for name in self.config.tools.disabled:
                 self._tools.pop(name, None)
+        self._build_name_index()
 
     def _builtin_tools(self) -> list[ToolDefinition]:
         from .agent_tool import agent_tools
