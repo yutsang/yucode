@@ -169,9 +169,16 @@ def _edit_file(registry: ToolRegistry, args: dict[str, Any]) -> str:
     new = str(args["new_string"])
     replace_all = bool(args.get("replace_all", False))
     text = path.read_text(encoding="utf-8")
-    if old not in text:
+    occurrences = text.count(old)
+    if occurrences == 0:
         raise ValueError(f"`{old}` not found in {path}")
-    count = text.count(old) if replace_all else 1
+    if not replace_all and occurrences > 1:
+        raise ValueError(
+            f"`old_string` matches {occurrences} places in {path}. "
+            "Either pass `replace_all: true` or extend `old_string` with "
+            "surrounding context so it uniquely identifies one location."
+        )
+    count = occurrences if replace_all else 1
     updated = text.replace(old, new) if replace_all else text.replace(old, new, 1)
     path.write_text(updated, encoding="utf-8")
     try:
@@ -336,7 +343,7 @@ def _py_grep_lines(
                 if regex.search(line_text):
                     if rel not in seen_files:
                         seen_files.add(rel)
-                        results.append(str(filepath))
+                        results.append(rel)
                     break
         else:
             for lineno, line_text in enumerate(text.splitlines(), 1):

@@ -34,6 +34,7 @@ from ..security.permissions import (
 from ..security.safety import scan_and_redact_secrets
 from ..tools import ToolRegistry
 from .errors import (
+    AgentError,
     CompactionError,
     McpError,
     ProviderError,
@@ -329,6 +330,8 @@ class AgentRuntime:
             except Exception as exc:
                 _log.error("Provider call failed: %s", exc)
                 if self.config.runtime.error_strategy == "strict":
+                    if isinstance(exc, AgentError):
+                        raise
                     raise ProviderError(str(exc)) from exc
                 summary.final_text = f"[Provider error: {exc}. The task could not be completed.]"
                 if event_callback:

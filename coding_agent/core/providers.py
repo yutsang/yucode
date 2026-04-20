@@ -567,6 +567,22 @@ class _TextToolCallFilter:
         """Call at end of stream; return any remaining safe text."""
         return self._drain(flush_all=True)
 
+    def _holdback(self) -> int:
+        """Length of buffer tail that might still complete into an open tag.
+
+        Only the suffix that is a proper prefix of any open tag needs to be
+        withheld — the rest of the buffer can be safely emitted. Returning 0
+        when the tail clearly isn't a tag prefix avoids per-chunk streaming
+        latency on text that happens to be shorter than _MAX_OPEN_LEN.
+        """
+        tail_max = min(len(self._buf), self._MAX_OPEN_LEN - 1)
+        for size in range(tail_max, 0, -1):
+            suffix = self._buf[-size:]
+            for tag in self._OPEN_TAGS:
+                if tag.startswith(suffix):
+                    return size
+        return 0
+
     def _drain(self, flush_all: bool) -> str:
         parts: list[str] = []
         while True:
@@ -582,7 +598,7 @@ class _TextToolCallFilter:
                     self._open_tag = found
                     # continue to look for the close tag
                 else:
-                    safe = len(self._buf) if flush_all else max(0, len(self._buf) - self._MAX_OPEN_LEN)
+                    safe = len(self._buf) if flush_all else len(self._buf) - self._holdback()
                     parts.append(self._buf[:safe])
                     self._buf = self._buf[safe:]
                     break

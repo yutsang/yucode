@@ -112,6 +112,43 @@ class TestWriteFileAllowed:
         assert (workspace / "output.txt").read_text() == "written by test"
 
 
+class TestEditFileUniqueness:
+    def test_edit_file_replaces_unique_match(self, workspace: Path, default_config: AppConfig):
+        (workspace / "f.txt").write_text("alpha beta gamma", encoding="utf-8")
+        registry = ToolRegistry(workspace, default_config)
+        result = registry.execute("edit_file", {
+            "path": "f.txt", "old_string": "beta", "new_string": "BETA",
+        })
+        assert "1 replacement" in result
+        assert (workspace / "f.txt").read_text() == "alpha BETA gamma"
+
+    def test_edit_file_rejects_non_unique_without_replace_all(
+        self, workspace: Path, default_config: AppConfig,
+    ):
+        (workspace / "f.txt").write_text("foo foo foo", encoding="utf-8")
+        registry = ToolRegistry(workspace, default_config)
+        with pytest.raises(ValueError, match="matches 3 places"):
+            registry.execute("edit_file", {
+                "path": "f.txt", "old_string": "foo", "new_string": "bar",
+            })
+        # File must be left untouched.
+        assert (workspace / "f.txt").read_text() == "foo foo foo"
+
+    def test_edit_file_replace_all_handles_multiple(
+        self, workspace: Path, default_config: AppConfig,
+    ):
+        (workspace / "f.txt").write_text("foo foo foo", encoding="utf-8")
+        registry = ToolRegistry(workspace, default_config)
+        result = registry.execute("edit_file", {
+            "path": "f.txt",
+            "old_string": "foo",
+            "new_string": "bar",
+            "replace_all": True,
+        })
+        assert "3 replacements" in result
+        assert (workspace / "f.txt").read_text() == "bar bar bar"
+
+
 # ---------------------------------------------------------------------------
 # 5. write_file_denied
 # ---------------------------------------------------------------------------

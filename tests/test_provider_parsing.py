@@ -749,3 +749,40 @@ class TestTextToolCallFallback:
         assert len(response.tool_calls) == 1
         assert response.tool_calls[0].name == "write_file"
         assert response.text == ""  # tag content stripped
+
+
+class TestTextToolCallFilter:
+    """The live streaming filter that hides <tool_call> blocks from the terminal."""
+
+    def test_plain_text_emits_without_holdback(self):
+        from coding_agent.core.providers import _TextToolCallFilter
+        f = _TextToolCallFilter()
+        assert f.push("Hello world! ") == "Hello world! "
+        assert f.push("no tags here.") == "no tags here."
+
+    def test_holds_back_only_real_tag_prefix(self):
+        from coding_agent.core.providers import _TextToolCallFilter
+        f = _TextToolCallFilter()
+        # Ends with "<" — a valid prefix of "<tool_call>", must be withheld.
+        out = f.push("Hello <")
+        assert out == "Hello "
+        # Completing into a non-tag emits the held-back chars.
+        out2 = f.push("NOT>")
+        assert out2 == "<NOT>"
+
+    def test_suppresses_tool_call_block(self):
+        from coding_agent.core.providers import _TextToolCallFilter
+        f = _TextToolCallFilter()
+        out = ""
+        out += f.push('before <tool_call>{"name":"x","arguments":{}}</tool_call> after')
+        out += f.flush()
+        assert "<tool_call>" not in out
+        assert "before " in out
+        assert "after" in out
+
+    def test_flush_emits_partial_tag_prefix(self):
+        from coding_agent.core.providers import _TextToolCallFilter
+        f = _TextToolCallFilter()
+        # "<tool" is a partial prefix; on EOF it should be flushed verbatim.
+        assert f.push("<tool") == ""
+        assert f.flush() == "<tool"
