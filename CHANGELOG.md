@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.4] - 2026-04-22
+
+### Fixed
+- `coding_agent/core/providers.py`: stream-stall timeout in `_iter_stream()` now raises `ProviderError ... from None` so the exception chain doesn't point at the spurious `queue.Empty` (ruff B904)
+- `coding_agent/interface/render.py`: spinner animation thread now uses `contextlib.suppress(Exception)` around `_redraw()` instead of `try/except/pass` (ruff SIM105)
+
+### Changed
+- CI lint job (`ruff check coding_agent/ tests/`) is green again — both errors above previously failed the pipeline
+
 ## [0.3.3] - 2026-04-11
 
 ### Added

@@ -8,6 +8,7 @@ Modeled after claw-code-main/rust/crates/claw-cli/src/render.rs.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import shutil
@@ -296,10 +297,9 @@ class ProgressDisplay:
             with self._lock:
                 if not self._spinning:
                     break
-            try:
+            # never let a render error kill the animation thread
+            with contextlib.suppress(Exception):
                 self._redraw()
-            except Exception:  # noqa: BLE001
-                pass  # never let a render error kill the animation thread
             time.sleep(self.INTERVAL)
 
     def _redraw(self) -> None:

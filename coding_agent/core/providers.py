@@ -366,7 +366,7 @@ class OpenAICompatibleProvider:
                         "The provider may have hung. Try again or set "
                         "provider.streaming_mode: no_stream.",
                         recoverable=True,
-                    )
+                    ) from None
                 continue
             idle = 0.0
             if kind == "done":
