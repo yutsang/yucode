@@ -17,7 +17,7 @@ from coding_agent.security.permissions import PermissionPolicy
 
 
 def test_version_matches_repo() -> None:
-    assert __version__ == "0.3.4"
+    assert __version__ == "0.3.5"
 
 
 def test_env_api_key_takes_priority() -> None:

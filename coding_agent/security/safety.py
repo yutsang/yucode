@@ -114,12 +114,17 @@ def check_bash_safety(command: str) -> SafetyVerdict:
     Returns a SafetyVerdict indicating whether the command should be blocked,
     warned about, or allowed. Blocked commands should not be executed.
     """
+    # Deferred import: bash_validation imports SafetyVerdict from this module.
+    from .bash_validation import check_path_traversal, check_sed_in_place
+
     for check in (
         _check_destructive_fs,
         _check_exfiltration,
         _check_dangerous_git,
         _check_bypass_flags,
         _check_warn_patterns,
+        check_sed_in_place,
+        check_path_traversal,
     ):
         verdict = check(command)
         if verdict is not None:

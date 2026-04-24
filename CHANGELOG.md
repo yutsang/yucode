@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.5] - 2026-04-24
+
+### Added
+- `coding_agent/security/bash_validation.py`: new module that narrows the gap vs. claw-code's `bash_validation.rs`:
+  - `CommandIntent` enum + `classify_command()` — tags commands as read-only / write / destructive / network / process / package / system-admin / unknown
+  - `extract_first_command()` — strips leading `KEY=val` env-var prefixes so classification/read-only detection is not fooled by `FOO=bar rm -rf /`
+  - `check_sed_in_place()` — warns on `sed -i` (silent in-place edit)
+  - `check_path_traversal()` — warns on `../` and on write/destructive commands that target system paths (`/etc/`, `/usr/`, `/var/`, `/dev/`, …)
+- `coding_agent/security/__init__.py`: re-exports `CommandIntent` and `classify_command`
+- `tests/test_security.py`: 13 new tests covering the above
+
+### Changed
+- `coding_agent/security/safety.py::check_bash_safety()` now also runs `check_sed_in_place` and `check_path_traversal` as part of the pipeline
+- `coding_agent/security/permissions.py::_is_read_only_command()` now strips leading `KEY=val` env-var tokens before matching — `FOO=bar ls` is now recognised as read-only, `FOO=bar rm -rf /tmp` is still rejected
+
 ## [0.3.4] - 2026-04-22
 
 ### Fixed

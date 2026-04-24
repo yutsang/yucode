@@ -1,5 +1,6 @@
 """Security layer -- permissions, sandbox isolation, and safety checks."""
 
+from .bash_validation import CommandIntent, classify_command
 from .permissions import (
     PERMISSION_ORDER,
     PermissionDecision,
@@ -20,6 +21,7 @@ from .sandbox import (
 
 __all__ = [
     "PERMISSION_ORDER",
+    "CommandIntent",
     "LinuxSandboxCommand",
     "PermissionDecision",
     "PermissionMode",
@@ -31,6 +33,7 @@ __all__ = [
     "SandboxStatus",
     "build_linux_sandbox_command",
     "check_bash_safety",
+    "classify_command",
     "detect_container_environment",
     "resolve_sandbox_status",
 ]

@@ -332,10 +332,22 @@ def _is_read_only_command(command: str) -> bool:
     for indicator in _MUTATING_INDICATORS:
         if indicator in stripped:
             return False
-    parts = stripped.split()
-    first_token = parts[0] if parts else ""
+    # Skip leading ``KEY=val`` environment-variable assignments so
+    # ``FOO=bar ls`` is recognised the same as ``ls``.
+    tokens = stripped.split()
+    start = 0
+    for tok in tokens:
+        if "=" in tok:
+            name, _, _ = tok.partition("=")
+            if name and all(c.isalnum() or c == "_" for c in name):
+                start += 1
+                continue
+        break
+    tokens = tokens[start:]
+    if not tokens:
+        return False
+    first_token = tokens[0]
     for prefix_len in (1, 2):
-        tokens = stripped.split(None, prefix_len)
         prefix = " ".join(tokens[:prefix_len])
         if prefix in _READ_ONLY_COMMANDS:
             return True
