@@ -21,7 +21,7 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Application Frameworks",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-dependencies = []
+dependencies = ["prompt_toolkit>=3.0"]
 
 [project.urls]
 Homepage = "https://github.com/ultraworkers/yucode"

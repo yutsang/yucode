@@ -284,6 +284,15 @@ class OpenAICompatibleProvider:
             if not _looks_like_openai_response(payload):
                 detail = _extract_envelope_detail(payload)
                 hint = f" Server message: {detail}" if detail else ""
+                if detail and detail.lower() in ("bad request", "unauthorized", "forbidden", "invalid request"):
+                    raise ProviderError(
+                        f"The provider gateway ({self._build_url()}) rejected the request "
+                        f"with: {detail!r}.{hint} "
+                        "The gateway URL is reachable but the request payload was refused. "
+                        "Check: (1) provider.model is a valid model name on this gateway, "
+                        "(2) your API key is current, "
+                        "(3) any required extra_body or extra_headers fields your gateway needs."
+                    )
                 raise ProviderError(
                     f"The provider endpoint ({self._build_url()}) returned a non-OpenAI "
                     f"response. Payload keys: {sorted(payload.keys())}.{hint} "

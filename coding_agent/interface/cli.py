@@ -939,28 +939,71 @@ _SLASH_COMMANDS = [
 ]
 
 
-def _make_completer(workspace: Path):
-    def completer(text: str, state: int) -> str | None:
-        if text.startswith("/"):
-            options = [c + " " for c in _SLASH_COMMANDS if c.startswith(text)]
-        elif text.startswith("@"):
-            partial = text[1:]
-            base = workspace / partial if partial else workspace
-            parent = base.parent if partial and not base.is_dir() else base
+_AT_HIDDEN = frozenset({"__pycache__", ".git", ".DS_Store", ".mypy_cache", ".ruff_cache", ".pytest_cache"})
+
+
+def _make_pt_session(workspace: Path) -> Any:
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.completion import Completer, Completion
+    from prompt_toolkit.history import FileHistory
+    from prompt_toolkit.key_binding import KeyBindings
+
+    class _YuCompleter(Completer):
+        def get_completions(self, document, complete_event):
+            text = document.text_before_cursor
+            # Slash commands — only valid on the first line
+            first_line = text.split("\n")[0]
+            if first_line.startswith("/") and "\n" not in text:
+                for cmd in _SLASH_COMMANDS:
+                    if cmd.startswith(first_line):
+                        yield Completion(cmd[len(first_line):], display=cmd)
+                return
+            # @file paths — complete the most recent @-token
+            at_idx = text.rfind("@")
+            if at_idx == -1:
+                return
+            partial = text[at_idx + 1:]
+            if "/" in partial:
+                sub_dir = partial.rsplit("/", 1)[0]
+                parent = workspace / sub_dir
+                prefix_used = sub_dir + "/"
+            else:
+                parent = workspace
+                prefix_used = ""
             try:
                 entries = sorted(parent.iterdir()) if parent.is_dir() else []
             except OSError:
-                entries = []
-            options = []
+                return
+            stem = partial[len(prefix_used):]
             for entry in entries:
-                rel = str(entry.relative_to(workspace))
-                candidate = "@" + rel + ("/" if entry.is_dir() else " ")
-                if candidate.startswith(text):
-                    options.append(candidate)
+                # Skip hidden/noise entries unless the user explicitly typed a dot prefix
+                if entry.name in _AT_HIDDEN or (entry.name.startswith(".") and not stem.startswith(".")):
+                    continue
+                name = entry.name + ("/" if entry.is_dir() else "")
+                if name.startswith(stem):
+                    yield Completion(name[len(stem):], display="@" + prefix_used + name)
+
+    kb = KeyBindings()
+
+    @kb.add("c-c")
+    def _ctrl_c(event):
+        buf = event.current_buffer
+        if buf.text:
+            buf.reset()
         else:
-            options = []
-        return options[state] if state < len(options) else None
-    return completer
+            raise KeyboardInterrupt()
+
+    history_file = Path.home() / ".yucode" / "history"
+    history_file.parent.mkdir(parents=True, exist_ok=True)
+
+    return PromptSession(
+        completer=_YuCompleter(),
+        complete_while_typing=False,
+        multiline=True,
+        prompt_continuation=lambda width, line_number, wrap_count: " " * (width - 1) + "·",
+        history=FileHistory(str(history_file)),
+        key_bindings=kb,
+    )
 
 
 def _format_session_resume_info(session: Any) -> str:
@@ -1016,13 +1059,7 @@ def _run_interactive(args: argparse.Namespace) -> int:
     prompter = InteractivePermissionPrompter() if config.runtime.permission_mode == "prompt" else None
     runtime = AgentRuntime(workspace, config, session=session, permission_prompter=prompter)
 
-    try:
-        import readline
-        readline.set_completer(_make_completer(workspace))
-        readline.set_completer_delims(" \t\n")
-        readline.parse_and_bind("tab: complete")
-    except ImportError:
-        pass
+    pt_session = _make_pt_session(workspace)
 
     from ..memory.prompting import MAX_INSTRUCTION_FILE_CHARS, MAX_TOTAL_INSTRUCTION_CHARS, discover_instruction_files
     _ifiles = discover_instruction_files(workspace, config.instruction_files or [])
@@ -1049,9 +1086,11 @@ def _run_interactive(args: argparse.Namespace) -> int:
 
     handler = _InteractiveEventHandler(streaming=config.provider.streaming_mode != "no_stream")
 
+    from prompt_toolkit.formatted_text import ANSI as _ANSI
+
     while True:
         try:
-            line = input(user_prompt()).strip()
+            line = pt_session.prompt(_ANSI(user_prompt())).strip()
         except (EOFError, KeyboardInterrupt):
             _auto_save(runtime)
             print(f"\n{render_info('Bye.')}")

@@ -426,7 +426,7 @@ def startup_banner(
 
     lines.extend([
         f"  {THEME.brand}│{RESET}",
-        f"  {THEME.brand}╰─{RESET} {DIM}Type {THEME.prompt_you}/help{RESET}{DIM} for commands, Tab to complete{RESET}",
+        f"  {THEME.brand}╰─{RESET} {DIM}Type {THEME.prompt_you}/help{RESET}{DIM} for commands · Tab to complete · Alt+Enter to send{RESET}",
         "",
     ])
     return "\n".join(lines)
