@@ -183,6 +183,8 @@ class OpenAICompatibleProvider:
             "temperature": self.config.temperature,
             "stream": stream,
         }
+        if stream:
+            body["stream_options"] = {"include_usage": True}
         if tools:
             body["tools"] = tools
             body["tool_choice"] = "auto"

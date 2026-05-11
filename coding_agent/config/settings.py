@@ -333,6 +333,11 @@ def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]
         elif key in result and isinstance(result[key], list) and isinstance(value, list):
             result[key] = list(result[key]) + value
         else:
+            # An empty overlay value must not shadow a non-empty base value
+            # (e.g. an empty api_key in settings.local.yml shouldn't wipe the
+            # real key from settings.yml).
+            if value in ("", None) and key in result and result[key] not in ("", None):
+                continue
             result[key] = value
     return result
 

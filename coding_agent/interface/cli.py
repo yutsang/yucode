@@ -985,6 +985,19 @@ def _make_pt_session(workspace: Path) -> Any:
 
     kb = KeyBindings()
 
+    @kb.add("enter", eager=True)
+    def _enter_submit(event):
+        buf = event.current_buffer
+        if buf.complete_state:
+            # Accept the selected completion but don't submit yet
+            buf.complete_state = None
+            return
+        buf.validate_and_handle()
+
+    @kb.add("escape", "enter")
+    def _alt_enter_newline(event):
+        event.current_buffer.insert_text("\n")
+
     @kb.add("c-c")
     def _ctrl_c(event):
         buf = event.current_buffer

@@ -426,7 +426,7 @@ def startup_banner(
 
     lines.extend([
         f"  {THEME.brand}│{RESET}",
-        f"  {THEME.brand}╰─{RESET} {DIM}Type {THEME.prompt_you}/help{RESET}{DIM} for commands · Tab to complete · Alt+Enter to send{RESET}",
+        f"  {THEME.brand}╰─{RESET} {DIM}Type {THEME.prompt_you}/help{RESET}{DIM} for commands · Tab to complete · Alt+Enter for newline{RESET}",
         "",
     ])
     return "\n".join(lines)
@@ -813,10 +813,10 @@ def format_cost_summary(usage: dict[str, int]) -> str:
         lines.append(f"  {THEME.muted}│{RESET}  cache write {cache_create:>8,}")
     if cache_read:
         lines.append(f"  {THEME.muted}│{RESET}  cache read  {cache_read:>8,}")
-    lines.extend([
-        f"  {THEME.muted}│{RESET}  {BOLD}total{RESET}        {total:>8,}",
-        f"  {THEME.muted}╰────────────────────────────────╯{RESET}",
-    ])
+    lines.append(f"  {THEME.muted}│{RESET}  {BOLD}total{RESET}        {total:>8,}")
+    if total == 0:
+        lines.append(f"  {THEME.muted}│{RESET}  {DIM}(provider did not report usage){RESET}")
+    lines.append(f"  {THEME.muted}╰────────────────────────────────╯{RESET}")
     return "\n".join(lines)
 
 
