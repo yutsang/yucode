@@ -422,29 +422,34 @@ class OpenAICompatibleProvider:
                     saw_non_openai_stream_payload = True
                 continue
             chunk_count += 1
-            choice = payload.get("choices", [{}])[0]
-            delta = choice.get("delta", {})
-            content = _extract_content_text(delta.get("content"))
-            if content:
-                text_parts.append(content)
-                to_emit = stream_filter.push(content)
-                if to_emit and stream_callback:
-                    stream_callback({"type": "assistant_delta", "delta": to_emit})
-            for tool_call_delta in delta.get("tool_calls", []):
-                index = int(tool_call_delta.get("index", 0))
-                function_delta = tool_call_delta.get("function", {})
-                slot = tool_call_accumulator.setdefault(
-                    index,
-                    {
-                        "id": tool_call_delta.get("id") or f"tool_{uuid4().hex[:8]}",
-                        "name": "",
-                        "arguments": "",
-                    },
-                )
-                if tool_call_delta.get("id"):
-                    slot["id"] = tool_call_delta["id"]
-                slot["name"] += function_delta.get("name", "")
-                slot["arguments"] += function_delta.get("arguments", "")
+            # When stream_options.include_usage is on, providers send a final
+            # chunk with `choices: []` carrying only usage — skip delta parsing
+            # for that chunk but still process usage below.
+            choices = payload.get("choices") or []
+            if choices:
+                choice = choices[0]
+                delta = choice.get("delta", {})
+                content = _extract_content_text(delta.get("content"))
+                if content:
+                    text_parts.append(content)
+                    to_emit = stream_filter.push(content)
+                    if to_emit and stream_callback:
+                        stream_callback({"type": "assistant_delta", "delta": to_emit})
+                for tool_call_delta in delta.get("tool_calls", []):
+                    index = int(tool_call_delta.get("index", 0))
+                    function_delta = tool_call_delta.get("function", {})
+                    slot = tool_call_accumulator.setdefault(
+                        index,
+                        {
+                            "id": tool_call_delta.get("id") or f"tool_{uuid4().hex[:8]}",
+                            "name": "",
+                            "arguments": "",
+                        },
+                    )
+                    if tool_call_delta.get("id"):
+                        slot["id"] = tool_call_delta["id"]
+                    slot["name"] += function_delta.get("name", "")
+                    slot["arguments"] += function_delta.get("arguments", "")
             raw_usage = payload.get("usage") or {}
             if stream_callback and raw_usage:
                 stream_callback({"type": "usage", "usage": raw_usage})
