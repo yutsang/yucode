@@ -283,13 +283,31 @@ class AgentRuntime:
             resumed_messages=prior_message_count,
             estimated_tokens=self.estimated_tokens(),
         ).render()
-        self.session.add_message(Message(role="user", content=prompt))
+        # Grounding nudge: weak models often answer investigation prompts from
+        # memory without reading any source. Front-load an explicit directive
+        # so the first response has to call grep_search or read_file.
+        effective_prompt = prompt
+        if self.config.provider.resolved_tier() == "weak":
+            from .coordinator import looks_like_investigation
+            if looks_like_investigation(prompt):
+                effective_prompt = (
+                    f"{prompt}\n\n"
+                    "[System: investigation task. Before answering you MUST call "
+                    "grep_search or read_file at least once. Answering from general "
+                    "knowledge without inspecting the actual workspace source is a "
+                    "failure mode — cite specific file paths and line numbers.]"
+                )
+        self.session.add_message(Message(role="user", content=effective_prompt))
 
         self._cancel_event.clear()
 
         max_steps = max_steps_override or self.config.runtime.max_iterations
         max_tool_calls = self.config.runtime.max_tool_calls
         dedup_threshold = self.config.runtime.dedup_tool_threshold
+        # Weak models loop more readily — block the 2nd identical call instead
+        # of the 3rd. (Observed: Qwen3 looped 8× on the same read_file path.)
+        if self.config.provider.resolved_tier() == "weak":
+            dedup_threshold = max(2, dedup_threshold - 1)
         tool_call_count = 0
         dedup_counts: dict[tuple[str, str], int] = {}
         dedup_blocks_this_turn = 0   # how many hard dedup stops have fired

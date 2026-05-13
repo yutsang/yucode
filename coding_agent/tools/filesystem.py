@@ -131,9 +131,23 @@ def _find_similar_files(workspace: Path, path_arg: str) -> list[str]:
 
 
 def _read_file(registry: ToolRegistry, args: dict[str, Any]) -> str:
-    path = registry._resolve_path(str(args["path"]))
+    raw = str(args["path"])
+    path = registry._resolve_path(raw)
     if not path.exists():
-        similar = _find_similar_files(registry.workspace_root, str(args["path"]))
+        # Bare-filename auto-resolve: if `raw` is a bare filename (no directory
+        # separator), search the workspace for a unique non-artifact match and
+        # use it. Eliminates retry loops where the agent guesses common paths
+        # like "coordinator.py" / "settings.py".
+        normalized = raw.replace("\\", "/")
+        if "/" not in normalized and normalized:
+            candidates = [
+                p for p in registry.workspace_root.rglob(normalized)
+                if p.is_file() and not _is_artifact_path(str(p))
+            ]
+            if len(candidates) == 1:
+                path = candidates[0]
+    if not path.exists():
+        similar = _find_similar_files(registry.workspace_root, raw)
         msg = f"File not found: `{path}`."
         if similar:
             msg += f" Did you mean: {', '.join(similar[:3])}?"

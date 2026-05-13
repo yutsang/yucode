@@ -216,3 +216,70 @@ def test_system_prompt_contains_complex_task_guidance(tmp_path: Path) -> None:
     ctx = ProjectContext(cwd=tmp_path, current_date="2026-01-01", git_status=None, git_diff=None, instruction_files=[])
     prompt = PromptAssembler(AppConfig(), ctx).render()
     assert "plan" in prompt.lower(), "System prompt should mention writing a plan for complex tasks"
+
+
+# --- is_complex_prompt / looks_like_investigation ---
+
+@pytest.mark.parametrize("prompt", [
+    "Please check why kedro tells me Pipeline does not contain nodes named [...]",
+    "List every environment variable that yucode reads. Group by purpose.",
+    "How many tools does yucode register? Group them by RiskLevel.",
+    "幫我調查這個 kedro 錯誤",
+    "為什麼 X 不存在",
+    "refactor the auth module",
+])
+def test_is_complex_prompt_triggers_for_investigation_and_implementation(prompt: str) -> None:
+    """Investigation question forms and implementation verbs must trigger coordinator."""
+    from coding_agent.core.coordinator import is_complex_prompt
+    assert is_complex_prompt(prompt, intelligence_tier="weak"), f"Should trigger: {prompt!r}"
+
+
+@pytest.mark.parametrize("prompt", ["ls", "print pi", "hello", ""])
+def test_is_complex_prompt_skips_trivial_short_prompts(prompt: str) -> None:
+    from coding_agent.core.coordinator import is_complex_prompt
+    assert not is_complex_prompt(prompt, intelligence_tier="strong"), f"Should not trigger: {prompt!r}"
+
+
+def test_weak_tier_triggers_earlier_than_strong() -> None:
+    """Weak-tier should trigger on prompts strong-tier ignores (e.g. 'find function foo')."""
+    from coding_agent.core.coordinator import is_complex_prompt
+    prompt = "find function foo"
+    assert is_complex_prompt(prompt, intelligence_tier="weak")
+    assert not is_complex_prompt(prompt, intelligence_tier="strong")
+
+
+def test_intelligence_tier_auto_detects_weak_models() -> None:
+    from coding_agent.config.settings import resolve_intelligence_tier
+    assert resolve_intelligence_tier("auto", "qwen3-32b") == "weak"
+    assert resolve_intelligence_tier("auto", "llama-3.1-70b") == "weak"
+    assert resolve_intelligence_tier("auto", "gpt-4o") == "strong"
+    assert resolve_intelligence_tier("auto", "claude-opus-4-7") == "strong"
+    assert resolve_intelligence_tier("auto", "unknown-model") == "strong"
+    # Explicit overrides ignore model name
+    assert resolve_intelligence_tier("strong", "qwen3-32b") == "strong"
+    assert resolve_intelligence_tier("weak", "gpt-4o") == "weak"
+
+
+def test_resolve_path_normalizes_backslashes(tmp_path: Path) -> None:
+    """Windows backslash paths must resolve identically to forward-slash paths."""
+    from coding_agent.config import AppConfig
+    from coding_agent.tools import ToolRegistry
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "file.py").write_text("x")
+    reg = ToolRegistry(tmp_path, AppConfig())
+    posix = reg._resolve_path("pkg/file.py")
+    windows = reg._resolve_path("pkg\\file.py")
+    assert posix == windows, "Backslash and forward-slash paths must resolve to the same Path"
+    assert posix.exists()
+
+
+def test_read_file_auto_resolves_bare_filename(tmp_path: Path) -> None:
+    """Bare filename with unique workspace match should resolve automatically."""
+    from coding_agent.config import AppConfig
+    from coding_agent.tools import ToolRegistry
+    from coding_agent.tools.filesystem import _read_file
+    (tmp_path / "pkg" / "sub").mkdir(parents=True)
+    (tmp_path / "pkg" / "sub" / "uniquename.py").write_text("content")
+    reg = ToolRegistry(tmp_path, AppConfig())
+    result = _read_file(reg, {"path": "uniquename.py"})
+    assert "content" in result

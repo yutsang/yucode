@@ -66,10 +66,28 @@ _MULTI_PART_RE = __import__("re").compile(r"\band\s+also\b|\bthen\s+also\b|\b(?:
 # Triggers coordinator even for short prompts because investigation tasks
 # almost always need multi-step grep→read→synthesise.
 _INVESTIGATION_RE = __import__("re").compile(
-    r"\b(why\s+(does|is|are|did)|where\s+(is|are|does)|how\s+(does|is|are))\b"
-    r"|為什麼|哪裡|哪個|怎麼會|怎樣",
+    # English question forms
+    r"\bwhy\b"                                         # "why X happens", "check why"
+    r"|\bwhere\s+(is|are|does)\b"                       # "where is foo defined"
+    r"|\bhow\s+(does|is|are|many|much|do)\b"            # "how many", "how does"
+    r"|\b(list|count|show|find)\s+(every|each|all)\b"   # "list every env var"
+    r"|\bgroup\s+(them|by)\b"                           # "group them by", "group by"
+    # Chinese question / investigation cues
+    r"|為什麼|為何|哪裡|哪個|怎麼|怎樣|多少",
     __import__("re").IGNORECASE,
 )
+
+
+def looks_like_investigation(prompt: str) -> bool:
+    """True if *prompt* matches investigation patterns — used by runtime + coordinator."""
+    lower = prompt.lower()
+    if _INVESTIGATION_RE.search(prompt):
+        return True
+    investigation_kw = (
+        "investigate", "debug", "trace", "analyze", "analyse", "explain", "compare",
+        "調查", "追蹤", "分析", "比較", "解釋", "找出", "為什麼", "為何",
+    )
+    return any(kw in lower for kw in investigation_kw)
 
 PLAN_PROMPT_TEMPLATE = """\
 You are a task planner for a coding agent. Analyze the user request and decompose it
@@ -109,6 +127,9 @@ class TaskPlan:
     research_tasks: list[str] = field(default_factory=list)
     work_tasks: list[str] = field(default_factory=list)
     validation_criteria: list[str] = field(default_factory=list)
+    # True when this plan is pure investigation — research output IS the answer,
+    # work/validate phases are skipped. Set by _plan_task's weak-model override.
+    investigate_only: bool = False
 
 
 @dataclass
@@ -226,6 +247,7 @@ class AdminCoordinator:
             return summary
 
         research_context = ""
+        research_results: list[WorkerResult] = []
         if plan.research_tasks:
             if event_callback:
                 event_callback({"type": "phase_started", "phase": "research"})
@@ -236,6 +258,17 @@ class AdminCoordinator:
             for r in research_results:
                 summary.usage.add(r.usage)
             research_context = self._format_context(research_results)
+
+        # Investigation-only plan: the research output IS the answer.
+        # Skip work + validate, return immediately.
+        if plan.investigate_only and research_results:
+            summary.final_text = "\n\n".join(
+                r.output for r in research_results if r.output
+            ).strip() or research_context
+            summary.iterations = max(summary.iterations, 1)
+            if event_callback:
+                event_callback({"type": "completed", "text": summary.final_text})
+            return summary
 
         max_retries = self.config.runtime.max_iterations
         for attempt in range(1, max_retries + 1):
@@ -347,12 +380,30 @@ class AdminCoordinator:
             )
             return TaskPlan(is_simple=True, work_tasks=[prompt])
 
-        return TaskPlan(
+        plan = TaskPlan(
             is_simple=bool(data.get("is_simple", False)),
             research_tasks=data.get("research_tasks", []),
             work_tasks=data.get("work_tasks", [prompt]),
             validation_criteria=data.get("validation_criteria", []),
         )
+        # Weak-model override: Qwen3-class models often return is_simple=True
+        # for investigation prompts ("explain X", "why does Y") and the
+        # downstream worker then answers from memory with zero tool calls.
+        # Force them through a research-only flow so the answer is grounded.
+        if (
+            self.config.provider.resolved_tier() == "weak"
+            and plan.is_simple
+            and looks_like_investigation(prompt)
+        ):
+            plan.is_simple = False
+            plan.investigate_only = True
+            plan.work_tasks = []          # skip work phase
+            plan.validation_criteria = []  # skip validate phase
+            if not plan.research_tasks:
+                plan.research_tasks = [
+                    f"Investigate and answer using workspace evidence: {prompt}"
+                ]
+        return plan
 
     # ------------------------------------------------------------------
     # Worker execution

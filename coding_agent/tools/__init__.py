@@ -539,7 +539,10 @@ class ToolRegistry:
         return json.dumps(self.mcp_manager.execute_prefixed_tool(tool_name, arguments), indent=2)
 
     def _resolve_path(self, raw_path: str, allow_outside_workspace: bool = False) -> Path:
-        path = Path(raw_path)
+        # Normalize backslashes so Windows-style and POSIX-style paths resolve
+        # identically. Weak models on Windows often mix the two when retrying
+        # a path; without this they trigger separate dedup keys and loop.
+        path = Path(raw_path.replace("\\", "/"))
         resolved = (path if path.is_absolute() else self.workspace_root / path).resolve()
         if not allow_outside_workspace:
             # Canonical path comparison prevents symlink escapes (parity with Rust)
