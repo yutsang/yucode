@@ -1,0 +1,133 @@
+# yucode evaluation prompt suite
+#
+# Run with: yucode eval --suite tests/eval_prompts.yaml --out results.json
+#
+# Each entry captures EXPECTED behaviour for human review. The eval runner
+# does NOT auto-judge correctness — it captures tool calls, files read,
+# whether the output mentions build artifacts, and the final text. The
+# human reads results.json and compares before/after.
+#
+# Categories:
+#   A: lookup            — simple find-this-thing, 3-4 calls expected
+#   B: negative invest.  — string doesn't exist, should not surface .pyc
+#   C: positive invest.  — needs grep then read multiple files
+#   D: cross-cutting     — multi-file comparison or aggregation
+#
+# Pick a fixed workspace for both runs (e.g. ~/Downloads/kpi-main).
+# Keep --workspace consistent between before/after runs.
+
+version: 1
+
+prompts:
+  # ---------- A: Lookup ----------
+  - id: A1_find_function_def
+    category: lookup
+    prompt: "Where is the function `_grep_search` defined? Give the file path and line number."
+    expected:
+      max_tool_calls: 5
+      must_read_files: true
+      must_not_mention_artifacts: true
+
+  - id: A2_list_yaml
+    category: lookup
+    prompt: "List all .yaml files in the workspace."
+    expected:
+      max_tool_calls: 3
+      must_read_files: false
+      must_not_mention_artifacts: true
+
+  - id: A3_find_class
+    category: lookup
+    prompt: "Find where the class `AgentRuntime` is declared and tell me its constructor signature."
+    expected:
+      max_tool_calls: 6
+      must_read_files: true
+      must_not_mention_artifacts: true
+
+  # ---------- B: Negative investigation ----------
+  - id: B1_kedro_node_missing
+    category: negative_investigation
+    prompt: "Please check why kedro tells me Pipeline does not contain nodes named ['company3_step0_convert']."
+    expected:
+      max_tool_calls: 10
+      must_read_files: true
+      must_not_mention_artifacts: true
+      acceptable_conclusions:
+        - "not found / does not exist in the codebase"
+        - "string never appears as a registered node"
+        - "likely refers to dynamic naming convention X (with cited evidence)"
+      unacceptable_conclusions:
+        - "surfaces .pyc paths as evidence"
+        - "guesses without reading any source file"
+
+  - id: B2_nonexistent_helper_zh
+    category: negative_investigation
+    prompt: "幫我找出 `nonexistent_super_helper_xyz` 這個函式定義在哪裡。"
+    expected:
+      max_tool_calls: 6
+      must_read_files: false  # acceptable to stop after grep returns nothing
+      must_not_mention_artifacts: true
+
+  - id: B3_typo_search
+    category: negative_investigation
+    prompt: "Where is the variable `MAX_TOO_LCALLS` set? (intentional typo)"
+    expected:
+      max_tool_calls: 6
+      must_read_files: true  # should investigate similar matches
+      must_not_mention_artifacts: true
+
+  # ---------- C: Positive investigation ----------
+  - id: C1_trace_config_flow_zh
+    category: positive_investigation
+    prompt: "追蹤 `max_tool_calls` 這個 config 從 yaml 讀進來到 runtime 用到，經過哪些檔案？"
+    expected:
+      max_tool_calls: 12
+      must_read_files: true
+      must_not_mention_artifacts: true
+      acceptable_conclusions:
+        - "names settings.py + runtime.py + cites specific lines"
+
+  - id: C2_why_dedup_triggers
+    category: positive_investigation
+    prompt: "Why does the runtime sometimes force-stop with a dedup error? Trace the logic that decides when to block."
+    expected:
+      max_tool_calls: 12
+      must_read_files: true
+      must_not_mention_artifacts: true
+      acceptable_conclusions:
+        - "explains _MAX_STUCK_DEDUP_BLOCKS / dedup_threshold from runtime.py"
+
+  - id: C3_explain_compaction
+    category: positive_investigation
+    prompt: "解釋 yucode 的 compaction 機制 — 什麼時候會觸發、什麼 message 會被保留？"
+    expected:
+      max_tool_calls: 12
+      must_read_files: true
+      must_not_mention_artifacts: true
+      acceptable_conclusions:
+        - "cites compact.py + CompactionConfig + preserve_recent"
+
+  # ---------- D: Cross-cutting analysis ----------
+  - id: D1_list_env_vars
+    category: cross_cutting
+    prompt: "List every environment variable that yucode reads (look for `os.environ.get` and `os.getenv`). Group by purpose."
+    expected:
+      max_tool_calls: 10
+      must_read_files: false  # grep can be sufficient
+      must_not_mention_artifacts: true
+
+  - id: D2_compare_workers
+    category: cross_cutting
+    prompt: "Compare the three WorkerRole entries in coordinator.py — what tools does each role have access to, and why?"
+    expected:
+      max_tool_calls: 8
+      must_read_files: true
+      must_not_mention_artifacts: true
+
+  - id: D3_count_tools
+    category: cross_cutting
+    prompt: "How many tools does yucode register? Group them by RiskLevel."
+    expected:
+      max_tool_calls: 10
+      must_read_files: true
+      must_not_mention_artifacts: true

@@ -15,6 +15,32 @@ ErrorStrategy = Literal["strict", "resilient"]
 LogLevel = Literal["DEBUG", "INFO", "WARN", "ERROR"]
 LogFormat = Literal["text", "json"]
 StreamingMode = Literal["stream", "no_stream", "hybrid"]
+# "auto" infers from model name; "strong"/"weak" force a tier. Weak models
+# (Qwen3, Llama, Mistral, Phi, Gemma, small Yi/DeepSeek-distill) get more
+# aggressive coordinator triggering — they benefit from explicit decomposition.
+IntelligenceTier = Literal["auto", "strong", "weak"]
+
+_WEAK_MODEL_HINTS = (
+    "qwen", "llama", "mistral", "mixtral", "phi-", "phi3", "phi4",
+    "gemma", "yi-", "yi:", "codellama", "code-llama", "starcoder",
+    "deepseek-r1-distill", "deepseek-coder-v2-lite",
+)
+
+
+def resolve_intelligence_tier(tier: str, model_name: str) -> Literal["strong", "weak"]:
+    """Resolve `intelligence_tier` config value to a concrete strong/weak tier.
+
+    "auto" infers from *model_name*. Unknown models default to "strong" to
+    preserve current behaviour for users who never set this field.
+    """
+    if tier == "weak":
+        return "weak"
+    if tier == "strong":
+        return "strong"
+    name = model_name.lower()
+    if any(hint in name for hint in _WEAK_MODEL_HINTS):
+        return "weak"
+    return "strong"
 
 BUNDLED_CONFIG_PATH = Path(__file__).resolve().with_name("config.yml")
 DEFAULT_CONFIG_PATH = Path.home() / ".yucode" / "settings.yml"
@@ -67,8 +93,12 @@ class ProviderConfig:
     streaming_mode: StreamingMode = "hybrid"
     temperature: float = 0.0
     request_timeout_seconds: int = 90
+    intelligence_tier: IntelligenceTier = "auto"
     extra_headers: dict[str, str] = field(default_factory=dict)
     extra_body: dict[str, Any] = field(default_factory=dict)
+
+    def resolved_tier(self) -> Literal["strong", "weak"]:
+        return resolve_intelligence_tier(self.intelligence_tier, self.model)
 
 
 OrchestrationMode = Literal["auto", "single", "multi"]
@@ -197,6 +227,7 @@ class AppConfig:
                 "streaming_mode": self.provider.streaming_mode,
                 "temperature": self.provider.temperature,
                 "request_timeout_seconds": self.provider.request_timeout_seconds,
+                "intelligence_tier": self.provider.intelligence_tier,
                 "extra_headers": dict(self.provider.extra_headers),
                 "extra_body": dict(self.provider.extra_body),
             },
@@ -437,6 +468,7 @@ def app_config_from_dict(raw: dict[str, Any]) -> AppConfig:
             provider_raw.get("request_timeout_seconds", 90),
             "provider.request_timeout_seconds",
         ),
+        intelligence_tier=_coerce_intelligence_tier(provider_raw.get("intelligence_tier", "auto")),
         extra_headers=_coerce_string_dict(provider_raw.get("extra_headers", {}), "provider.extra_headers"),
         extra_body=_expect_dict(provider_raw.get("extra_body", {}), "provider.extra_body"),
     )
@@ -664,6 +696,13 @@ def _coerce_orchestration_mode(value: Any) -> OrchestrationMode:
     text = str(value)
     if text not in {"auto", "single", "multi"}:
         raise ConfigError(f"Unsupported orchestration mode: {text}")
+    return text  # type: ignore[return-value]
+
+
+def _coerce_intelligence_tier(value: Any) -> IntelligenceTier:
+    text = str(value).strip().lower() or "auto"
+    if text not in {"auto", "strong", "weak"}:
+        raise ConfigError(f"Unsupported intelligence_tier: {text} (expected auto/strong/weak)")
     return text  # type: ignore[return-value]
 
 

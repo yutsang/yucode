@@ -146,6 +146,17 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--workspace", default=".")
     serve.set_defaults(handler=handle_serve)
 
+    eval_cmd = subparsers.add_parser(
+        "eval",
+        help="Run a prompt suite and capture tool calls / files read / final answers to JSON.",
+    )
+    eval_cmd.add_argument("--suite", required=True, help="Path to eval_prompts.yaml.")
+    eval_cmd.add_argument("--out", required=True, help="Output JSON file.")
+    eval_cmd.add_argument("--workspace", default=".")
+    eval_cmd.add_argument("--only", default=None, help="Comma-separated prompt IDs to run.")
+    eval_cmd.add_argument("--label", default="", help="Free-form label for the run (e.g. before/after).")
+    eval_cmd.set_defaults(handler=handle_eval)
+
     return parser
 
 
@@ -771,6 +782,22 @@ def _cli_event_callback(event: dict[str, Any]) -> None:
         print()
 
 _cli_event_callback._progress = ProgressDisplay()  # type: ignore[attr-defined]
+
+
+def handle_eval(args: argparse.Namespace) -> int:
+    from .eval import run as _eval_run
+    argv = [
+        "--suite", str(args.suite),
+        "--out", str(args.out),
+        "--workspace", str(args.workspace),
+    ]
+    if getattr(args, "only", None):
+        argv += ["--only", str(args.only)]
+    if getattr(args, "label", None):
+        argv += ["--label", str(args.label)]
+    if getattr(args, "config_path", None):
+        argv += ["--config-path", str(args.config_path)]
+    return _eval_run(argv)
 
 
 def handle_default(args: argparse.Namespace) -> int:

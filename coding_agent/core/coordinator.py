@@ -47,13 +47,29 @@ ROLE_TOOLS: dict[WorkerRole, list[str]] = {
 }
 
 _COMPLEXITY_KEYWORDS = [
+    # English — implementation
     "refactor", "implement", "build", "create", "migrate", "redesign",
     "optimize", "rewrite", "add feature", "multi-step", "across files",
     "entire codebase", "all files", "multiple files",
+    # English — investigation (added: weak models won't multi-mode without these)
+    "investigate", "debug", "trace", "analyze", "analyse", "compare",
+    # Chinese — implementation
+    "重構", "實作", "實現", "建立", "建構", "加入", "新增", "修復", "優化", "改寫",
+    # Chinese — investigation
+    "調查", "追蹤", "分析", "比較", "解釋", "找出", "搜尋", "查詢", "為什麼", "為何",
 ]
 
 # Conjunctions that suggest multi-part requests
 _MULTI_PART_RE = __import__("re").compile(r"\band\s+also\b|\bthen\s+also\b|\b(?:also|additionally)\s+\w", __import__("re").IGNORECASE)
+
+# Investigation question forms — "why does X happen", "where is Y defined", etc.
+# Triggers coordinator even for short prompts because investigation tasks
+# almost always need multi-step grep→read→synthesise.
+_INVESTIGATION_RE = __import__("re").compile(
+    r"\b(why\s+(does|is|are|did)|where\s+(is|are|does)|how\s+(does|is|are))\b"
+    r"|為什麼|哪裡|哪個|怎麼會|怎樣",
+    __import__("re").IGNORECASE,
+)
 
 PLAN_PROMPT_TEMPLATE = """\
 You are a task planner for a coding agent. Analyze the user request and decompose it
@@ -121,29 +137,49 @@ class CoordinatorSummary:
     tool_messages: list[Message] = field(default_factory=list)
 
 
-def is_complex_prompt(prompt: str) -> bool:
-    """Heuristic: does the prompt look like it needs multi-phase orchestration?"""
+def is_complex_prompt(prompt: str, intelligence_tier: str = "strong") -> bool:
+    """Heuristic: does the prompt look like it needs multi-phase orchestration?
+
+    *intelligence_tier* controls how aggressive the heuristic is. For "weak"
+    models (Qwen3-32B, Llama-70B, smaller local models) we trigger coordinator
+    more readily — they benefit more from explicit decomposition.
+    """
     import re
     lower = prompt.lower()
 
     # These signals are strong enough to override any word-count gate.
-    # Explicit complexity keywords
+    # Explicit complexity keywords (now includes Chinese + investigation verbs)
     if any(kw in lower for kw in _COMPLEXITY_KEYWORDS):
+        return True
+    # Investigation question forms — bypass word-count gate (often short prompts)
+    if _INVESTIGATION_RE.search(prompt):
         return True
     # Multiple @ file references or source-file extensions → touches many files
     if len(re.findall(r"@[\w./\\-]+|\w+\.(?:py|ts|js|go|rs|java|cpp|c|rb|sh|yaml|yml|json|toml)\b", prompt)) >= 2:
         return True
 
-    # Weaker signals require a minimum word count to avoid false positives on
-    # very short prompts like "update and fix".
-    if len(lower.split()) < 6:
+    # Word-count gate: by default 6 words minimum to avoid false positives like
+    # "update and fix". Weak models benefit from earlier decomposition, so we
+    # drop the gate to 3 words for them.
+    min_words = 3 if intelligence_tier == "weak" else 6
+    if len(lower.split()) < min_words:
         return False
 
     # "and also / then also / additionally X" → clearly multi-part request
     if _MULTI_PART_RE.search(prompt):
         return True
     # Three or more " and " conjunctions suggest a compound task
-    return lower.count(" and ") >= 3
+    if lower.count(" and ") >= 3:
+        return True
+
+    # Weak-model only: any prompt with an explicit verb-like investigation cue
+    # ("find", "show me", "list", "explain") gets coordinator. Strong models
+    # handle these fine single-agent, so we keep the gate for them.
+    if intelligence_tier == "weak":
+        weak_cues = ("find ", "show me", "list all", "explain", "tell me", "告訴我", "列出", "顯示")
+        if any(cue in lower for cue in weak_cues):
+            return True
+    return False
 
 
 class AdminCoordinator:

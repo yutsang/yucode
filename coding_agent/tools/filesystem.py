@@ -19,6 +19,32 @@ MAX_WRITE_SIZE = 10 * 1024 * 1024  # 10 MB
 _BINARY_PROBE_SIZE = 8192
 _GREP_MAX_LINES = 250              # max grep output lines — models think in lines, not bytes
 
+# Directories and suffixes that are build/cache artifacts, not source.
+# Filtered out of heuristic search paths so the agent doesn't cite `.pyc`
+# files as evidence (real incident: model surfaced __pycache__ entries as
+# "relevant files" when grep had no exact match).
+_ARTIFACT_DIRS = frozenset({
+    ".git", "__pycache__", "node_modules",
+    ".venv", "venv",
+    ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox",
+    "dist", "build", "target",
+    ".next", ".nuxt", "coverage",
+    ".idea", ".vscode",
+})
+_ARTIFACT_SUFFIXES = (".pyc", ".pyo", ".class", ".o")
+
+
+def _is_artifact_path(path_str: str) -> bool:
+    """True if *path_str* looks like a build/cache artifact rather than source."""
+    normalised = path_str.replace("\\", "/")
+    parts = normalised.split("/")
+    if any(p in _ARTIFACT_DIRS for p in parts):
+        return True
+    if any(p.endswith(".egg-info") for p in parts):
+        return True
+    name = parts[-1] if parts else ""
+    return name.endswith(_ARTIFACT_SUFFIXES)
+
 
 def filesystem_tools(registry: ToolRegistry) -> list[ToolDefinition]:
     return [
@@ -93,9 +119,10 @@ def _find_similar_files(workspace: Path, path_arg: str) -> list[str]:
     def _collect(pattern: str) -> None:
         for p in workspace.rglob(pattern):
             rel = str(p.relative_to(workspace))
-            if rel not in seen:
-                seen.add(rel)
-                results.append(rel)
+            if rel in seen or _is_artifact_path(rel):
+                continue
+            seen.add(rel)
+            results.append(rel)
 
     _collect(f"**/{name}")
     if stem:
@@ -207,7 +234,11 @@ def _glob_fuzzy_fallback(workspace: Path, pattern: str) -> list[dict[str, Any]]:
         if alt in tried or len(results) >= 5:
             return
         tried.add(alt)
-        hits = sorted(str(p.relative_to(workspace)) for p in workspace.rglob(alt))[:5]
+        hits = sorted(
+            str(p.relative_to(workspace))
+            for p in workspace.rglob(alt)
+            if not _is_artifact_path(str(p.relative_to(workspace)))
+        )[:5]
         if hits:
             results.append({"pattern": alt, "matches": hits})
 
@@ -229,7 +260,10 @@ def _glob_search(registry: ToolRegistry, args: dict[str, Any]) -> str:
     pattern = str(args["pattern"])
     matches = sorted(str(p.relative_to(registry.workspace_root)) for p in target.rglob(pattern))
     if matches:
-        return json.dumps(matches[:200], indent=2)
+        # Filter out build artifacts, but only if doing so leaves real results —
+        # this preserves explicit searches like `**/*.pyc`.
+        non_artifact = [m for m in matches if not _is_artifact_path(m)]
+        return json.dumps((non_artifact or matches)[:200], indent=2)
 
     # No exact matches — try fuzzy alternatives so the model can recover without
     # requiring the user to manually rephrase ("if not ok please find similar").
@@ -324,7 +358,7 @@ def _py_grep_lines(
     for filepath in sorted(search_path.rglob("*")):
         if len(results) >= max_lines:
             break
-        if not filepath.is_file() or ".git" in filepath.parts:
+        if not filepath.is_file() or _is_artifact_path(str(filepath)):
             continue
         if glob_filter and not filepath.match(glob_filter):
             continue
@@ -359,7 +393,7 @@ def _py_list_files(search_path: Path) -> list[str]:
     return [
         str(fp)
         for fp in sorted(search_path.rglob("*"))
-        if fp.is_file() and ".git" not in fp.parts
+        if fp.is_file() and not _is_artifact_path(str(fp))
     ]
 
 
@@ -399,7 +433,10 @@ def _grep_search(registry: ToolRegistry, args: dict[str, Any]) -> str:
         for tok in tokens[:4]:
             if len(tok) < 4:
                 continue
-            name_hits = [p for p in all_paths if tok.lower() in p.lower()][:8]
+            name_hits = [
+                p for p in all_paths
+                if tok.lower() in p.lower() and not _is_artifact_path(p)
+            ][:8]
             if name_hits:
                 partial.append({
                     "term": tok,
@@ -425,7 +462,11 @@ def _grep_search(registry: ToolRegistry, args: dict[str, Any]) -> str:
                 seen: set[str] = set()
                 for line in raw:
                     parts = line.split(":", 2)
-                    if len(parts) >= 3 and parts[0] not in seen:
+                    if (
+                        len(parts) >= 3
+                        and parts[0] not in seen
+                        and not _is_artifact_path(parts[0])
+                    ):
                         seen.add(parts[0])
                         files.append(parts[0])
                 return tok, _grep_rel(registry.workspace_root, files[:10]), "\n".join(raw)
@@ -460,7 +501,11 @@ def _grep_search(registry: ToolRegistry, args: dict[str, Any]) -> str:
                 seen_pfx: set[str] = set()
                 for line in raw:
                     parts = line.split(":", 2)
-                    if len(parts) >= 3 and parts[0] not in seen_pfx:
+                    if (
+                        len(parts) >= 3
+                        and parts[0] not in seen_pfx
+                        and not _is_artifact_path(parts[0])
+                    ):
                         seen_pfx.add(parts[0])
                         files.append(parts[0])
                 if files:
@@ -492,6 +537,8 @@ def _grep_search(registry: ToolRegistry, args: dict[str, Any]) -> str:
                     for gram_files in pool.map(_search_one_gram, grams):
                         for f in gram_files:
                             key = _grep_rel(registry.workspace_root, [f])[0]
+                            if _is_artifact_path(key):
+                                continue
                             file_votes[key] = file_votes.get(key, 0) + 1
                 top = sorted(file_votes, key=lambda f: -file_votes[f])
                 top = [f for f in top if file_votes[f] >= 2][:5] or top[:3]
@@ -502,9 +549,11 @@ def _grep_search(registry: ToolRegistry, args: dict[str, Any]) -> str:
             return json.dumps(
                 {
                     "hint": (
-                        f"No exact match for '{pattern}'. "
-                        "Showing matching content for individual terms "
-                        "(original query may contain a typo or misspelling)."
+                        f"No exact match for '{pattern}'. The files below are CANDIDATES "
+                        "that contain individual keywords from the query — they are NOT "
+                        "the answer. You MUST read_file the most relevant ones before "
+                        "drawing a conclusion. Reporting these paths to the user without "
+                        "reading their contents is a failure mode."
                     ),
                     "partial_matches": partial,
                 },

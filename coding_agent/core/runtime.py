@@ -217,9 +217,10 @@ class AgentRuntime:
         self._ensure_plugins_initialized()
 
         mode = self.config.runtime.orchestration_mode
+        tier = self.config.provider.resolved_tier()
         use_coordinator = (
             mode == "multi"
-            or (mode == "auto" and is_complex_prompt(prompt))
+            or (mode == "auto" and is_complex_prompt(prompt, intelligence_tier=tier))
         )
 
         if not use_coordinator:
