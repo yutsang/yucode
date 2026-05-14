@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import contextlib
 import json
 import re
@@ -18,6 +19,8 @@ MAX_READ_SIZE = 10 * 1024 * 1024   # 10 MB
 MAX_WRITE_SIZE = 10 * 1024 * 1024  # 10 MB
 _BINARY_PROBE_SIZE = 8192
 _GREP_MAX_LINES = 250              # max grep output lines — models think in lines, not bytes
+_READ_FILES_MAX_PATHS = 10         # max files per read_files call — prevents context blowout
+_OUTLINE_MAX_BYTES = 2 * 1024 * 1024  # 2 MB — file_outline parses with ast, must fit in memory
 
 # Directories and suffixes that are build/cache artifacts, not source.
 # Filtered out of heuristic search paths so the agent doesn't cite `.pyc`
@@ -92,6 +95,45 @@ def filesystem_tools(registry: ToolRegistry) -> list[ToolDefinition]:
                 "read-only", RiskLevel.LOW,
             ),
             lambda args: _list_directory(registry, args),
+        ),
+        ToolDefinition(
+            ToolSpec(
+                "read_files",
+                "Read multiple text files in one call. Returns a JSON array; each entry is "
+                "either {path, content, total_lines} on success or {path, error} on failure. "
+                f"Up to {_READ_FILES_MAX_PATHS} paths per call. Use this instead of N sequential "
+                "read_file calls when you need to compare or correlate content across files.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "paths": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Workspace-relative or absolute paths to read.",
+                        },
+                        "offset": {"type": "integer", "description": "Optional 1-based start line, applied to each file."},
+                        "limit": {"type": "integer", "description": "Optional max lines per file."},
+                    },
+                    "required": ["paths"],
+                },
+                "read-only", RiskLevel.LOW,
+            ),
+            lambda args: _read_files(registry, args),
+        ),
+        ToolDefinition(
+            ToolSpec(
+                "file_outline",
+                "Return a structural outline of a Python file (classes, methods, functions, "
+                "top-level imports) with line numbers. Much cheaper than read_file when you "
+                "only need to locate a symbol. Non-Python files return an error suggesting read_file.",
+                {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                },
+                "read-only", RiskLevel.LOW,
+            ),
+            lambda args: _file_outline(registry, args),
         ),
     ]
 
@@ -208,6 +250,12 @@ def _edit_file(registry: ToolRegistry, args: dict[str, Any]) -> str:
     path = registry._resolve_path(str(args["path"]))
     old = str(args["old_string"])
     new = str(args["new_string"])
+    if old == new:
+        raise ValueError(
+            "edit_file: `old_string` and `new_string` are identical — this would "
+            "be a no-op. Provide a different new_string, or use write_file if you "
+            "want to replace the entire file."
+        )
     replace_all = bool(args.get("replace_all", False))
     text = path.read_text(encoding="utf-8")
     occurrences = text.count(old)
@@ -221,6 +269,14 @@ def _edit_file(registry: ToolRegistry, args: dict[str, Any]) -> str:
         )
     count = occurrences if replace_all else 1
     updated = text.replace(old, new) if replace_all else text.replace(old, new, 1)
+    if updated == text:
+        # Defence in depth — should be unreachable because old == new is caught
+        # above and old must occur ≥1 times. Still worth raising clearly if it
+        # happens (e.g. surrogate handling on Windows).
+        raise ValueError(
+            f"edit_file: replacement produced no change in {path}. "
+            "Check that old_string and new_string actually differ."
+        )
     path.write_text(updated, encoding="utf-8")
     try:
         rel = str(path.relative_to(registry.workspace_root))
@@ -319,6 +375,115 @@ def _list_directory(registry: ToolRegistry, args: dict[str, Any]) -> str:
     except ValueError:
         rel = str(path)
     return json.dumps({"path": rel or ".", "entries": entries, "count": len(entries)}, indent=2)
+
+
+def _read_files(registry: ToolRegistry, args: dict[str, Any]) -> str:
+    raw_paths = args.get("paths")
+    if not isinstance(raw_paths, list) or not raw_paths:
+        raise ValueError("read_files: 'paths' must be a non-empty list of strings.")
+    if len(raw_paths) > _READ_FILES_MAX_PATHS:
+        raise ValueError(
+            f"read_files: too many paths ({len(raw_paths)}; limit {_READ_FILES_MAX_PATHS}). "
+            "Split into multiple calls or use grep_search to narrow the set first."
+        )
+    offset = int(args.get("offset", 1))
+    limit_arg = args.get("limit")
+    results: list[dict[str, Any]] = []
+    for raw in raw_paths:
+        entry: dict[str, Any] = {"path": str(raw)}
+        try:
+            content = _read_file(registry, {"path": raw, "offset": offset, **({"limit": int(limit_arg)} if limit_arg is not None else {})})
+            entry["content"] = content
+            first_line = content.split("\n", 1)[0]
+            m = re.match(r"\[(\d+) lines shown, (\d+) total\]", first_line)
+            if m:
+                entry["lines_shown"] = int(m.group(1))
+                entry["total_lines"] = int(m.group(2))
+        except (FileNotFoundError, ValueError, OSError) as exc:
+            entry["error"] = str(exc)
+        results.append(entry)
+    return json.dumps(results, indent=2, ensure_ascii=False)
+
+
+def _outline_python(path: Path) -> dict[str, Any]:
+    text = path.read_text(encoding="utf-8")
+    try:
+        tree = ast.parse(text)
+    except SyntaxError as exc:
+        return {"error": f"Could not parse {path} as Python: {exc}"}
+    imports: list[dict[str, Any]] = []
+    classes: list[dict[str, Any]] = []
+    functions: list[dict[str, Any]] = []
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                imports.append({"module": alias.name, "as": alias.asname, "line": node.lineno})
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            for alias in node.names:
+                imports.append({
+                    "module": f"{module}.{alias.name}" if module else alias.name,
+                    "from": module,
+                    "name": alias.name,
+                    "as": alias.asname,
+                    "line": node.lineno,
+                })
+        elif isinstance(node, ast.ClassDef):
+            methods: list[dict[str, Any]] = []
+            for item in node.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    methods.append({
+                        "name": item.name,
+                        "line": item.lineno,
+                        "async": isinstance(item, ast.AsyncFunctionDef),
+                    })
+            classes.append({
+                "name": node.name,
+                "line": node.lineno,
+                "bases": [ast.unparse(b) for b in node.bases] if node.bases else [],
+                "methods": methods,
+            })
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            functions.append({
+                "name": node.name,
+                "line": node.lineno,
+                "async": isinstance(node, ast.AsyncFunctionDef),
+            })
+    return {
+        "imports": imports,
+        "classes": classes,
+        "functions": functions,
+        "total_lines": text.count("\n") + 1,
+    }
+
+
+def _file_outline(registry: ToolRegistry, args: dict[str, Any]) -> str:
+    raw = str(args["path"])
+    path = registry._resolve_path(raw)
+    if not path.exists():
+        similar = _find_similar_files(registry.workspace_root, raw)
+        msg = f"File not found: `{path}`."
+        if similar:
+            msg += f" Did you mean: {', '.join(similar[:3])}?"
+        raise FileNotFoundError(msg)
+    if path.suffix != ".py":
+        raise ValueError(
+            f"file_outline only supports Python (.py) files; got {path.suffix or 'no extension'}. "
+            "Use read_file for other file types."
+        )
+    size = path.stat().st_size
+    if size > _OUTLINE_MAX_BYTES:
+        raise ValueError(
+            f"File `{path}` is {size:,} bytes (outline limit: {_OUTLINE_MAX_BYTES:,}). "
+            "Use read_file with offset/limit on a large file."
+        )
+    try:
+        rel = str(path.relative_to(registry.workspace_root))
+    except ValueError:
+        rel = str(path)
+    outline = _outline_python(path)
+    outline["path"] = rel
+    return json.dumps(outline, indent=2, ensure_ascii=False)
 
 
 def _grep_rel(workspace: Path, files: list[str]) -> list[str]:

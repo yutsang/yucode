@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -20,7 +21,6 @@ from ..memory.compact import (
     estimate_session_tokens,
     should_compact,
 )
-from .response_dedup import dedup_repetitive_response
 from ..memory.prompting import PromptAssembler, discover_project_context
 from ..observability.metrics import AuditLogger, MetricsCollector
 from ..plugins import PluginManager
@@ -42,6 +42,7 @@ from .errors import (
     tool_error_response,
 )
 from .providers import OpenAICompatibleProvider
+from .response_dedup import dedup_repetitive_response
 from .session import Message, Session, Usage, UsageTracker
 
 _log = logging.getLogger("yucode.runtime")
@@ -87,6 +88,76 @@ class TurnSummary:
     tool_messages: list[Message] = field(default_factory=list)
     usage: Usage = field(default_factory=Usage)
     auto_compaction_performed: bool = False
+
+
+@dataclass
+class _ToolObservations:
+    """Per-turn accumulated facts about tool calls — used by grounding checks
+    to decide whether the model's final answer is consistent with reality.
+
+    Replaces the earlier ad-hoc grep_had_matches / read_was_called locals so
+    additional checks can hang off the same state without growing more flags."""
+    grep_had_matches: bool = False
+    read_paths: set[str] = field(default_factory=set)
+    write_paths: set[str] = field(default_factory=set)
+    edit_paths: set[str] = field(default_factory=set)
+    last_bash_returncode: int | None = None
+
+
+@dataclass
+class _GroundingViolation:
+    reason: str   # short machine-readable tag emitted in events
+    message: str  # supervisor message injected back into the conversation
+
+
+_BASH_SUCCESS_PHRASES = (
+    "test pass", "tests pass", "all tests pass", "tests passed", "tests are passing",
+    "build succeed", "build success", "build passed", "compiled successfully",
+    "no errors", "ran successfully", "executed successfully",
+    "測試通過", "測試成功", "成功通過", "全部通過", "編譯成功",
+)
+
+
+def _check_final_answer_grounding(
+    obs: _ToolObservations,
+    response_text: str,
+    *,
+    is_weak_investigation: bool,
+) -> _GroundingViolation | None:
+    """Return the first grounding violation in *response_text* given *obs*, or None.
+
+    Checks (in order):
+    1. Weak-tier investigation: grep returned matches but no read_file was ever called.
+    2. Bash claimed success in final text but last bash returncode was non-zero.
+    """
+    if is_weak_investigation and obs.grep_had_matches and not obs.read_paths:
+        return _GroundingViolation(
+            reason="grep_matched_but_no_read",
+            message=(
+                "[SYSTEM SUPERVISOR] You called grep_search and got matches, "
+                "but never called read_file. Your previous answer is likely "
+                "hallucinated — grep returns ONE LINE of context per match, "
+                "which is NOT enough to determine values, defaults, or full "
+                "behavior. Before giving any final answer you MUST call "
+                "read_file on at least one of the cited files. Do that NOW."
+            ),
+        )
+    if obs.last_bash_returncode is not None and obs.last_bash_returncode != 0:
+        lowered = response_text.lower()
+        if any(phrase in lowered for phrase in _BASH_SUCCESS_PHRASES):
+            return _GroundingViolation(
+                reason="claimed_success_but_bash_failed",
+                message=(
+                    f"[SYSTEM SUPERVISOR] Your final answer claims success "
+                    f"(\"passed\" / \"successful\" / \"通過\"), but the most recent "
+                    f"bash call returned exit code {obs.last_bash_returncode}. "
+                    "Either the command actually failed and you should investigate "
+                    "(read the stderr, fix the issue) or you should rewrite your "
+                    "answer to acknowledge the failure. Do not claim success on a "
+                    "non-zero exit code."
+                ),
+            )
+    return None
 
 
 class AgentRuntime:
@@ -316,19 +387,17 @@ class AgentRuntime:
         budget_exhausted = False
         consecutive_readonly_calls = 0  # read-only calls with no write/exec in between
         _tool_cache: dict[tuple[str, str], str] = {}  # within-turn cache for read-only tools
-        # Grounding supervisor: track whether grep found matches and whether
-        # the model subsequently read any file. Used to force-retry when a
-        # weak-tier model tries to answer an investigation prompt without
-        # reading source after a successful grep (observed in v6 C3: 1 grep,
-        # 0 reads, hallucinated "compact_token_threshold = 10,000").
+        # Grounding observations + supervisor — track tool-call facts and run
+        # consistency checks against the model's final answer. Originally added
+        # for the v6 C3 failure (Qwen3 grep'd `compact_token_threshold`, never
+        # read, hallucinated "10,000"); now also covers bash-success mismatches.
         from .coordinator import looks_like_investigation as _looks_inv
         is_weak_investigation = (
             self.config.provider.resolved_tier() == "weak"
             and _looks_inv(prompt)
         )
-        grep_had_matches = False
-        read_was_called = False
-        forced_read_retry_done = False
+        observations = _ToolObservations()
+        forced_retry_done = False
 
         summary = TurnSummary(final_text="", iterations=0)
         for iteration in range(1, max_steps + 1):
@@ -384,33 +453,25 @@ class AgentRuntime:
             summary.usage.add(response.usage)
 
             if not response.tool_calls:
-                # Grounding supervisor: weak-tier investigation prompts that
-                # grep'd and got matches but never read a file are likely
-                # hallucinating. Inject a forced-read reminder and continue.
-                if (
-                    is_weak_investigation
-                    and grep_had_matches
-                    and not read_was_called
-                    and not forced_read_retry_done
-                ):
-                    forced_read_retry_done = True
-                    self.session.add_message(Message(
-                        role="user",
-                        content=(
-                            "[SYSTEM SUPERVISOR] You called grep_search and got matches, "
-                            "but never called read_file. Your previous answer is likely "
-                            "hallucinated — grep returns ONE LINE of context per match, "
-                            "which is NOT enough to determine values, defaults, or full "
-                            "behavior. Before giving any final answer you MUST call "
-                            "read_file on at least one of the cited files. Do that NOW."
-                        ),
-                    ))
-                    if event_callback:
-                        event_callback({
-                            "type": "grounding_retry",
-                            "reason": "grep_matched_but_no_read",
-                        })
-                    continue
+                # Grounding supervisor: run consistency checks against the
+                # accumulated tool observations. Fires at most once per turn.
+                if not forced_retry_done:
+                    violation = _check_final_answer_grounding(
+                        observations, response.text,
+                        is_weak_investigation=is_weak_investigation,
+                    )
+                    if violation is not None:
+                        forced_retry_done = True
+                        self.session.add_message(Message(
+                            role="user",
+                            content=violation.message,
+                        ))
+                        if event_callback:
+                            event_callback({
+                                "type": "grounding_retry",
+                                "reason": violation.reason,
+                            })
+                        continue
                 summary.final_text = dedup_repetitive_response(response.text)
                 if not response.text and response.usage.total_tokens() == 0 and iteration == 1:
                     if event_callback:
@@ -515,14 +576,10 @@ class AgentRuntime:
                                 _tool_cache[call_key] = tool_result_content
                         except KeyError:
                             pass
-                    # Track grep/read state for the grounding supervisor.
-                    if tool_call.name == "grep_search":
-                        # Match present if result is non-empty and not an error envelope.
-                        stripped = (tool_result_content or "").strip()
-                        if stripped and not stripped.startswith('{\n  "error"'):
-                            grep_had_matches = True
-                    elif tool_call.name == "read_file":
-                        read_was_called = True
+                    # Update grounding observations for the supervisor.
+                    self._record_tool_observation(
+                        observations, tool_call.name, tool_call.arguments, tool_result_content,
+                    )
                     # Track read-only streak (cache hits still count as reads)
                     try:
                         perm = self.tools.permission_for(tool_call.name)
@@ -754,6 +811,60 @@ class AgentRuntime:
         cp_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
         _log.info("Checkpoint saved to %s", cp_path)
         return cp_path
+
+    # ------------------------------------------------------------------
+    # Grounding observation recording
+    # ------------------------------------------------------------------
+
+    def _record_tool_observation(
+        self,
+        observations: _ToolObservations,
+        tool_name: str,
+        raw_arguments: str,
+        tool_result_content: str,
+    ) -> None:
+        """Update grounding observations from one tool call's result.
+
+        Read-only inspection: never raises. Unknown tools are ignored."""
+        stripped = (tool_result_content or "").strip()
+        is_error_envelope = stripped.startswith('{\n  "error"') or stripped.startswith('{"error"')
+        if tool_name == "grep_search":
+            if stripped and not is_error_envelope:
+                observations.grep_had_matches = True
+        elif tool_name == "read_file":
+            try:
+                args = json.loads(raw_arguments or "{}")
+                if "path" in args:
+                    observations.read_paths.add(str(args["path"]))
+            except (json.JSONDecodeError, TypeError):
+                observations.read_paths.add("?")  # at least record that read_file was called
+        elif tool_name == "read_files":
+            try:
+                args = json.loads(raw_arguments or "{}")
+                for p in args.get("paths", []) or []:
+                    observations.read_paths.add(str(p))
+            except (json.JSONDecodeError, TypeError):
+                observations.read_paths.add("?")
+        elif tool_name == "write_file":
+            try:
+                args = json.loads(raw_arguments or "{}")
+                if "path" in args and not is_error_envelope:
+                    observations.write_paths.add(str(args["path"]))
+            except (json.JSONDecodeError, TypeError):
+                pass
+        elif tool_name == "edit_file":
+            try:
+                args = json.loads(raw_arguments or "{}")
+                if "path" in args and not is_error_envelope:
+                    observations.edit_paths.add(str(args["path"]))
+            except (json.JSONDecodeError, TypeError):
+                pass
+        elif tool_name == "bash" and not is_error_envelope:
+            # Bash returns JSON like {"returncode": N, "stdout": "...", "stderr": "..."}.
+            with contextlib.suppress(json.JSONDecodeError, KeyError, TypeError, ValueError):
+                payload = json.loads(stripped)
+                if isinstance(payload, dict) and "returncode" in payload:
+                    observations.last_bash_returncode = int(payload["returncode"])
 
     # ------------------------------------------------------------------
     # Tool execution with enforcer + failure hooks

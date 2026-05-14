@@ -70,10 +70,14 @@ class PromptAssembler:
             _system_section(),
             _doing_tasks_section(self.config.runtime.dedup_tool_threshold),
             _executing_actions_section(),
+        ]
+        if self.config.provider.resolved_tier() == "weak":
+            sections.append(_weak_tier_section())
+        sections.extend([
             SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
             self._environment_section(),
             self._project_context_section(),
-        ]
+        ])
         if self.project_context.instruction_files:
             sections.append(self._instruction_files_section())
         if self.project_context.skills_summary:
@@ -298,6 +302,32 @@ def _doing_tasks_section(dedup_threshold: int = 3) -> str:
             "3. For investigation tasks, reads ARE the work — keep reading until you can answer.",
             "   For build/edit tasks, once you have enough context, stop reading and act.",
             "4. Do not re-read files you already have in context.",
+        ]
+    )
+
+
+def _weak_tier_section() -> str:
+    return "\n".join(
+        [
+            "# Grounding rules (local-model tier)",
+            "You are running on a smaller local model. The rules below exist because answers",
+            "from memory are unreliable — workspace evidence is the only authority.",
+            "1. Before answering any 'where is X', 'why does Y', 'how does Z' question, you MUST",
+            "   call grep_search or read_file at least once. Do NOT answer from general",
+            "   knowledge or from the symbol name alone.",
+            "2. Cite specific filename:line for every claim. 'Defined in coordinator.py' is not",
+            "   enough — say 'coordinator.py:412'. If you cannot point to a line, you do not",
+            "   know yet — keep reading.",
+            "3. grep returns ONE line of context per match. ONE LINE is not enough to determine",
+            "   a default value, a function signature, or class structure. Always read_file the",
+            "   cited file before drawing a conclusion.",
+            "4. Prefer batch tools when you need ≥2 files: read_files([path1, path2]) instead",
+            "   of N sequential read_file calls; file_outline(path) instead of read_file when",
+            "   you only need symbol locations.",
+            "5. Produce your final answer EXACTLY ONCE. Do not restate it with different wording,",
+            "   do not number it as 'pass 1 / pass 2'. One coherent answer, then stop.",
+            "6. If the workspace genuinely lacks the information, say 'not found in workspace'.",
+            "   Never invent file paths, line numbers, or default values to seem helpful.",
         ]
     )
 

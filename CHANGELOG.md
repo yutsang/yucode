@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.0] - 2026-05-14
+
+Focus of this release: cut weak-tier round-trip cost (batch + outline tools), make the planner / validator harder to fool, and unify the ad-hoc grounding supervisor onto a small per-turn observation framework that future checks can hang off. Strong-tier behaviour is unchanged for every code path that isn't gated on `provider.resolved_tier() == "weak"`.
+
+### Added
+- `coding_agent/tools/filesystem.py`: new `read_files(paths, offset?, limit?)` tool — reads up to 10 files in one call, returning a JSON array of `{path, content, total_lines}` or `{path, error}` per entry. Designed to replace N sequential `read_file` calls when correlating content across files.
+- `coding_agent/tools/filesystem.py`: new `file_outline(path)` tool — uses `ast` to extract classes (with bases + methods), top-level functions, and imports from a Python file with line numbers. Cheap structural alternative to `read_file` when you only need to locate a symbol. Non-Python files raise a clear error pointing back to `read_file`.
+- `coding_agent/core/coordinator.py`: `_try_parse_plan_json()` — tolerant planner-output parser that strips ```` ```json ```` fences, peels prose preambles, and falls back to outermost-`{…}` bracket matching before declaring the response unparseable. Used by the new planner retry path.
+- `coding_agent/core/coordinator.py`: planner JSON retry — when the first planner response is unparseable, the coordinator re-prompts once with a stricter "RETURN JSON ONLY" reminder before falling back to `is_simple=True`. Weak models often produce a markdown-wrapped or prose-prefixed response on the first attempt but recover on the second.
+- `coding_agent/core/coordinator.py`: investigation synthesis pass — when `investigate_only` is set and ≥2 research workers produced output, a final synthesis LLM call consolidates the joined findings into one coherent answer keyed off the user's original prompt. The previous behaviour (join + cross-worker dedup) is the fallback when synthesis fails. Strong-tier "single worker" investigations bypass this entirely.
+- `coding_agent/core/coordinator.py`: concrete pytest validator — `_run_concrete_validators()` runs `python -m pytest -x -q tests/` (120s timeout) when the workspace has a `tests/` directory with `test_*.py` files. If pytest fails, `_validate` short-circuits to `passed=False` with the tail of pytest output as feedback, bypassing the LLM-as-judge step. If pytest passes, the evidence is appended to the validator prompt so the judge can rely on it.
+- `coding_agent/core/runtime.py`: `_ToolObservations` dataclass + `_check_final_answer_grounding()` framework — replaces the ad-hoc `grep_had_matches` / `read_was_called` locals with a per-turn observation object that future grounding checks can hang off without growing more flags. Emits `grounding_retry` events with a stable `reason` tag.
+- `coding_agent/core/runtime.py`: new grounding check `claimed_success_but_bash_failed` — fires when the model's final answer contains a success phrase (English or Chinese: "tests passed", "compiled successfully", "測試通過", …) but the most recent bash returncode was non-zero. Injects a supervisor message and forces one retry iteration.
+- `coding_agent/memory/prompting.py`: tier-aware system prompt — when `provider.resolved_tier() == "weak"`, a new `# Grounding rules (local-model tier)` section is added with explicit "read before answering", "cite filename:line", "use batch tools" guidance. Strong-tier prompts are unchanged.
+- `tests/test_improvements.py`: 34 new tests covering the batch tools, file_outline AST extraction, planner parser edge cases, weak-tier prompt section, grounding check matrix (grep/read + bash returncode), concrete validator detection, and tool-observation recording.
+
+### Changed
+- `coding_agent/tools/filesystem.py`: `edit_file` now rejects `old_string == new_string` upfront (was previously a silent no-op write). Also defends in depth by comparing pre/post text and refusing to claim success if a non-identical replacement still produced no change.
+- `coding_agent/core/runtime.py`: `_record_tool_observation()` centralises grounding-state updates from each tool call (grep matches, read paths, write paths, edit paths, bash returncode) into one method. Replaces the inline if/elif chain in the previous run loop.
+- `coding_agent/core/coordinator.py`: investigate-only flow now filters empty worker outputs before joining, so a single non-empty worker still takes the synthesis-bypass path correctly.
+
 ## [0.4.2] - 2026-05-14
 
 Focus of this release: making the agent usable on weak-tier local models (Qwen3-class, Llama, Mistral, …) without sacrificing strong-tier behaviour, plus a rewrite of the interactive shell.

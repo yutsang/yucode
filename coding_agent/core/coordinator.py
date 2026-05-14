@@ -79,6 +79,47 @@ _INVESTIGATION_RE = __import__("re").compile(
 )
 
 
+def _try_parse_plan_json(text: str) -> dict[str, Any] | None:
+    """Tolerantly parse a planner response — strips ```json fences and finds the
+    outermost {...} block. Returns None when no valid JSON object is found."""
+    stripped = text.strip()
+    if not stripped:
+        return None
+    # Strip optional ```json … ``` fences.
+    if stripped.startswith("```"):
+        first_nl = stripped.find("\n")
+        if first_nl != -1:
+            stripped = stripped[first_nl + 1:]
+        if stripped.rstrip().endswith("```"):
+            stripped = stripped.rstrip()[:-3]
+        stripped = stripped.strip()
+    try:
+        result = json.loads(stripped)
+    except json.JSONDecodeError:
+        # Last resort: find the outermost {...} block by bracket matching.
+        start = stripped.find("{")
+        if start == -1:
+            return None
+        depth = 0
+        end = -1
+        for i in range(start, len(stripped)):
+            ch = stripped[i]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+        if end == -1:
+            return None
+        try:
+            result = json.loads(stripped[start:end + 1])
+        except json.JSONDecodeError:
+            return None
+    return result if isinstance(result, dict) else None
+
+
 def looks_like_investigation(prompt: str) -> bool:
     """True if *prompt* matches investigation patterns — used by runtime + coordinator."""
     lower = prompt.lower()
@@ -263,12 +304,23 @@ class AdminCoordinator:
         # Investigation-only plan: the research output IS the answer.
         # Skip work + validate, return immediately.
         if plan.investigate_only and research_results:
-            joined = "\n\n".join(
-                r.output for r in research_results if r.output
-            ).strip() or research_context
-            # Cross-worker dedup — when multiple research workers produced
-            # similar answers, joining them with \n\n creates apparent
-            # multi-pass output. Run dedup on the joined text too.
+            non_empty = [r for r in research_results if r.output and r.output.strip()]
+            joined = "\n\n".join(r.output for r in non_empty).strip() or research_context
+            # When ≥2 workers produced output, run a synthesis pass instead of
+            # returning a stitched + deduped blob. The synthesis call consolidates
+            # overlapping findings into one coherent answer keyed off the original
+            # prompt — particularly helpful for cross-cutting questions where each
+            # worker addressed a different facet.
+            if len(non_empty) >= 2:
+                synth = self._synthesise_investigation(prompt, joined, event_callback)
+                if synth is not None:
+                    summary.final_text = synth.text
+                    summary.usage.add(synth.usage)
+                    summary.iterations = max(summary.iterations, 1)
+                    if event_callback:
+                        event_callback({"type": "completed", "text": summary.final_text})
+                    return summary
+            # Fallback: cross-worker dedup on the joined text (also the single-worker path).
             summary.final_text = dedup_repetitive_response(joined)
             summary.iterations = max(summary.iterations, 1)
             if event_callback:
@@ -375,15 +427,29 @@ class AdminCoordinator:
             {"role": "user", "content": plan_prompt},
         ]
         response = self.provider.complete(messages, tools=[], stream_callback=event_callback)
-        try:
-            data = json.loads(response.text.strip())
-        except json.JSONDecodeError:
-            _log.warning(
-                "Task planning returned non-JSON response; falling back to simple mode. "
-                "Response (first 200 chars): %s",
-                response.text[:200],
-            )
-            return TaskPlan(is_simple=True, work_tasks=[prompt])
+        data = _try_parse_plan_json(response.text)
+        if data is None:
+            # Retry once with a stricter "JSON ONLY" reminder — weak models often
+            # produce a markdown-wrapped or prose-prefixed response on the first
+            # attempt but recover when the format is restated.
+            _log.info("Planner returned non-JSON on first attempt; retrying with stricter format reminder.")
+            retry_messages = messages + [
+                {"role": "assistant", "content": response.text},
+                {"role": "user", "content": (
+                    "Your previous response was not valid JSON. Respond now with ONLY a "
+                    "single JSON object — no prose, no markdown fences, no commentary. "
+                    "Required keys: is_simple, research_tasks, work_tasks, validation_criteria."
+                )},
+            ]
+            retry_response = self.provider.complete(retry_messages, tools=[], stream_callback=event_callback)
+            data = _try_parse_plan_json(retry_response.text)
+            if data is None:
+                _log.warning(
+                    "Task planning returned non-JSON on both attempts; falling back to simple mode. "
+                    "First response (first 200 chars): %s",
+                    response.text[:200],
+                )
+                return TaskPlan(is_simple=True, work_tasks=[prompt])
 
         plan = TaskPlan(
             is_simple=bool(data.get("is_simple", False)),
@@ -506,6 +572,53 @@ class AdminCoordinator:
         )
 
     # ------------------------------------------------------------------
+    # Investigation synthesis
+    # ------------------------------------------------------------------
+
+    @dataclass
+    class _SynthOutcome:
+        text: str
+        usage: Usage = field(default_factory=Usage)
+
+    def _synthesise_investigation(
+        self,
+        original_prompt: str,
+        joined_findings: str,
+        event_callback: EventCallback | None = None,
+    ) -> AdminCoordinator._SynthOutcome | None:
+        """Consolidate ≥2 research worker outputs into one coherent answer.
+
+        Returns None on provider error so the caller can fall back to the
+        joined+deduped blob.
+        """
+        synth_prompt = (
+            "You are synthesising the findings of multiple research workers into a single,"
+            " coherent answer to the user's original question.\n\n"
+            f"User's original question:\n{original_prompt}\n\n"
+            "Research findings (multiple workers, may overlap):\n"
+            f"{joined_findings}\n\n"
+            "Rules:\n"
+            "- Produce ONE consolidated answer. Do not list 'worker 1 said... worker 2 said...'.\n"
+            "- Preserve every concrete fact: file paths, line numbers, values, signatures.\n"
+            "- If workers disagree, prefer the one that cited specific filename:line evidence.\n"
+            "- Do not invent details that no worker mentioned.\n"
+            "- Output prose (or a short bulleted list if the question asked for one). No JSON."
+        )
+        messages = [
+            {"role": "system", "content": "You consolidate research findings into one answer."},
+            {"role": "user", "content": synth_prompt},
+        ]
+        try:
+            response = self.provider.complete(messages, tools=[], stream_callback=event_callback)
+        except Exception as exc:  # noqa: BLE001 — fall back to non-synthesised path
+            _log.warning("Investigation synthesis failed; using joined+deduped output: %s", exc)
+            return None
+        text = dedup_repetitive_response(response.text.strip())
+        if not text:
+            return None
+        return self._SynthOutcome(text=text, usage=response.usage)
+
+    # ------------------------------------------------------------------
     # Validation
     # ------------------------------------------------------------------
 
@@ -514,16 +627,73 @@ class AdminCoordinator:
         result: ValidationResult
         usage: Usage = field(default_factory=Usage)
 
+    def _run_concrete_validators(self) -> tuple[bool, str] | None:
+        """Run language-level ground-truth validators on the current workspace.
+
+        Returns ``(passed, output)`` or ``None`` when no applicable validator is
+        present. Currently runs pytest if ``tests/`` contains test files; future
+        additions (cargo check, npm test, …) hang off the same return shape."""
+        import subprocess
+        tests_dir = self.workspace_root / "tests"
+        has_pytest_dir = tests_dir.is_dir() and any(tests_dir.rglob("test_*.py"))
+        if not has_pytest_dir:
+            return None
+        try:
+            result = subprocess.run(
+                ["python", "-m", "pytest", "-x", "-q", "--no-header", "tests/"],
+                cwd=self.workspace_root,
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return False, "pytest exceeded 120s timeout"
+        except FileNotFoundError:
+            return None  # python not on PATH — skip rather than fail
+        passed = result.returncode == 0
+        combined = (result.stdout + ("\n" + result.stderr if result.stderr else "")).strip()
+        # Keep only the tail so a flood of test output doesn't fill the validator prompt.
+        if len(combined) > 4000:
+            combined = "…(truncated)…\n" + combined[-4000:]
+        return passed, combined
+
     def _validate(
         self,
         criteria: list[str],
         work_results: list[WorkerResult],
         event_callback: EventCallback | None = None,
     ) -> _ValidateOutcome:
+        # Concrete validator first — if pytest exists and fails, that's
+        # ground truth; skip the LLM-as-judge step which would otherwise
+        # be free to declare "passed: true" on broken code.
+        concrete = self._run_concrete_validators()
+        if event_callback and concrete is not None:
+            event_callback({
+                "type": "concrete_validator",
+                "validator": "pytest",
+                "passed": concrete[0],
+            })
+        if concrete is not None and not concrete[0]:
+            return self._ValidateOutcome(
+                result=ValidationResult(
+                    passed=False,
+                    feedback=(
+                        "Concrete validator (pytest) failed. Tail of output:\n"
+                        + concrete[1]
+                    ),
+                ),
+            )
         criteria_text = "\n".join(f"- {c}" for c in criteria)
         work_text = "\n\n---\n\n".join(
             f"### Task: {r.task[:200]}\n{r.output}" for r in work_results
         )
+        if concrete is not None and concrete[0]:
+            # Pass the pytest evidence to the LLM judge so it can rely on it.
+            work_text += (
+                "\n\n---\n\n### Concrete validator evidence\n"
+                f"pytest exited 0. Tail of output:\n{concrete[1][-1500:]}"
+            )
         validate_prompt = VALIDATE_PROMPT_TEMPLATE.format(
             criteria=criteria_text,
             work_results=work_text,
