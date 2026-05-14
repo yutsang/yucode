@@ -2,6 +2,33 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.2] - 2026-05-14
+
+Focus of this release: making the agent usable on weak-tier local models (Qwen3-class, Llama, Mistral, …) without sacrificing strong-tier behaviour, plus a rewrite of the interactive shell.
+
+### Added
+- `coding_agent/interface/eval.py`: new evaluation runner that executes a prompt suite (`tests/eval_prompts.yaml`) against a configured model and writes a single JSON file capturing per-prompt tool calls, file reads, iterations, and final text. Designed to run on the target machine (e.g. a Qwen3-32B box) and ship the JSON back for offline diffing — the runner does NOT auto-judge correctness.
+- `coding_agent/config/settings.py`: `provider.intelligence_tier` config field (`auto` / `strong` / `weak`) and `resolve_intelligence_tier()` helper. `auto` infers from model name (Qwen / Llama / Mistral / Phi / Gemma / Yi / DeepSeek-distill → weak; everything else → strong) so existing strong-tier deployments are unaffected.
+- `coding_agent/core/coordinator.py`: investigation-only execution path. When a weak-tier model is configured AND the planner returns `is_simple=True` on an investigation prompt (`why`, `where is`, `how does`, `list every`, `為什麼`, `哪裡`, …), the plan is forced through research-only flow and the research output IS the final answer — skipping the work + validate phases that weak models often hallucinate through.
+- `coding_agent/core/coordinator.py`: `looks_like_investigation(prompt)` is now a module-level helper used by both the coordinator and the runtime grounding supervisor; recognises English and Chinese investigation cues plus `list/count/show/find every|each|all`.
+- `coding_agent/core/runtime.py`: grounding supervisor for weak-tier investigation prompts. If the model called `grep_search` and got matches but never called `read_file` before producing a final answer, the runtime injects a forced-read system message and re-runs one iteration. Emits a `grounding_retry` event with `reason=grep_matched_but_no_read`. Fires at most once per turn and only for weak-tier + investigation prompts, so strong-tier behaviour is unchanged.
+- `coding_agent/core/response_dedup.py`: new module that collapses multi-pass repetition in model output (Qwen3 frequently emits the same answer 2–3 times with slight rewording). Uses paragraph-similarity period detection — a single match is treated as coincidence; ≥2 matching pairs are needed to confirm a real repetition pattern. Conservative defaults (≥600 chars, 3–60 paragraphs, similarity ≥ 0.65).
+- `coding_agent/core/response_dedup.py`: conservatism guard — refuses to dedup when the "last pass" would be < 15% of the total response. Prevents truncating a long worker answer down to a short closing summary when the two share lead-in phrasing.
+- `tests/eval_prompts.yaml`: 133-line prompt suite covering search / read / write / investigation / multi-step categories, used by `yucode eval`.
+
+### Changed
+- `coding_agent/interface/cli.py`: interactive shell rewritten on top of `prompt_toolkit`. Multi-line input (Alt+Enter inserts newline, Enter submits, Enter on an open completion popup just accepts), Ctrl+C now clears the buffer when text is present and raises `KeyboardInterrupt` only on an empty line, persistent history at `~/.yucode/history`, and an `@file` completer that hides `__pycache__` / `.git` / `.DS_Store` / `.mypy_cache` / `.ruff_cache` / `.pytest_cache` unless the user explicitly types a `.` prefix.
+- `coding_agent/interface/render.py`: `StreamingTextDisplay` rewritten — intermediate `assistant_delta` text now renders on stderr (alongside the spinner) and `finalize()` ERASES the streamed lines from the terminal on TTY, computing physical rows with wrap-awareness. The final polished answer is still printed separately on stdout by the chat loop. Non-TTY (redirected output) preserves the streamed text as a flat transcript.
+- `coding_agent/core/coordinator.py`: cross-worker output dedup. When the planner splits one question into multiple work / research tasks and each worker produces an overlapping answer, joining them with `\n\n` previously surfaced as multi-pass repetition. Both `_run_research` (investigation-only) and the work-result joiner now run `dedup_repetitive_response()` on the joined text.
+- `coding_agent/core/providers.py`: `_TextToolCallFilter._holdback()` replaces the fixed `_MAX_OPEN_LEN` reserve. The buffer tail is held back only when its suffix is a proper prefix of an open tag — short text that clearly isn't a tag prefix is emitted immediately, removing per-chunk latency on streaming.
+- `coding_agent/core/providers.py`: OpenAI-compatible streaming parser now tolerates the final `choices: []` chunk that providers send when `stream_options.include_usage` is enabled, processing usage from that chunk without crashing on the missing delta.
+- `coding_agent/interface/eval.py`: per-prompt outer retry with 30-second wait when the provider raises a transient gateway error (`502` / `503` / `504` / `timeout`). Eval keeps going across prompts on non-transient errors as before.
+- `coding_agent/tools/filesystem.py`: `edit_file` now rejects ambiguous matches — if `old_string` appears more than once and `replace_all` is `false`, it raises a clear error instructing the caller to either pass `replace_all: true` or extend `old_string` with surrounding context.
+
+### Fixed
+- `coding_agent/config/settings.py`: `_deep_merge` no longer lets an empty overlay value wipe a non-empty base value. An empty `api_key` in `settings.local.yml` no longer shadows the real key from `settings.yml`.
+- `coding_agent/tools/filesystem.py`: `_py_grep_lines` now stores relative paths in its result list (previously absolute), matching the rest of the search pipeline so downstream rendering and dedup work correctly.
+
 ## [0.3.5] - 2026-04-24
 
 ### Added
