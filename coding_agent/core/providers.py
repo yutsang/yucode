@@ -20,9 +20,11 @@ from .session import AssistantResponse, ToolCall, Usage
 
 _log = logging.getLogger("yucode.providers")
 
-_MAX_RETRIES = 3
-_RETRY_BACKOFF_BASE = 1.0
+_MAX_RETRIES = 5
+_RETRY_BACKOFF_BASE = 1.5
 _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+# Total wait across 5 attempts with base=1.5: 1.5 + 3 + 6 + 12 + 24 = ~46s
+# matches typical provider-gateway recovery windows.
 
 StreamCallback = Callable[[dict[str, Any]], None]
 

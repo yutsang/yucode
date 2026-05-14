@@ -17,7 +17,7 @@ from coding_agent.security.permissions import PermissionPolicy
 
 
 def test_version_matches_repo() -> None:
-    assert __version__ == "0.4.0"
+    assert __version__ == "0.4.1"
 
 
 def test_env_api_key_takes_priority() -> None:
@@ -323,6 +323,30 @@ def test_response_dedup_keeps_full_last_pass_when_passes_are_multi_paragraph() -
     assert "AgentRuntime class is declared" in out
     assert "Constructor signature" in out
     assert "complete constructor signature" in out
+
+
+def test_response_dedup_preserves_long_answer_with_short_trailing_summary() -> None:
+    """Regression for v5 D2: when worker A produces a full answer and worker B
+    appends only a short summary, dedup must NOT truncate the response to
+    just the summary. Guard: if last "pass" is <15% of total chars, skip."""
+    from coding_agent.core.response_dedup import dedup_repetitive_response
+    long_body = (
+        "### RESEARCH\n"
+        "The research role has access to read-only tools: read_file, grep_search, "
+        "glob_search, web_search. It is used for gathering information.\n\n"
+        "### WORK\n"
+        "The work role has access to write tools: write_file, edit_file, bash, "
+        "plus all the read tools. It performs the actual implementation.\n\n"
+        "### VALIDATE\n"
+        "The validate role has read-only tools plus bash for running tests. "
+        "It verifies the work meets the criteria."
+    )
+    short_summary = "Summary: each role gets minimal tools for its responsibility."
+    text = long_body + "\n\n" + short_summary
+    out = dedup_repetitive_response(text, min_total_len=200)
+    assert "RESEARCH" in out, "Full body must be preserved"
+    assert "WORK" in out, "Full body must be preserved"
+    assert "VALIDATE" in out, "Full body must be preserved"
 
 
 def test_response_dedup_fallback_catches_restructured_passes() -> None:

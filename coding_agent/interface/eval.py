@@ -162,11 +162,16 @@ def _find_artifact_mentions(text: str) -> list[str]:
     return found
 
 
+_EVAL_RETRY_WAIT_SECONDS = 30
+
+
 def _run_one(
     entry: dict[str, Any],
     workspace: Path,
     config_path: str | None,
 ) -> PromptResult:
+    import time as _time
+
     prompt_id = str(entry.get("id", "?"))
     category = str(entry.get("category", "uncategorized"))
     prompt_text = str(entry.get("prompt", "")).strip()
@@ -191,12 +196,28 @@ def _run_one(
         )
     )
 
-    runtime = AgentRuntime(workspace, config)
-    events: list[dict[str, Any]] = []
-    try:
-        summary = runtime.orchestrate(prompt_text, event_callback=_capture_callback(events))
-    except Exception as exc:  # noqa: BLE001 — eval must keep going across prompts
-        result.error = f"{type(exc).__name__}: {exc}"
+    # Outer retry — when the gateway is having a sustained outage, the
+    # provider's in-call retries (5× with ~46s total backoff) can still fail.
+    # Wait longer and try the whole prompt again once.
+    last_exc: Exception | None = None
+    for attempt in (1, 2):
+        runtime = AgentRuntime(workspace, config)
+        events: list[dict[str, Any]] = []
+        try:
+            summary = runtime.orchestrate(prompt_text, event_callback=_capture_callback(events))
+            last_exc = None
+            break
+        except Exception as exc:  # noqa: BLE001 — eval must keep going across prompts
+            last_exc = exc
+            is_transient = "502" in str(exc) or "503" in str(exc) or "504" in str(exc) or "timeout" in str(exc).lower()
+            if attempt == 1 and is_transient:
+                print(f"      ↳ transient error, retrying in {_EVAL_RETRY_WAIT_SECONDS}s ({type(exc).__name__})")
+                _time.sleep(_EVAL_RETRY_WAIT_SECONDS)
+                continue
+            break
+
+    if last_exc is not None:
+        result.error = f"{type(last_exc).__name__}: {last_exc}"
         return result
 
     result.iterations = summary.iterations

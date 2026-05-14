@@ -102,4 +102,19 @@ def dedup_repetitive_response(
     if last_pass_start <= 0 or last_pass_start >= len(paragraphs):
         return text
 
-    return "\n\n".join(paragraphs[last_pass_start:]).strip()
+    # Conservatism guard — refuse to dedup when the "last pass" would be
+    # disproportionately small relative to the whole response. Real multi-pass
+    # repetition has roughly equal-sized passes; a tiny trailing pass is
+    # almost always a closing summary that we'd wrongly truncate to.
+    #
+    # Real failure case (D2 in v5): worker 1 produced full 3-role descriptions
+    # (~800 chars), worker 2 produced only a short summary (~80 chars).
+    # Period detection found similar lead-ins and would have dropped worker 1
+    # entirely without this guard.
+    trailing = paragraphs[last_pass_start:]
+    trailing_chars = sum(len(p) for p in trailing)
+    total_chars = sum(len(p) for p in paragraphs)
+    if total_chars > 0 and trailing_chars / total_chars < 0.15:
+        return text
+
+    return "\n\n".join(trailing).strip()

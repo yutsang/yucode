@@ -263,9 +263,13 @@ class AdminCoordinator:
         # Investigation-only plan: the research output IS the answer.
         # Skip work + validate, return immediately.
         if plan.investigate_only and research_results:
-            summary.final_text = "\n\n".join(
+            joined = "\n\n".join(
                 r.output for r in research_results if r.output
             ).strip() or research_context
+            # Cross-worker dedup — when multiple research workers produced
+            # similar answers, joining them with \n\n creates apparent
+            # multi-pass output. Run dedup on the joined text too.
+            summary.final_text = dedup_repetitive_response(joined)
             summary.iterations = max(summary.iterations, 1)
             if event_callback:
                 event_callback({"type": "completed", "text": summary.final_text})
@@ -573,6 +577,11 @@ class AdminCoordinator:
         for r in work_results:
             parts.append(r.output)
         text = "\n\n".join(parts)
+        # Cross-worker dedup — Qwen3 planner often splits a single question
+        # into multiple work_tasks (e.g. "find declaration" + "get signature"),
+        # each worker produces an overlapping answer, and joining them with
+        # \n\n looks like multi-pass repetition. Collapse it here.
+        text = dedup_repetitive_response(text)
 
         if max_retries_reached:
             note = (
