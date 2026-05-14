@@ -347,11 +347,16 @@ class ProgressDisplay:
 
 
 class StreamingTextDisplay:
-    """Live-stream the model's text output between tool calls.
+    """Live-stream the model's intermediate text between tool calls.
 
-    Renders incoming `assistant_delta` chunks to stdout with a dim "💭" prefix,
-    visually distinct from the final answer. Stops automatically when a tool
-    call interrupts or the turn completes.
+    Renders incoming `assistant_delta` chunks to stderr (same channel as the
+    spinner) with a dim "💭" prefix. Crucially, `finalize()` ERASES the
+    streamed lines from the terminal — they were just live progress, not
+    part of the saved transcript. The final polished answer is printed
+    separately by the chat loop on stdout.
+
+    On non-TTY stderr (logs, redirected output) the text is written but not
+    erased; users redirecting output expect a flat transcript.
     """
 
     PREFIX = "💭 "
@@ -359,7 +364,7 @@ class StreamingTextDisplay:
 
     def __init__(self) -> None:
         self._active: bool = False
-        self._char_count: int = 0  # for soft line-wrap
+        self._buffer: str = ""              # accumulated text for line-count math
         self._lock = threading.Lock()
 
     def _prefix(self) -> str:
@@ -370,22 +375,46 @@ class StreamingTextDisplay:
             return
         with self._lock:
             if not self._active:
-                # Use stdout so it's not interleaved with stderr spinner.
-                sys.stdout.write(f"\n{DIM}{self._prefix()}")
+                sys.stderr.write(f"{DIM}{self._prefix()}")
                 self._active = True
-                self._char_count = 0
-            sys.stdout.write(delta)
-            self._char_count += len(delta)
-            sys.stdout.flush()
+                self._buffer = ""
+            sys.stderr.write(delta)
+            self._buffer += delta
+            sys.stderr.flush()
 
     def finalize(self) -> None:
-        """Close the current streaming line (if any)."""
+        """Close and ERASE the current streaming output (if any).
+
+        TTY: erases all lines that the streamed text occupied so the next
+        thing printed (spinner / final answer) starts on a clean line.
+        Non-TTY: just writes a newline + RESET (preserves text in logs).
+        """
         with self._lock:
-            if self._active:
-                sys.stdout.write(f"{RESET}\n")
-                sys.stdout.flush()
-                self._active = False
-                self._char_count = 0
+            if not self._active:
+                return
+            if _IS_STDERR_TTY:
+                # Compute physical row count, accounting for terminal wrap.
+                cols = shutil.get_terminal_size((80, 24)).columns
+                prefix_len = _visible_len(self._prefix())
+                rendered = self._prefix() + self._buffer
+                # Each logical line wraps every `cols` cells.
+                rows = 0
+                for line in rendered.split("\n"):
+                    rows += max(1, (_visible_len(line) + cols - 1) // cols)
+                # Move cursor to the start of the first streamed line and erase
+                # everything from there to end of screen.
+                sys.stderr.write("\r")
+                if rows > 1:
+                    sys.stderr.write(f"\x1b[{rows - 1}A")
+                sys.stderr.write("\x1b[J")
+                sys.stderr.write(RESET)
+                sys.stderr.flush()
+                _ = prefix_len  # not currently needed; reserved for future use
+            else:
+                sys.stderr.write(f"{RESET}\n")
+                sys.stderr.flush()
+            self._active = False
+            self._buffer = ""
 
     @property
     def is_active(self) -> bool:
