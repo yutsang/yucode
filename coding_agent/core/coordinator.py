@@ -18,6 +18,7 @@ from typing import Any
 from ..config import AppConfig, ToolOptions
 from ..plugins.mcp import McpManager
 from .providers import OpenAICompatibleProvider
+from .response_dedup import dedup_repetitive_response
 from .session import Message, Usage
 
 _log = logging.getLogger("yucode.coordinator")
@@ -445,15 +446,35 @@ class AdminCoordinator:
             worker_config,
             mcp_manager=self.mcp_manager,
         )
+        worker_prompt = prompt
+        if role == WorkerRole.RESEARCH:
+            # Research workers MUST escalate from grep to read. Observed
+            # failure: Qwen3 grep'd `compact_token_threshold`, saw one line,
+            # then hallucinated the default value (10,000 — actual is 60,000).
+            worker_prompt = (
+                "[Research role rules — MUST follow]\n"
+                "1. After any grep_search that returns hits, you MUST call "
+                "   read_file on at least one of the cited files before "
+                "   drawing a conclusion. Grep returns one line of context — "
+                "   that is NOT enough to determine a symbol's value or "
+                "   definition.\n"
+                "2. If grep hits are in .yaml / .md / .json / .txt / .rst, "
+                "   treat them as documentation references, not definitions. "
+                "   Find the real .py / .ts / source-language definition.\n"
+                "3. Cite specific file paths and line numbers in your answer.\n"
+                "4. Do NOT repeat your answer in multiple rephrasings — "
+                "   produce ONE answer.\n\n"
+                + prompt
+            )
         summary = worker_runtime.run_turn(
-            prompt,
+            worker_prompt,
             event_callback=event_callback,
             max_steps_override=self.config.runtime.max_worker_steps,
         )
         return WorkerResult(
             role=role,
             task=prompt[:500],
-            output=summary.final_text,
+            output=dedup_repetitive_response(summary.final_text),
             usage=summary.usage,
             iterations=summary.iterations,
         )

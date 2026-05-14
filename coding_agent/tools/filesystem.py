@@ -576,11 +576,26 @@ def _grep_search(registry: ToolRegistry, args: dict[str, Any]) -> str:
         return output  # empty — let the agent know nothing was found
 
     lines = output.splitlines()
+    # Warn if any matches are in documentation / fixture files. Weak models
+    # often report grep hits in .yaml/.md/.json as if they were source
+    # definitions (real failure case: nonexistent symbol "found at yaml:65"
+    # because that line happened to mention it in a test prompt).
+    doc_suffixes = (".md", ".yaml", ".yml", ".json", ".txt", ".rst", ".toml")
+    if any(any(s in line.split(":", 1)[0].lower() for s in doc_suffixes) for line in lines[:50]):
+        doc_hint = (
+            "\n\n[Note: matches in .md/.yaml/.json/.txt/.rst files are often "
+            "documentation, config, or test fixtures — not actual symbol "
+            "definitions. Use read_file on the cited line to verify before "
+            "claiming a symbol is 'defined' there.]"
+        )
+    else:
+        doc_hint = ""
     if len(lines) > _GREP_MAX_LINES:
         total = len(lines)
         return (
             "\n".join(lines[:_GREP_MAX_LINES])
             + f"\n\n[Output truncated: showing {_GREP_MAX_LINES}/{total} lines."
             " Narrow your search with --glob or a more specific pattern.]"
+            + doc_hint
         )
-    return output
+    return output + doc_hint

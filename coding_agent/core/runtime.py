@@ -20,6 +20,7 @@ from ..memory.compact import (
     estimate_session_tokens,
     should_compact,
 )
+from .response_dedup import dedup_repetitive_response
 from ..memory.prompting import PromptAssembler, discover_project_context
 from ..observability.metrics import AuditLogger, MetricsCollector
 from ..plugins import PluginManager
@@ -370,7 +371,7 @@ class AgentRuntime:
             summary.usage.add(response.usage)
 
             if not response.tool_calls:
-                summary.final_text = response.text
+                summary.final_text = dedup_repetitive_response(response.text)
                 if not response.text and response.usage.total_tokens() == 0 and iteration == 1:
                     if event_callback:
                         event_callback({
@@ -404,7 +405,19 @@ class AgentRuntime:
                         "tool_call_id": tool_call.id,
                     })
 
-                call_key = (tool_call.name, _content_stable_hash(tool_call.arguments))
+                # Canonicalize args before hashing so two semantically identical
+                # calls with different JSON formatting (whitespace, key order)
+                # collapse into the same dedup key. Qwen3 frequently emits
+                # `{"a":1,"b":2}` and `{"a": 1, "b": 2}` for the same intent.
+                try:
+                    canonical_args = json.dumps(
+                        json.loads(tool_call.arguments or "{}"),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                except (json.JSONDecodeError, TypeError):
+                    canonical_args = tool_call.arguments or ""
+                call_key = (tool_call.name, _content_stable_hash(canonical_args))
                 dedup_counts[call_key] = dedup_counts.get(call_key, 0) + 1
 
                 if dedup_counts[call_key] >= dedup_threshold:

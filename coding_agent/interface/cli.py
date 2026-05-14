@@ -32,6 +32,7 @@ from .render import (
     RESET,
     THEME,
     ProgressDisplay,
+    StreamingTextDisplay,
     agent_label,
     compact_tool_result_line,
     compact_tool_start_label,
@@ -588,6 +589,7 @@ class _InteractiveEventHandler:
     def __init__(self, *, streaming: bool = True) -> None:
         self.streaming = streaming
         self._progress = ProgressDisplay()
+        self._stream = StreamingTextDisplay()
         self._turn_start: float = 0
         self._current_iteration = 0
         self._text_started = False
@@ -639,6 +641,8 @@ class _InteractiveEventHandler:
             if not self._in_coordinator:
                 self._progress.set_thinking("Thinking")
         elif etype == "tool_call":
+            # Close any in-flight streamed text so the spinner has a clean line.
+            self._stream.finalize()
             name = event.get("name", "?")
             arguments = event.get("arguments", "{}")
             label = compact_tool_start_label(name, arguments)
@@ -656,16 +660,19 @@ class _InteractiveEventHandler:
             result_line = compact_tool_result_line(name, content, is_error=is_err)
             self._progress.finish_tool(result_line)
         elif etype == "assistant_delta":
-            if self._in_coordinator or self._tool_calls_this_turn:
-                # Suppress intermediate text: coordinator workers stream via this
-                # event but we only show the final coordinator result; similarly,
-                # text that precedes or follows tool calls is interim reasoning
-                # that the user doesn't need to see.
+            delta = event.get("delta", "")
+            if not delta:
                 pass
+            elif self._in_coordinator or self._tool_calls_this_turn:
+                # Stream intermediate reasoning visibly (was previously dropped).
+                # Visually distinct (dim 💭 prefix) so it's not confused with
+                # the final polished answer printed at end-of-turn.
+                self._progress.stop()
+                self._stream.feed(delta)
             else:
                 # Buffer text until we know whether tool calls will follow.
                 # Flushed in the `completed` handler if no tool calls occurred.
-                self._text_buf += event.get("delta", "")
+                self._text_buf += delta
         elif etype == "dedup_limit":
             self._progress.stop()
             tool = event.get("tool", "?")
@@ -695,6 +702,7 @@ class _InteractiveEventHandler:
         elif etype == "usage":
             pass
         elif etype == "completed":
+            self._stream.finalize()
             self._progress.stop()
             was_coordinator = self._in_coordinator
             self._in_coordinator = False
@@ -742,6 +750,8 @@ def _cli_event_callback(event: dict[str, Any]) -> None:
         # so the user knows the agent is still active (not hung).
         progress.set_thinking("Thinking")
     elif etype == "tool_call":
+        # Finalize any in-flight streaming text so it doesn't bleed into spinner.
+        _cli_event_callback._stream.finalize()  # type: ignore[attr-defined]
         name = event.get("name", "?")
         arguments = event.get("arguments", "{}")
         label = compact_tool_start_label(name, arguments)
@@ -776,12 +786,19 @@ def _cli_event_callback(event: dict[str, Any]) -> None:
         tokens = event.get("cumulative_input_tokens", 0)
         print(render_info(f"Auto-compacted {removed} messages ({tokens:,} cumulative input tokens)"))
     elif etype == "assistant_delta":
-        pass
+        # Stream the model's intermediate text so users can see reasoning, not
+        # just tool-call labels. Stops the spinner so the text isn't clobbered.
+        delta = event.get("delta", "")
+        if delta:
+            progress.stop()
+            _cli_event_callback._stream.feed(delta)  # type: ignore[attr-defined]
     elif etype == "completed":
+        _cli_event_callback._stream.finalize()  # type: ignore[attr-defined]
         progress.stop()
         print()
 
 _cli_event_callback._progress = ProgressDisplay()  # type: ignore[attr-defined]
+_cli_event_callback._stream = StreamingTextDisplay()  # type: ignore[attr-defined]
 
 
 def handle_eval(args: argparse.Namespace) -> int:

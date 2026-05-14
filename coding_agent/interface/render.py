@@ -343,6 +343,55 @@ class ProgressDisplay:
         self._lines_on_screen = 0
 
 
+# ---- Streaming "thinking" display -----------------------------------------
+
+
+class StreamingTextDisplay:
+    """Live-stream the model's text output between tool calls.
+
+    Renders incoming `assistant_delta` chunks to stdout with a dim "💭" prefix,
+    visually distinct from the final answer. Stops automatically when a tool
+    call interrupts or the turn completes.
+    """
+
+    PREFIX = "💭 "
+    PREFIX_ASCII = ">> "
+
+    def __init__(self) -> None:
+        self._active: bool = False
+        self._char_count: int = 0  # for soft line-wrap
+        self._lock = threading.Lock()
+
+    def _prefix(self) -> str:
+        return self.PREFIX if _UNICODE_SAFE else self.PREFIX_ASCII
+
+    def feed(self, delta: str) -> None:
+        if not delta:
+            return
+        with self._lock:
+            if not self._active:
+                # Use stdout so it's not interleaved with stderr spinner.
+                sys.stdout.write(f"\n{DIM}{self._prefix()}")
+                self._active = True
+                self._char_count = 0
+            sys.stdout.write(delta)
+            self._char_count += len(delta)
+            sys.stdout.flush()
+
+    def finalize(self) -> None:
+        """Close the current streaming line (if any)."""
+        with self._lock:
+            if self._active:
+                sys.stdout.write(f"{RESET}\n")
+                sys.stdout.flush()
+                self._active = False
+                self._char_count = 0
+
+    @property
+    def is_active(self) -> bool:
+        return self._active
+
+
 # ---- Compact tool display (single-line dynamic) ----------------------------
 
 _PATH_TOOLS = frozenset({

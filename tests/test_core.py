@@ -283,3 +283,66 @@ def test_read_file_auto_resolves_bare_filename(tmp_path: Path) -> None:
     reg = ToolRegistry(tmp_path, AppConfig())
     result = _read_file(reg, {"path": "uniquename.py"})
     assert "content" in result
+
+
+# --- response_dedup ---
+
+def test_response_dedup_collapses_repeated_passes() -> None:
+    from coding_agent.core.response_dedup import dedup_repetitive_response
+    lead_in = (
+        "The compaction mechanism in yucode is designed to manage the size "
+        "of the conversation history. It triggers when token count exceeds "
+        "the compact_token_threshold. "
+    )
+    text = "\n\n".join([
+        lead_in + "PASS1: threshold = 10,000.",
+        lead_in + "PASS2: threshold = 60,000.",
+        lead_in + "PASS3: threshold = 60,000 (final).",
+    ])
+    # Lower min_total_len so this concise test fixture triggers the dedup.
+    out = dedup_repetitive_response(text, min_total_len=200)
+    assert "PASS3" in out
+    assert "PASS1" not in out, "First pass should be dropped"
+    assert "PASS2" not in out, "Second pass should be dropped"
+
+
+def test_response_dedup_leaves_normal_text_alone() -> None:
+    from coding_agent.core.response_dedup import dedup_repetitive_response
+    text = "Step 1: do X.\n\nStep 2: do Y.\n\nConclusion: done."
+    assert dedup_repetitive_response(text) == text
+
+
+def test_response_dedup_skips_short_text() -> None:
+    from coding_agent.core.response_dedup import dedup_repetitive_response
+    short = "Repeated.\n\nRepeated.\n\nRepeated."
+    # Short text should never be touched even if it looks repetitive
+    assert dedup_repetitive_response(short) == short
+
+
+# --- streaming display ---
+
+def test_streaming_display_active_state() -> None:
+    from coding_agent.interface.render import StreamingTextDisplay
+    s = StreamingTextDisplay()
+    assert s.is_active is False
+    s.feed("hello ")
+    assert s.is_active is True
+    s.finalize()
+    assert s.is_active is False
+    # Finalize on already-inactive is a no-op
+    s.finalize()
+    assert s.is_active is False
+
+
+# --- canonical dedup hashing ---
+
+def test_dedup_hash_matches_for_different_json_formatting() -> None:
+    """Two semantically identical tool calls with different JSON formatting
+    must collapse to the same dedup key after canonicalization."""
+    import json as _json
+    from coding_agent.core.runtime import _content_stable_hash
+    a = '{"pattern":"foo","path":"bar"}'
+    b = '{"path": "bar", "pattern": "foo"}'
+    canon_a = _json.dumps(_json.loads(a), sort_keys=True, separators=(",", ":"))
+    canon_b = _json.dumps(_json.loads(b), sort_keys=True, separators=(",", ":"))
+    assert _content_stable_hash(canon_a) == _content_stable_hash(canon_b)
