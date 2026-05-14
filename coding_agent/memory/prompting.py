@@ -238,6 +238,9 @@ def _doing_tasks_section(dedup_threshold: int = 3) -> str:
             "- Preserve unrelated user changes.",
             "- Call out uncertainty instead of guessing.",
             "- Use MCP tools when they are the best source of truth.",
+            "- Produce the final answer EXACTLY ONCE. Do not restate, rephrase, "
+            "or repeat your answer with a different structure in the same response. "
+            "One coherent answer, then stop.",
             "",
             "# Tool usage limits (CRITICAL)",
             dedup_line,
@@ -251,7 +254,9 @@ def _doing_tasks_section(dedup_threshold: int = 3) -> str:
             "",
             "# Workspace search (ALWAYS before web search)",
             "When looking for a file, definition, symbol, or behavior in the project:",
-            "1. SPLIT the query into individual keywords (e.g. 'queueing theory' → ['queueing', 'theory']).",
+            "1. SPLIT the user's query into individual keywords from the user's prompt. "
+            "Do NOT grep for these example placeholders verbatim. (Example only: a "
+            "query like 'foo bar' splits into ['foo', 'bar'].)",
             "2. For EACH keyword call grep_search ONCE — it searches both file CONTENT and FILENAMES",
             "   and falls back automatically to typo-tolerant matching.",
             "3. If the result contains 'partial_matches', those are CANDIDATES, not answers.",

@@ -306,6 +306,45 @@ def test_response_dedup_collapses_repeated_passes() -> None:
     assert "PASS2" not in out, "Second pass should be dropped"
 
 
+def test_response_dedup_keeps_full_last_pass_when_passes_are_multi_paragraph() -> None:
+    """Regression: response_dedup must keep ALL paragraphs of the final pass,
+    not just the last paragraph (the A3/D2 bug in v3 eval)."""
+    from coding_agent.core.response_dedup import dedup_repetitive_response
+    pass_paragraphs = [
+        "The AgentRuntime class is declared in coding_agent/core/runtime.py at line 92.",
+        "Constructor signature: __init__(self, workspace_root, config, *, provider, ...)",
+        "This is the complete constructor signature for AgentRuntime.",
+    ]
+    # Two identical passes; new dedup should keep the second full pass.
+    text = "\n\n".join(pass_paragraphs + pass_paragraphs)
+    out = dedup_repetitive_response(text, min_total_len=200)
+    paras = out.split("\n\n")
+    assert len(paras) == 3, f"Expected 3 paragraphs (one pass), got {len(paras)}"
+    assert "AgentRuntime class is declared" in out
+    assert "Constructor signature" in out
+    assert "complete constructor signature" in out
+
+
+def test_response_dedup_fallback_catches_restructured_passes() -> None:
+    """When passes use different lead-ins but share body content, the
+    whole-paragraph fallback should still catch the repetition."""
+    from coding_agent.core.response_dedup import dedup_repetitive_response
+    body = (
+        "max_tool_calls is defined in coding_agent/config/config.yml line 21. "
+        "It is loaded by coding_agent/config/settings.py and used by "
+        "coding_agent/core/runtime.py to cap tool invocations per turn. "
+    )
+    text = "\n\n".join([
+        "## Summary\n" + body,
+        "## Transmission path\n" + body,
+        "## Flow diagram\n" + body,
+    ])
+    out = dedup_repetitive_response(text, min_total_len=200)
+    # Last pass starts with "## Flow diagram"
+    assert "## Flow diagram" in out
+    assert "## Summary" not in out
+
+
 def test_response_dedup_leaves_normal_text_alone() -> None:
     from coding_agent.core.response_dedup import dedup_repetitive_response
     text = "Step 1: do X.\n\nStep 2: do Y.\n\nConclusion: done."
