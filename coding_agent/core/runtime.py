@@ -102,6 +102,8 @@ class _ToolObservations:
     write_paths: set[str] = field(default_factory=set)
     edit_paths: set[str] = field(default_factory=set)
     last_bash_returncode: int | None = None
+    web_searched: bool = False
+    web_fetched: bool = False
 
 
 @dataclass
@@ -117,18 +119,46 @@ _BASH_SUCCESS_PHRASES = (
     "測試通過", "測試成功", "成功通過", "全部通過", "編譯成功",
 )
 
+# Time-sensitive query markers — when a prompt contains any of these, the
+# model's final answer must be backed by a fresh web_search/web_fetch
+# rather than training memory. Covers English + Chinese (and a few Japanese
+# overlaps). Word-boundary anchored where applicable to avoid false positives.
+import re as _re_module  # noqa: E402 (top-level import already done; alias for clarity)
+
+_TIME_SENSITIVE_RE = _re_module.compile(
+    r"\b(?:latest|newest|most\s+recent|current(?:ly)?|currently|nowadays|"
+    r"today|tonight|this\s+(?:week|month|year|quarter)|as\s+of|right\s+now|"
+    r"upcoming|stock\s+price|share\s+price|exchange\s+rate|live\s+score|"
+    r"who\s+is\s+the\s+(?:current|new)|what\s+is\s+the\s+(?:current|latest))\b"
+    # Chinese / Japanese — no word boundaries (CJK doesn't have them)
+    r"|最新|现在|現在|今天|今日|今年|本年|本月|当前|當前|目前|"
+    r"近期|最近|實時|实时|即時|"
+    r"股價|股价|匯率|汇率|價格|价格|"
+    r"誰是|谁是|什麼.*目前|什么.*目前",
+    _re_module.IGNORECASE,
+)
+
+
+def _is_time_sensitive_prompt(prompt: str) -> bool:
+    """Return True if *prompt* asks about something likely to have changed since training."""
+    if not prompt:
+        return False
+    return bool(_TIME_SENSITIVE_RE.search(prompt))
+
 
 def _check_final_answer_grounding(
     obs: _ToolObservations,
     response_text: str,
     *,
     is_weak_investigation: bool,
+    is_time_sensitive: bool = False,
 ) -> _GroundingViolation | None:
     """Return the first grounding violation in *response_text* given *obs*, or None.
 
     Checks (in order):
     1. Weak-tier investigation: grep returned matches but no read_file was ever called.
     2. Bash claimed success in final text but last bash returncode was non-zero.
+    3. Time-sensitive prompt but the model never called web_search/web_fetch.
     """
     if is_weak_investigation and obs.grep_had_matches and not obs.read_paths:
         return _GroundingViolation(
@@ -157,6 +187,20 @@ def _check_final_answer_grounding(
                     "non-zero exit code."
                 ),
             )
+    if is_time_sensitive and not obs.web_searched and not obs.web_fetched:
+        return _GroundingViolation(
+            reason="time_sensitive_no_web_search",
+            message=(
+                "[SYSTEM SUPERVISOR] The user asked about something time-sensitive "
+                "(latest / current / today / 最新 / 現在 / 今年 ...), but you answered "
+                "without calling web_search or web_fetch. Your training data is "
+                "older than today and likely stale on this topic — answering from "
+                "memory risks naming dissolved companies, retired products, or "
+                "out-of-date facts. Call web_search NOW with a focused query, then "
+                "web_fetch the most promising 1-3 URLs, and rewrite your answer "
+                "citing those sources."
+            ),
+        )
     return None
 
 
@@ -396,6 +440,7 @@ class AgentRuntime:
             self.config.provider.resolved_tier() == "weak"
             and _looks_inv(prompt)
         )
+        is_time_sensitive = _is_time_sensitive_prompt(prompt)
         observations = _ToolObservations()
         forced_retry_done = False
 
@@ -459,6 +504,7 @@ class AgentRuntime:
                     violation = _check_final_answer_grounding(
                         observations, response.text,
                         is_weak_investigation=is_weak_investigation,
+                        is_time_sensitive=is_time_sensitive,
                     )
                     if violation is not None:
                         forced_retry_done = True
@@ -865,6 +911,10 @@ class AgentRuntime:
                 payload = json.loads(stripped)
                 if isinstance(payload, dict) and "returncode" in payload:
                     observations.last_bash_returncode = int(payload["returncode"])
+        elif tool_name == "web_search" and not is_error_envelope:
+            observations.web_searched = True
+        elif tool_name == "web_fetch" and not is_error_envelope:
+            observations.web_fetched = True
 
     # ------------------------------------------------------------------
     # Tool execution with enforcer + failure hooks

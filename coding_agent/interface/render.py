@@ -599,12 +599,24 @@ def _summarize_tool_result(name: str, content: str, is_error: bool) -> str:
 
     if name in ("web_search",):
         try:
-            hits = _json.loads(content)
-            if isinstance(hits, list):
+            parsed = _json.loads(content)
+            # New shape: {results: [...], _meta: {backends_tried: [...]}}.
+            # Legacy shape: bare list[{title, url}] — handled in the elif.
+            if isinstance(parsed, dict) and "results" in parsed:
+                hits = parsed.get("results") or []
+                meta = parsed.get("_meta", {}) or {}
+                backends = meta.get("backends_tried") or []
+                tag = f" [{backends[-1]}]" if backends else ""
                 if not hits:
-                    return "no results"
+                    return f"no results{tag}"
                 titles = [h.get("title", "?") for h in hits[:3] if isinstance(h, dict)]
                 suffix = f" (+{len(hits) - 3} more)" if len(hits) > 3 else ""
+                return " · ".join(_truncate(t, 35) for t in titles) + suffix + tag
+            if isinstance(parsed, list):  # legacy shape — kept for backward compat
+                if not parsed:
+                    return "no results"
+                titles = [h.get("title", "?") for h in parsed[:3] if isinstance(h, dict)]
+                suffix = f" (+{len(parsed) - 3} more)" if len(parsed) > 3 else ""
                 return " · ".join(_truncate(t, 35) for t in titles) + suffix
         except Exception:
             pass
@@ -909,6 +921,7 @@ def format_memory_display(
     session_messages: int,
     compaction_count: int = 0,
     metrics: dict[str, Any] | None = None,
+    persistent_memories: list[Any] | None = None,
 ) -> str:
     lines = [
         f"  {BOLD}{THEME.heading}Memory & Context{RESET}",
@@ -945,6 +958,21 @@ def format_memory_display(
             lines.append(f"    📚 {name}" + (f" — {desc}" if desc else ""))
     else:
         lines.append(f"    {DIM}No skills discovered.{RESET}")
+    lines.append("")
+
+    lines.append(f"  {THEME.brand}{_SYM_ARROW}{RESET} {BOLD}Persistent Memory{RESET} (cross-session)")
+    if persistent_memories:
+        for m in persistent_memories:
+            name = getattr(m, "name", "?")
+            desc = getattr(m, "description", "")
+            scope = getattr(m, "scope", "?")
+            mem_type = getattr(m, "type", "?")
+            scope_tag = f"{DIM}[{scope}/{mem_type}]{RESET}"
+            desc_part = f" — {desc}" if desc else ""
+            lines.append(f"    🧠 {name} {scope_tag}{desc_part}")
+    else:
+        lines.append(f"    {DIM}No saved memories.{RESET}")
+        lines.append(f"    {DIM}Use the `memory_save` tool or /remember to add one.{RESET}")
     lines.append("")
 
     lines.append(f"  {THEME.brand}{_SYM_ARROW}{RESET} {BOLD}Saved Sessions{RESET}")

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 import re
 import time
 import urllib.parse
@@ -18,6 +20,9 @@ if TYPE_CHECKING:
 _MAX_RESPONSE_SIZE = 5 * 1024 * 1024  # 5 MB
 _MAX_REDIRECTS = 10
 _FETCH_TIMEOUT = 30
+_BRAVE_API_URL = "https://api.search.brave.com/res/v1/web/search"
+
+_log = logging.getLogger("yucode.tools.web")
 
 
 def web_tools(registry: ToolRegistry) -> list[ToolDefinition]:
@@ -46,7 +51,9 @@ def web_tools(registry: ToolRegistry) -> list[ToolDefinition]:
         ToolDefinition(
             ToolSpec(
                 "web_search",
-                "Search the web via DuckDuckGo. Returns a list of {title, url} results. "
+                "Search the web. Uses Brave Search API if BRAVE_API_KEY is set, else "
+                "DuckDuckGo HTML; auto-retries with a relaxed query on zero hits. "
+                "Returns {results: [{title, url}], _meta: {backends_tried}}. "
                 "IMPORTANT: After searching, pick the 1-3 most relevant URLs and use web_fetch "
                 "to read their content. Do NOT keep searching endlessly — fetch the best results "
                 "to extract the actual data. If the first search doesn't find what you need, "
@@ -122,27 +129,53 @@ def _web_fetch(args: dict[str, Any]) -> str:
 
 
 def _web_search(args: dict[str, Any]) -> str:
-    query = urllib.parse.quote_plus(str(args["query"]))
-    url = f"https://duckduckgo.com/html/?q={query}"
-    req = urllib.request.Request(url, headers={
-        "User-Agent": "yucode-agent/0.1",
-        "Accept": "text/html",
-    })
-    opener = _build_redirect_limited_opener()
-    with opener.open(req, timeout=_FETCH_TIMEOUT) as response:
-        body = response.read(_MAX_RESPONSE_SIZE).decode("utf-8", errors="replace")
+    """Web search with backend fallback chain.
 
-    hits = _extract_ddg_search_hits(body)
-    if not hits:
-        hits = _extract_generic_link_hits(body)
+    Order of preference:
+      1. Brave Search API (if BRAVE_API_KEY env var is set) — most reliable, current.
+      2. DuckDuckGo HTML scraping (default; no key required, but brittle).
+      3. DuckDuckGo retry with relaxed query (strip quotes, drop short tokens) — fires only on 0 hits.
 
+    The response is always the JSON-encoded list of {title, url} hits the
+    tool spec promises, plus an optional `_meta.fallback` field naming which
+    backend ultimately produced the results.
+    """
+    raw_query = str(args["query"]).strip()
     allowed_domains: list[str] | None = args.get("allowed_domains")
     blocked_domains: list[str] | None = args.get("blocked_domains")
+
+    fallback_path: list[str] = []
+    hits: list[dict[str, str]] = []
+
+    # 1) Brave Search API first if configured
+    brave_key = os.environ.get("BRAVE_API_KEY", "").strip()
+    if brave_key:
+        try:
+            hits = _brave_search(raw_query, brave_key)
+            fallback_path.append("brave")
+        except Exception as exc:
+            _log.warning("Brave Search failed (%s); falling back to DuckDuckGo", exc)
+
+    # 2) DuckDuckGo HTML (primary if no Brave key, fallback otherwise)
+    if not hits:
+        hits = _duckduckgo_search(raw_query)
+        fallback_path.append("duckduckgo")
+
+    # 3) Zero-hit retry with relaxed query
+    if not hits:
+        relaxed = _relax_query(raw_query)
+        if relaxed and relaxed != raw_query:
+            _log.info("0 hits for `%s`; retrying with relaxed `%s`", raw_query, relaxed)
+            hits = _duckduckgo_search(relaxed)
+            fallback_path.append("duckduckgo_relaxed")
+
+    # Domain filters
     if allowed_domains:
         hits = [h for h in hits if any(d in h["url"] for d in allowed_domains)]
     if blocked_domains:
         hits = [h for h in hits if not any(d in h["url"] for d in blocked_domains)]
 
+    # Dedup by URL, preserve order
     seen: set[str] = set()
     deduped: list[dict[str, str]] = []
     for h in hits:
@@ -150,7 +183,80 @@ def _web_search(args: dict[str, Any]) -> str:
             seen.add(h["url"])
             deduped.append(h)
 
-    return json.dumps(deduped[:10], indent=2)
+    result: dict[str, Any] = {"results": deduped[:10]}
+    if fallback_path:
+        result["_meta"] = {"backends_tried": fallback_path}
+    if not deduped:
+        result["_meta"] = result.get("_meta", {})
+        result["_meta"]["hint"] = (
+            "No results from any backend. Try a different query, "
+            "or set BRAVE_API_KEY for a more reliable search backend."
+        )
+    return json.dumps(result, indent=2)
+
+
+def _duckduckgo_search(query: str) -> list[dict[str, str]]:
+    """Single-shot DDG HTML scrape. Returns [] on failure rather than raising."""
+    if not query.strip():
+        return []
+    encoded = urllib.parse.quote_plus(query)
+    url = f"https://duckduckgo.com/html/?q={encoded}"
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "yucode-agent/0.1",
+        "Accept": "text/html",
+    })
+    opener = _build_redirect_limited_opener()
+    try:
+        with opener.open(req, timeout=_FETCH_TIMEOUT) as response:
+            body = response.read(_MAX_RESPONSE_SIZE).decode("utf-8", errors="replace")
+    except Exception as exc:
+        _log.warning("DuckDuckGo fetch failed: %s", exc)
+        return []
+    hits = _extract_ddg_search_hits(body)
+    if not hits:
+        hits = _extract_generic_link_hits(body)
+    return hits
+
+
+def _brave_search(query: str, api_key: str) -> list[dict[str, str]]:
+    """Brave Search API. Returns [{title, url}] or raises on HTTP error."""
+    if not query.strip():
+        return []
+    encoded = urllib.parse.urlencode({"q": query, "count": 10})
+    url = f"{_BRAVE_API_URL}?{encoded}"
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "yucode-agent/0.1",
+        "Accept": "application/json",
+        "X-Subscription-Token": api_key,
+    })
+    with urllib.request.urlopen(req, timeout=_FETCH_TIMEOUT) as response:
+        body = response.read(_MAX_RESPONSE_SIZE).decode("utf-8", errors="replace")
+    data = json.loads(body)
+    web = (data.get("web") or {}).get("results") or []
+    return [
+        {"title": str(r.get("title", "")), "url": str(r.get("url", ""))}
+        for r in web
+        if r.get("url")
+    ]
+
+
+_QUERY_FILLER = frozenset({
+    "a", "an", "the", "of", "in", "on", "at", "for", "to", "by",
+    "is", "are", "was", "were", "be", "been", "being", "do", "does", "did",
+    "and", "or", "but", "with", "this", "that", "these", "those",
+    "what", "who", "where", "when", "why", "how",
+    "what's", "who's",
+})
+
+
+def _relax_query(query: str) -> str:
+    """Drop quotes and short filler words to widen a zero-hit query."""
+    cleaned = query.replace('"', " ").replace("'", " ")
+    tokens = cleaned.split()
+    kept = [t for t in tokens if len(t) > 2 and t.lower() not in _QUERY_FILLER]
+    if not kept:
+        kept = tokens  # don't strip everything
+    return " ".join(kept)
 
 
 def _clean_html(body: str) -> str:

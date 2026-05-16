@@ -6,14 +6,20 @@ if the optional dependency is missing, telling the model how to install it.
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import json
+import mimetypes
 from typing import TYPE_CHECKING, Any
 
 from . import RiskLevel, ToolDefinition, ToolSpec
 
 if TYPE_CHECKING:
     from . import ToolRegistry
+
+
+_IMAGE_MAX_BASE64_BYTES = 1_500_000  # ~1 MB cap on raw bytes before base64-encoding
+_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tiff")
 
 
 def office_tools(registry: ToolRegistry) -> list[ToolDefinition]:
@@ -261,6 +267,28 @@ def office_tools(registry: ToolRegistry) -> list[ToolDefinition]:
                 RiskLevel.LOW,
             ),
             lambda args: _read_excel_preview(registry, args),
+        ),
+        # ---- Image ----
+        ToolDefinition(
+            ToolSpec(
+                "image_read",
+                "Inspect an image (.png/.jpg/.jpeg/.webp/.gif/.bmp/.tiff) and return "
+                "metadata (path, mime_type, width, height, mode, size_bytes). "
+                "Pass include_base64=true to also get a base64 data URL — useful when "
+                "the provider supports multimodal/vision input. Default omits base64 "
+                "to keep the response cheap.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Path to image file."},
+                        "include_base64": {"type": "boolean", "description": "If true, include a base64 data URL in the response."},
+                    },
+                    "required": ["path"],
+                },
+                "read-only",
+                RiskLevel.LOW,
+            ),
+            lambda args: _image_read(registry, args),
         ),
         # ---- PDF ----
         ToolDefinition(
@@ -628,6 +656,52 @@ def _is_numeric(value: str) -> bool:
         return True
     except (ValueError, AttributeError):
         return False
+
+
+# ---- Image handler ----------------------------------------------------------
+
+def _image_read(registry: ToolRegistry, args: dict[str, Any]) -> str:
+    path = registry._resolve_path(str(args["path"]))
+    if not path.exists():
+        raise FileNotFoundError(f"Image not found: {path}")
+    suffix = path.suffix.lower()
+    if suffix not in _IMAGE_SUFFIXES:
+        raise ValueError(f"Unsupported image extension `{suffix}` (expected one of {list(_IMAGE_SUFFIXES)}).")
+    size_bytes = path.stat().st_size
+    mime, _ = mimetypes.guess_type(str(path))
+    mime = mime or f"image/{suffix.lstrip('.')}"
+    include_b64 = bool(args.get("include_base64", False))
+
+    info: dict[str, Any] = {
+        "path": str(path.relative_to(registry.workspace_root)) if registry.workspace_root in path.parents else str(path),
+        "mime_type": mime,
+        "size_bytes": size_bytes,
+    }
+
+    # Try to extract width/height/mode via PIL if available; degrade gracefully.
+    try:
+        from PIL import Image  # type: ignore
+        with Image.open(str(path)) as im:
+            info["width"] = im.width
+            info["height"] = im.height
+            info["mode"] = im.mode
+    except ImportError:
+        info["dimensions_note"] = "Install Pillow (`pip install pillow`) to extract width/height."
+    except Exception as exc:
+        info["dimensions_error"] = str(exc)
+
+    if include_b64:
+        if size_bytes > _IMAGE_MAX_BASE64_BYTES:
+            info["base64_skipped"] = (
+                f"Image is {size_bytes:,} bytes; exceeds {_IMAGE_MAX_BASE64_BYTES:,} byte cap. "
+                "Resize the image or set include_base64=false."
+            )
+        else:
+            raw = path.read_bytes()
+            data_url = f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
+            info["data_url"] = data_url
+
+    return json.dumps(info, indent=2)
 
 
 # ---- PDF handler ------------------------------------------------------------

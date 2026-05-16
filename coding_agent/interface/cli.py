@@ -79,6 +79,16 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("target", nargs="?", default=".", help="Target directory (default: current dir).")
     init.set_defaults(handler=handle_init)
 
+    init_agents = subparsers.add_parser("init-agents", help="Scan the workspace and generate a starter AGENTS.md.")
+    init_agents.add_argument("target", nargs="?", default=".", help="Target directory (default: current dir).")
+    init_agents.add_argument("--force", action="store_true", help="Overwrite an existing AGENTS.md.")
+    init_agents.add_argument("--filename", default="AGENTS.md", help="Output filename (default: AGENTS.md).")
+    init_agents.set_defaults(handler=handle_init_agents)
+
+    init_memory = subparsers.add_parser("init-memory", help="Bootstrap a user-scope memory file from ~/.gitconfig and environment.")
+    init_memory.add_argument("--force", action="store_true", help="Overwrite an existing user-profile memory.")
+    init_memory.set_defaults(handler=handle_init_memory)
+
     chat = subparsers.add_parser("chat", help="Run a coding-agent turn (or start interactive mode with no prompt).")
     chat.add_argument("prompt", nargs="?", default=None)
     chat.add_argument("--workspace", default=".")
@@ -549,6 +559,46 @@ def handle_init(args: argparse.Namespace) -> int:
     print("  Note: do NOT run `pip install .` from this directory.")
     print("        To install/update yucode, run: pip install yucode-agent")
     print()
+    return 0
+
+
+def handle_init_agents(args: argparse.Namespace) -> int:
+    from .init_workspace import detect_profile, render_agents_md, write_agents_md
+
+    target = Path(args.target).resolve()
+    if not target.is_dir():
+        print(render_warning(f"`{target}` is not a directory."))
+        return 1
+    try:
+        path, _ = write_agents_md(target, force=args.force, filename=args.filename)
+    except FileExistsError as exc:
+        print(render_warning(str(exc)))
+        return 1
+    profile = detect_profile(target)
+    print(render_success(f"Wrote {path}"))
+    if profile.languages:
+        print(f"  Detected: {', '.join(profile.languages)}"
+              + (f"  +{', '.join(profile.frameworks)}" if profile.frameworks else ""))
+    if profile.test_command:
+        print(f"  Test command:  {profile.test_command}")
+    if profile.build_command:
+        print(f"  Build command: {profile.build_command}")
+    print("\n  Edit the file and add anything the agent should always know about this repo.")
+    return 0
+
+
+def handle_init_memory(args: argparse.Namespace) -> int:
+    from .memory_bootstrap import bootstrap_user_profile
+
+    try:
+        entry, was_new = bootstrap_user_profile(Path.cwd().resolve(), force=args.force)
+    except FileExistsError as exc:
+        print(render_warning(str(exc)))
+        return 1
+    action = "Wrote" if was_new else "Updated"
+    print(render_success(f"{action} {entry.path}"))
+    print(f"  Memory `{entry.name}` saved to user scope.")
+    print(f"  Body:\n{entry.body[:400]}{'...' if len(entry.body) > 400 else ''}")
     return 0
 
 
@@ -1298,8 +1348,10 @@ def _handle_slash_command_interactive(command: str, arguments: str, config: Any,
     elif command == "memory":
         files = list_instruction_files(workspace)
         from ..core.session import Session
+        from ..memory.store import MemoryStore
         sessions = Session.list_sessions(workspace)
         found_skills = list_skills(workspace)
+        persistent = MemoryStore(workspace).list()
         print(format_memory_display(
             workspace=workspace,
             instruction_files=files,
@@ -1308,7 +1360,14 @@ def _handle_slash_command_interactive(command: str, arguments: str, config: Any,
             estimated_tokens=runtime.estimated_tokens(),
             session_messages=len(runtime.session.messages),
             metrics=runtime.metrics.to_dict() if hasattr(runtime, "metrics") else None,
+            persistent_memories=persistent,
         ))
+    elif command == "remember":
+        _handle_remember_command(workspace, arguments)
+    elif command == "forget":
+        _handle_forget_command(workspace, arguments)
+    elif command == "init":
+        _handle_init_slash(workspace, arguments)
     elif command == "resume":
         from ..core.session import Session
         sessions = Session.list_sessions(workspace)
@@ -1461,6 +1520,88 @@ def _show_metrics(runtime: Any) -> None:
             print(f"    🛡️  {ev['event_type']} → {ev['tool_name']}: {ev.get('detail', '')[:60]}")
 
 
+def _handle_init_slash(workspace: Path, arguments: str) -> None:
+    """`/init [--force]` — generate a starter AGENTS.md for the current workspace."""
+    from .init_workspace import detect_profile, write_agents_md
+
+    force = "--force" in arguments.split()
+    try:
+        path, _ = write_agents_md(workspace, force=force)
+    except FileExistsError as exc:
+        print(render_warning(str(exc)))
+        return
+    profile = detect_profile(workspace)
+    print(render_success(f"Wrote {path}"))
+    if profile.languages:
+        print(f"  Detected: {', '.join(profile.languages)}"
+              + (f"  +{', '.join(profile.frameworks)}" if profile.frameworks else ""))
+    if profile.test_command:
+        print(f"  Test command:  {profile.test_command}")
+    if profile.build_command:
+        print(f"  Build command: {profile.build_command}")
+
+
+def _handle_remember_command(workspace: Path, arguments: str) -> None:
+    """`/remember [-w] [--type=TYPE] <body>` — save a persistent memory.
+
+    Flags:
+      -w / --workspace    save into <workspace>/.yucode/memory (default: ~/.yucode/memory)
+      --type=TYPE         user|feedback|project|reference (default: user)
+    The name is derived from the first ~5 words of the body; the description
+    is the first sentence (or first 120 chars).
+    """
+    from ..memory.store import MemoryStore, slugify
+
+    tokens = arguments.split()
+    scope = "user"
+    mem_type = "user"
+    rest: list[str] = []
+    for tok in tokens:
+        if tok in ("-w", "--workspace"):
+            scope = "workspace"
+        elif tok.startswith("--type="):
+            mem_type = tok.split("=", 1)[1].strip().lower()
+        else:
+            rest.append(tok)
+    body = " ".join(rest).strip()
+    if not body:
+        print(render_info("Usage: /remember [-w] [--type=user|feedback|project|reference] <text>"))
+        return
+    if mem_type not in ("user", "feedback", "project", "reference"):
+        print(render_warning(f"Invalid --type=`{mem_type}` (must be user|feedback|project|reference)"))
+        return
+
+    # Derive name from first words; cap to ~5 tokens to keep slug short
+    name_words = body.split()[:5]
+    name = slugify(" ".join(name_words))
+    # First sentence (period/。/!/？) or first 120 chars, whichever is shorter
+    end = min(
+        [i for i in (body.find("."), body.find("。"), body.find("!"), body.find("？"), body.find("?")) if i > 0]
+        + [120, len(body)]
+    )
+    description = body[:end].strip()
+
+    entry = MemoryStore(workspace).save(name, description, mem_type, body, scope)  # type: ignore[arg-type]
+    try:
+        rel = f"~/{entry.path.relative_to(Path.home())}"
+    except ValueError:
+        rel = str(entry.path)
+    print(render_success(f"Saved memory `{entry.name}` ({entry.scope}/{entry.type}) → {rel}"))
+
+
+def _handle_forget_command(workspace: Path, arguments: str) -> None:
+    from ..memory.store import MemoryStore
+
+    name = arguments.strip()
+    if not name:
+        print(render_info("Usage: /forget <name>   (use /memory to list names)"))
+        return
+    if MemoryStore(workspace).delete(name):
+        print(render_success(f"Deleted memory `{name}`."))
+    else:
+        print(render_warning(f"No memory named `{name}` found."))
+
+
 def _print_slash_help() -> None:
     print(section_header("Commands"))
     _cmds = [
@@ -1468,6 +1609,9 @@ def _print_slash_help() -> None:
         ("/status",      "Runtime status — model, tokens, messages"),
         ("/model [name]","Show or switch model in-session"),
         ("/memory",      "Show all memory & context info"),
+        ("/remember TXT","Save a persistent memory (cross-session)"),
+        ("/forget NAME", "Delete a persistent memory by name"),
+        ("/init [--force]","Scan workspace and write a starter AGENTS.md"),
         ("/tools",       "List available tools with risk levels"),
         ("/compact",     "Compact conversation to free context"),
         ("/metrics",     "Show tool usage and session metrics"),

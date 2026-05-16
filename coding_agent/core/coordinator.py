@@ -34,15 +34,21 @@ class WorkerRole(str, Enum):
 
 ROLE_TOOLS: dict[WorkerRole, list[str]] = {
     WorkerRole.RESEARCH: [
-        "read_file", "list_directory", "grep_search", "glob_search",
+        "read_file", "read_files", "file_outline",
+        "list_directory", "grep_search", "glob_search",
         "web_search", "web_fetch", "tool_search",
+        "memory_list", "memory_read", "memory_search",
+        # Office/PDF inspection so research can answer "what's in this spreadsheet?"
+        "inspect_excel_sheets", "read_excel_sheet", "read_excel_preview",
+        "read_word_text", "read_pptx", "read_pdf_text",
     ],
     WorkerRole.WORK: [
-        "read_file", "write_file", "edit_file", "list_directory",
+        "read_file", "read_files", "write_file", "edit_file", "list_directory",
         "grep_search", "glob_search", "bash", "notebook_edit",
+        "memory_list", "memory_read",
     ],
     WorkerRole.VALIDATE: [
-        "read_file", "list_directory", "grep_search", "glob_search",
+        "read_file", "read_files", "list_directory", "grep_search", "glob_search",
         "bash",
     ],
 }

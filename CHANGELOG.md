@@ -2,6 +2,53 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.0] - 2026-05-17
+
+Focus: give the agent durable memory across sessions, stop it from fumbling Office/PDF files, anchor it to today's date so it stops answering time-sensitive questions from stale training data, and add a runtime grounding check that forces web verification on time-sensitive prompts (failing-loud rather than silently hallucinating). Plus a workspace `/init` scanner, an image-inspection tool, a Brave-then-DDG search fallback chain, and a user-profile memory bootstrap.
+
+### Added — persistent memory subsystem
+- `coding_agent/memory/store.py`: NEW `MemoryStore` — file-backed persistent memory with two scopes: user (`~/.yucode/memory/`) and workspace (`<workspace>/.yucode/memory/`). Each memory is a standalone `.md` file with YAML-style frontmatter (`name`, `description`, `saved_at`, `type`); `MEMORY.md` per scope is a rebuilt one-line-per-entry index. Four memory types: `user`, `feedback`, `project`, `reference`. Files are plain markdown — user can edit them with any text editor.
+- `coding_agent/tools/memory_tools.py`: NEW five tools — `memory_save`, `memory_list`, `memory_read`, `memory_delete`, `memory_search`. All five are registered as built-ins in `tools/__init__.py::_builtin_tools`. `memory_list` returns metadata only (cheap); `memory_read` returns the full body (call once names are known).
+- `coding_agent/memory/prompting.py::_memory_section`: NEW prompt section. When MEMORY.md is non-empty in either scope, the index is auto-injected into the system prompt with instructions to call `memory_read` for full bodies. Truncates at 8K chars so a large user-scope memory store can't crowd out instruction files.
+- `coding_agent/memory/prompting.py::_memory_rules_section`: NEW prompt section with explicit "when to save" guidance (covers the four memory types, what to save vs. NOT save, and the dedupe rule "call `memory_list` before saving").
+- `MemoryEntry.saved_at` + `MemoryEntry.age_days()`: every memory now records the ISO save date; `MemoryStore.load_indexes_text()` annotates entries older than `STALE_DAYS_THRESHOLD` (30 days) with `[stale: Xd]` in the prompt-injected index. Mirrors Claude Code's stale-memory marker so the model can deprioritise old facts.
+- `coding_agent/interface/cli.py`: NEW `/remember [-w] [--type=TYPE] <text>` slash command — save a persistent memory in one line without invoking the tool layer. Auto-derives the slug from the first 5 words and the description from the first sentence. Default scope = user, type = user.
+- `coding_agent/interface/cli.py`: NEW `/forget <name>` slash command — delete a persistent memory by name.
+- `coding_agent/interface/render.py::format_memory_display`: new `persistent_memories` parameter. `/memory` now shows a `Persistent Memory (cross-session)` section listing every saved memory with its scope/type tag.
+- `coding_agent/interface/memory_bootstrap.py`: NEW `bootstrap_user_profile()` + `yucode init-memory` CLI subcommand. Scans `~/.gitconfig` for name/email, `$SHELL`, `$EDITOR`, `platform`, and a small allow-list of tools on PATH (rg/fd/fzf/gh/docker/poetry/pnpm/...) and writes a `user-profile` memory in the user scope. Idempotent; pass `--force` to refresh.
+
+### Added — office, image, and binary-file routing
+- `coding_agent/memory/prompting.py::_office_files_section`: NEW prompt section mapping file extensions to dedicated office tools (`.xlsx` → `inspect_excel_sheets` + `read_excel_sheet`, `.docx` → `read_word_text`, `.pptx` → `read_pptx`, `.pdf` → `read_pdf_text`, `.ipynb` → `edit_notebook_cell`, `.png` / `.jpg` → `image_read`). Explicitly steers the agent away from `cat`/`xxd`/`file`/`hexdump` on Office files — those were defaulting it into failure loops on Windows.
+- `coding_agent/tools/filesystem.py::_BINARY_TOOL_HINTS`: extension → tool-suggestion map. `_read_file` checks the suffix BEFORE the generic binary-bytes check and raises a tool-specific error (e.g. opening `report.xlsx` with `read_file` now says "use `inspect_excel_sheets` then `read_excel_sheet`" instead of "use bash xxd/file/hexdump"). Covers .xlsx/.xlsm/.xls/.docx/.pptx/.pdf/.ipynb/.png/.jpg/.jpeg/.webp/.gif/.bmp/.tiff.
+- `coding_agent/tools/office.py::_image_read`: NEW `image_read(path, include_base64?)` tool — returns mime_type, size_bytes, width/height/mode (via Pillow if available, else a degradation note). Pass `include_base64=true` to also get a data-URL base64 payload (capped at 1.5 MB raw) for multimodal providers.
+
+### Added — web grounding
+- `coding_agent/memory/prompting.py::_web_freshness_section`: NEW prompt section anchored to `current_date`. Tells the agent its training data is older than today and that any claim about current state (companies, products, prices, schedules, policies, exchange rates, news) MUST be verified via `web_search` + `web_fetch` before answering. Calls out the failure mode of naming dissolved companies / discontinued brands from memory.
+- `coding_agent/core/runtime.py::_TIME_SENSITIVE_RE` + `_is_time_sensitive_prompt()`: regex detector covering English (latest/current/now/today/this year/as of/stock price/...) + Chinese (最新/現在/今天/今年/匯率/股價/...). Used at turn start to flag the prompt as time-sensitive.
+- `coding_agent/core/runtime.py::_check_final_answer_grounding`: NEW third check `time_sensitive_no_web_search` — fires when the prompt is time-sensitive AND the model produced a final answer without ever calling `web_search` or `web_fetch`. Injects a supervisor message and forces one retry iteration. Emits `grounding_retry` event with `reason=time_sensitive_no_web_search`. Applies to ALL tiers (not just weak) because even frontier models trip on dissolved-company / retired-product questions.
+- `coding_agent/core/runtime.py::_record_tool_observation`: now records `web_searched` / `web_fetched` invocations so the new grounding check can short-circuit.
+- `coding_agent/tools/web.py`: `web_search` rewritten as a backend fallback chain. Order: (1) Brave Search API when `BRAVE_API_KEY` env var is set; (2) DuckDuckGo HTML scraping; (3) DuckDuckGo retry with a relaxed query (strips quotes + ≤2-char filler words) on zero-hit. Response shape changed from `list[{title,url}]` to `{results: list, _meta: {backends_tried: list, hint?: str}}`; render.py updated to display the new shape.
+
+### Added — workspace bootstrap
+- `coding_agent/interface/init_workspace.py`: NEW `detect_profile()` + `write_agents_md()` + `render_agents_md()`. Scans for `pyproject.toml`/`requirements.txt`/`setup.py`, `package.json` + `tsconfig.json` + lockfiles, `Cargo.toml`, `go.mod`, `Makefile`; detects framework hints (fastapi/flask/django/react/vue/next/express/rails/spring); extracts test/build/run commands from package.json scripts; reads README tagline; reads git remote.
+- `yucode init-agents` CLI subcommand + `/init [--force]` slash command — generates a starter `AGENTS.md` with the detected stack, common commands, notable files, and empty conventions/notes sections for the user to fill in. Refuses to overwrite an existing file without `--force`.
+
+### Added — AGENTS.md recognition
+- `coding_agent/memory/prompting.py::discover_instruction_files`: now recognises `AGENTS.md`, `AGENTS.local.md`, and `.agents/AGENTS.md` alongside the existing `YUCODE.md` / `CLAW.md` / `CLAUDE.md` candidates — opencode parity.
+
+### Added — coordinator subagent tooling
+- `coding_agent/core/coordinator.py::ROLE_TOOLS`: research workers gain `memory_list` / `memory_read` / `memory_search` + the office-inspection tools (`inspect_excel_sheets`, `read_excel_sheet`, `read_excel_preview`, `read_word_text`, `read_pptx`, `read_pdf_text`) so a research subagent can consult prior context AND read Office documents directly. Work workers gain `memory_list` / `memory_read` (read-only — workers should not silently create memories). Both gain `read_files` for batch reads.
+
+### Added — tests
+- `tests/test_memory_system.py`: NEW 40 tests covering MemoryStore CRUD, index rebuild, scope precedence, slugify edge cases, the five memory tools, prompt-integration (memory index loaded, sections present, AGENTS.md recognised, index truncation), `_read_file` binary-extension routing, `/remember` and `/forget` CLI handlers, coordinator ROLE_TOOLS memory entries.
+- `tests/test_v060_features.py`: NEW 49 tests covering `_is_time_sensitive_prompt` (English + Chinese positive/negative cases), the `time_sensitive_no_web_search` grounding check matrix, `MemoryEntry.age_days` + stale-marker annotation in `load_indexes_text`, `image_read` (metadata, base64 toggle, size cap, extension routing), `detect_profile` for Python/Node/Rust/Go, `render_agents_md`, `write_agents_md` (overwrite protection + force), `bootstrap_user_profile`, and the `_web_search` fallback chain (Brave → DDG → relaxed retry, mocked).
+
+### Changed
+- `coding_agent/memory/prompting.py::ProjectContext`: gained a `memory_index: str = ""` field. `discover_project_context` populates it by calling `MemoryStore(cwd).load_indexes_text()` and truncating at `MAX_MEMORY_INDEX_CHARS` (8K).
+- `coding_agent/tools/filesystem.py::_read_file`: the generic binary error message now also points at the office tools (`read_excel_sheet`, `read_word_text`, `read_pdf_text`, `read_pptx`, `edit_notebook_cell`) instead of only suggesting `xxd`/`file`/`hexdump`.
+- `coding_agent/tools/web.py::web_search`: response shape changed from `list[{title,url}]` to `{results: list, _meta: {backends_tried, hint?}}`. Backward compat: render.py handles both shapes; the legacy list form is still parsed if encountered.
+- `coding_agent/interface/render.py::_summarize_tool_result`: web_search summary now shows `[backend]` tag when meta is present (e.g. `result1 · result2 [brave]`).
+
 ## [0.5.0] - 2026-05-14
 
 Focus of this release: cut weak-tier round-trip cost (batch + outline tools), make the planner / validator harder to fool, and unify the ad-hoc grounding supervisor onto a small per-turn observation framework that future checks can hang off. Strong-tier behaviour is unchanged for every code path that isn't gated on `provider.resolved_tier() == "weak"`.

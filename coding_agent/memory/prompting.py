@@ -8,10 +8,12 @@ from pathlib import Path
 
 from ..config import AppConfig
 from .skills import skill_summaries_for_prompt
+from .store import MemoryStore
 
 SYSTEM_PROMPT_DYNAMIC_BOUNDARY = "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__"
 MAX_INSTRUCTION_FILE_CHARS = 10_000
 MAX_TOTAL_INSTRUCTION_CHARS = 30_000
+MAX_MEMORY_INDEX_CHARS = 8_000
 
 
 @dataclass(frozen=True)
@@ -28,6 +30,7 @@ class ProjectContext:
     git_diff: str | None
     instruction_files: list[ContextFile]
     skills_summary: str = ""
+    memory_index: str = ""
 
 
 def discover_project_context(
@@ -40,6 +43,9 @@ def discover_project_context(
     git_status = _run_git(cwd, ["status", "--short", "--branch"]) if include_git_context else None
     git_diff = _collect_git_diff(cwd) if include_git_context else None
     skills_summary = skill_summaries_for_prompt(cwd)
+    memory_index = MemoryStore(cwd).load_indexes_text()
+    if len(memory_index) > MAX_MEMORY_INDEX_CHARS:
+        memory_index = memory_index[:MAX_MEMORY_INDEX_CHARS] + "\n... (truncated)"
     return ProjectContext(
         cwd=cwd,
         current_date=current_date,
@@ -47,6 +53,7 @@ def discover_project_context(
         git_diff=git_diff,
         instruction_files=instruction_files,
         skills_summary=skills_summary,
+        memory_index=memory_index,
     )
 
 
@@ -69,6 +76,9 @@ class PromptAssembler:
             _intro_section(),
             _system_section(),
             _doing_tasks_section(self.config.runtime.dedup_tool_threshold),
+            _office_files_section(),
+            _web_freshness_section(self.project_context.current_date),
+            _memory_rules_section(),
             _executing_actions_section(),
         ]
         if self.config.provider.resolved_tier() == "weak":
@@ -78,6 +88,8 @@ class PromptAssembler:
             self._environment_section(),
             self._project_context_section(),
         ])
+        if self.project_context.memory_index:
+            sections.append(self._memory_section())
         if self.project_context.instruction_files:
             sections.append(self._instruction_files_section())
         if self.project_context.skills_summary:
@@ -118,6 +130,17 @@ class PromptAssembler:
         if self.project_context.git_diff:
             lines.extend(["## Git diff", self.project_context.git_diff])
         return "\n".join(lines)
+
+    def _memory_section(self) -> str:
+        return "\n".join([
+            "# Persistent memory",
+            "The index below lists memories saved from prior sessions. "
+            "Each entry has a description only — call `memory_read` (or open the file) "
+            "to see the full body. Update memories with `memory_save`; remove stale "
+            "ones with `memory_delete`.",
+            "",
+            self.project_context.memory_index,
+        ])
 
     def _instruction_files_section(self) -> str:
         parts = ["# Instruction files"]
@@ -161,6 +184,9 @@ def discover_instruction_files(cwd: Path, explicit_paths: list[str]) -> list[Con
                 directory / "YUCODE.local.md",
                 directory / ".yucode" / "YUCODE.md",
                 directory / ".yucode" / "instructions.md",
+                directory / "AGENTS.md",
+                directory / "AGENTS.local.md",
+                directory / ".agents" / "AGENTS.md",
                 directory / "CLAW.md",
                 directory / "CLAW.local.md",
                 directory / ".claw" / "CLAW.md",
@@ -302,6 +328,76 @@ def _doing_tasks_section(dedup_threshold: int = 3) -> str:
             "3. For investigation tasks, reads ARE the work — keep reading until you can answer.",
             "   For build/edit tasks, once you have enough context, stop reading and act.",
             "4. Do not re-read files you already have in context.",
+        ]
+    )
+
+
+def _office_files_section() -> str:
+    return "\n".join(
+        [
+            "# Office and document files",
+            "For Office/PDF/notebook files, use the dedicated tools — NEVER cat, xxd, file, or",
+            "hexdump (they fail on Windows and return garbage on binary data). Quick map:",
+            "- `.xlsx` / `.xlsm`         → `inspect_excel_sheets` first (lists sheets + sample rows),",
+            "                              then `read_excel_sheet` or `read_excel_preview` for detail.",
+            "- `.docx`                   → `read_word_text` (full text) or `read_word_paragraphs`.",
+            "- `.pptx`                   → `read_pptx` (slide-by-slide text).",
+            "- `.pdf`                    → `read_pdf_text` (page-by-page text).",
+            "- `.ipynb`                  → `edit_notebook_cell` (read cells / patch them).",
+            "- `.png` / `.jpg` / `.webp` → `image_read` (metadata; pass include_base64=true for vision providers).",
+            "When the user asks about a balance sheet, P&L, financial sheet, or any spreadsheet:",
+            "1. `inspect_excel_sheets` to discover which sheet has the data.",
+            "2. `read_excel_sheet` (or `read_excel_preview` for a typed preview) on that sheet.",
+            "3. Cite sheet name and cell range when reporting numbers.",
+            "If a tool reports a missing dependency (e.g. openpyxl), tell the user the install",
+            "command verbatim — don't fall back to bash/hex tools.",
+        ]
+    )
+
+
+def _web_freshness_section(current_date: str) -> str:
+    return "\n".join(
+        [
+            "# Time-sensitive facts (freshness rules)",
+            f"Today's date is {current_date}. Your training data is older.",
+            "- For ANY claim about current state — companies, products, prices, schedules,",
+            "  policies, who-owns-what, exchange rates, news, software versions, sports —",
+            "  you MUST verify via `web_search` + `web_fetch` before answering.",
+            "- Reasoning from memory on time-sensitive topics is a failure mode. Common",
+            "  example: naming companies that merged/dissolved years ago (e.g. an airline",
+            "  brand that was retired in 2020 still surfacing in answers). Always verify.",
+            "- After `web_search`, pick the 1-3 most plausible URLs and call `web_fetch`",
+            "  for each. Cite the source URL in your final answer.",
+            "- If `web_search` returns no useful hits or you cannot fetch a primary source,",
+            "  say 'I could not verify this' rather than guessing.",
+            "- When the user's question is in Chinese, search with the Chinese terms; the",
+            "  English equivalent often returns different (or outdated) results.",
+        ]
+    )
+
+
+def _memory_rules_section() -> str:
+    return "\n".join(
+        [
+            "# Persistent memory (when to save)",
+            "Memory persists across sessions. Use `memory_save` for things the next session",
+            "won't otherwise know. Four types:",
+            "- `user`      — role, preferences, knowledge level, language, tools they use.",
+            "- `feedback`  — corrections/validations from the user. Include a **Why:** line",
+            "                so future-you can judge edge cases.",
+            "- `project`   — ongoing work facts not derivable from code: deadlines, ownership,",
+            "                rationale behind a decision, in-flight initiatives.",
+            "- `reference` — pointers to external systems (Linear projects, Slack channels,",
+            "                Grafana dashboards, URLs that matter).",
+            "Save IMMEDIATELY when:",
+            "- the user explicitly says \"remember this\" / \"記住\";",
+            "- the user corrects your approach or confirms a non-obvious choice;",
+            "- you learn a stable fact about the user, project, or external resources.",
+            "Do NOT save: code patterns, file paths, architecture, git history, debug",
+            "recipes — those are derivable from the repo. Do NOT save ephemeral task state.",
+            "Before saving, call `memory_list` to avoid duplicates; prefer updating an",
+            "existing memory over creating a new one. Default scope: `user` (cross-project).",
+            "Use `workspace` scope when the fact is project-specific.",
         ]
     )
 

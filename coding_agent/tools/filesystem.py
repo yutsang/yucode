@@ -36,6 +36,27 @@ _ARTIFACT_DIRS = frozenset({
 })
 _ARTIFACT_SUFFIXES = (".pyc", ".pyo", ".class", ".o")
 
+# Binary file extensions that have dedicated tools. Maps suffix -> hint
+# steering the model to the right tool instead of falling back to bash/xxd.
+_BINARY_TOOL_HINTS: dict[str, str] = {
+    ".xlsx": "Use `inspect_excel_sheets` to discover sheet names, then `read_excel_sheet` "
+             "or `read_excel_preview` to read the data.",
+    ".xlsm": "Use `inspect_excel_sheets` then `read_excel_sheet` (macro-enabled Excel).",
+    ".xls":  "Legacy Excel (.xls) is not supported by openpyxl. Ask the user to re-save as .xlsx, "
+             "or use `bash` with a tool like `xls2csv` / `libreoffice --headless --convert-to xlsx`.",
+    ".docx": "Use `read_word_text` for full text or `read_word_paragraphs` for paragraph metadata.",
+    ".pptx": "Use `read_pptx` to read slide-by-slide text.",
+    ".pdf":  "Use `read_pdf_text` to extract text page-by-page.",
+    ".ipynb": "Use `read_file` only for the raw JSON, or `edit_notebook_cell` to inspect/modify cells.",
+    ".png":  "Use `image_read` to inspect metadata (dimensions, format) and optionally fetch a base64 data URL.",
+    ".jpg":  "Use `image_read` to inspect metadata; pass include_base64=true for vision-capable providers.",
+    ".jpeg": "Use `image_read` to inspect metadata; pass include_base64=true for vision-capable providers.",
+    ".webp": "Use `image_read` to inspect metadata.",
+    ".gif":  "Use `image_read` to inspect metadata.",
+    ".bmp":  "Use `image_read` to inspect metadata.",
+    ".tiff": "Use `image_read` to inspect metadata.",
+}
+
 
 def _is_artifact_path(path_str: str) -> bool:
     """True if *path_str* looks like a build/cache artifact rather than source."""
@@ -200,10 +221,17 @@ def _read_file(registry: ToolRegistry, args: dict[str, Any]) -> str:
             f"File `{path}` is {size:,} bytes (limit: {MAX_READ_SIZE:,}). "
             "Use offset/limit to read a portion, or use grep_search."
         )
+    suffix_hint = _BINARY_TOOL_HINTS.get(path.suffix.lower())
+    if suffix_hint:
+        raise ValueError(
+            f"`{path.name}` is a {path.suffix.lower()} file — read_file cannot parse it. {suffix_hint}"
+        )
     if _is_binary_file(path):
         raise ValueError(
             f"File `{path}` appears to be binary. "
-            "Use bash with `xxd`, `file`, or `hexdump` to inspect binary files."
+            "Use bash with `xxd`, `file`, or `hexdump` to inspect binary files. "
+            "For Office/PDF/notebook files, use the dedicated tools "
+            "(read_excel_sheet, read_word_text, read_pdf_text, read_pptx, edit_notebook_cell)."
         )
     lines = path.read_text(encoding="utf-8").splitlines()
     total_lines = len(lines)

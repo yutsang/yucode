@@ -472,6 +472,7 @@ class ToolRegistry:
     def _builtin_tools(self) -> list[ToolDefinition]:
         from .agent_tool import agent_tools
         from .filesystem import filesystem_tools
+        from .memory_tools import memory_tools
         from .misc import misc_tools
         from .notebook import notebook_tools
         from .office import office_tools
@@ -486,6 +487,7 @@ class ToolRegistry:
         tools.extend(agent_tools(self))
         tools.extend(misc_tools(self))
         tools.extend(office_tools(self))
+        tools.extend(memory_tools(self))
         return tools
 
     def _wire_mcp_lifecycle_tools(self) -> None:
