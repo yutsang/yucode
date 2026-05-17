@@ -41,9 +41,16 @@ from coding_agent.tools.web import _duckduckgo_search, _relax_query, _web_search
 
 @pytest.fixture
 def workspace(tmp_path, monkeypatch):
+    """Same Windows-aware home redirect as test_memory_system.workspace."""
+    import os as _os
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    drive, path = _os.path.splitdrive(str(home))
+    if drive:
+        monkeypatch.setenv("HOMEDRIVE", drive)
+        monkeypatch.setenv("HOMEPATH", path or "\\")
     ws = tmp_path / "ws"
     ws.mkdir()
     return ws

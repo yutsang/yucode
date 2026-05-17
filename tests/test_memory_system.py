@@ -46,10 +46,19 @@ class _StubRegistry:
 
 @pytest.fixture
 def workspace(tmp_path, monkeypatch):
-    """Isolated workspace with HOME redirected so user-scope memory lands in tmp."""
+    """Isolated workspace with home-dir redirected so user-scope memory lands in tmp.
+
+    Sets HOME *and* USERPROFILE/HOMEDRIVE/HOMEPATH so Path.home() resolves
+    into tmp on every OS (Windows uses USERPROFILE, POSIX uses HOME)."""
+    import os as _os
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    drive, path = _os.path.splitdrive(str(home))
+    if drive:
+        monkeypatch.setenv("HOMEDRIVE", drive)
+        monkeypatch.setenv("HOMEPATH", path or "\\")
     workspace = tmp_path / "ws"
     workspace.mkdir()
     return workspace

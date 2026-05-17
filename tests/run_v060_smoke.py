@@ -19,6 +19,7 @@ or wherever you pass --out.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import sys
@@ -40,6 +41,38 @@ class CheckResult:
     detail: str = ""
     duration_s: float = 0.0
     events: list[str] = field(default_factory=list)
+
+
+@contextlib.contextmanager
+def _redirect_home(tmp: str):
+    """Point Path.home() at *tmp* on every OS.
+
+    Path.home() reads HOME on POSIX but USERPROFILE on Windows (with
+    HOMEDRIVE+HOMEPATH as a fallback). Setting just HOME silently fails
+    on Windows and tests start writing to the real user dir.
+    """
+    keys = ("HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH")
+    saved = {k: os.environ.get(k) for k in keys}
+    try:
+        os.environ["HOME"] = tmp
+        os.environ["USERPROFILE"] = tmp
+        # Split tmp into drive + path for HOMEDRIVE/HOMEPATH (Windows legacy)
+        drive, path = os.path.splitdrive(tmp)
+        if drive:
+            os.environ["HOMEDRIVE"] = drive
+            os.environ["HOMEPATH"] = path or "\\"
+        else:
+            # Non-Windows path; remove HOMEDRIVE/HOMEPATH to avoid confusing
+            # Path.home() if they were set in the parent env
+            os.environ.pop("HOMEDRIVE", None)
+            os.environ.pop("HOMEPATH", None)
+        yield
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 # ---- prompt #1 — time-sensitive grounding ----------------------------------
@@ -143,36 +176,29 @@ def check_03_memory_roundtrip(live: bool) -> CheckResult:
     started = time.monotonic()
     from coding_agent.memory.store import MemoryStore
 
-    with tempfile.TemporaryDirectory() as tmp:
-        # Redirect HOME so we don't pollute the real user-scope store
-        original_home = os.environ.get("HOME")
-        os.environ["HOME"] = tmp
-        try:
-            ws = Path(tmp) / "ws"
-            ws.mkdir()
-            store = MemoryStore(ws)
-            store.save("user-prefs", "Prefers Traditional Chinese, terse",
-                       "user", "Always answer 繁中, no preamble.", scope="user")
-            # Round-trip: fresh store, same workspace, must find it
-            store2 = MemoryStore(ws)
-            entry = store2.read("user-prefs", "user")
-            if not entry:
-                return CheckResult("03 memory round-trip", "FAIL",
-                                   "saved memory not retrievable from fresh MemoryStore",
-                                   time.monotonic() - started)
-            if "繁中" not in entry.body:
-                return CheckResult("03 memory round-trip", "FAIL",
-                                   f"body content mismatch: {entry.body[:80]}",
-                                   time.monotonic() - started)
-            # Index loaded into prompt text
-            idx = store2.load_indexes_text()
-            if "user-prefs" not in idx:
-                return CheckResult("03 memory round-trip", "FAIL",
-                                   f"prompt-loaded index missing entry: {idx[:200]}",
-                                   time.monotonic() - started)
-        finally:
-            if original_home is not None:
-                os.environ["HOME"] = original_home
+    with tempfile.TemporaryDirectory() as tmp, _redirect_home(tmp):
+        ws = Path(tmp) / "ws"
+        ws.mkdir()
+        store = MemoryStore(ws)
+        store.save("user-prefs", "Prefers Traditional Chinese, terse",
+                   "user", "Always answer 繁中, no preamble.", scope="user")
+        # Round-trip: fresh store, same workspace, must find it
+        store2 = MemoryStore(ws)
+        entry = store2.read("user-prefs", "user")
+        if not entry:
+            return CheckResult("03 memory round-trip", "FAIL",
+                               "saved memory not retrievable from fresh MemoryStore",
+                               time.monotonic() - started)
+        if "繁中" not in entry.body:
+            return CheckResult("03 memory round-trip", "FAIL",
+                               f"body content mismatch: {entry.body[:80]}",
+                               time.monotonic() - started)
+        # Index loaded into prompt text
+        idx = store2.load_indexes_text()
+        if "user-prefs" not in idx:
+            return CheckResult("03 memory round-trip", "FAIL",
+                               f"prompt-loaded index missing entry: {idx[:200]}",
+                               time.monotonic() - started)
 
     return CheckResult("03 memory round-trip", "PASS",
                        "save → fresh MemoryStore → read + index reload all OK",
@@ -189,40 +215,33 @@ def check_04_slash_commands(live: bool) -> CheckResult:
     )
     from coding_agent.memory.store import MemoryStore
 
-    with tempfile.TemporaryDirectory() as tmp:
-        original_home = os.environ.get("HOME")
-        os.environ["HOME"] = tmp
+    with tempfile.TemporaryDirectory() as tmp, _redirect_home(tmp):
+        ws = Path(tmp) / "ws"
+        ws.mkdir()
+        from io import StringIO
+        captured = StringIO()
+        real_stdout = sys.stdout
+        sys.stdout = captured
         try:
-            ws = Path(tmp) / "ws"
-            ws.mkdir()
-            # Capture printed output by redirecting stdout
-            from io import StringIO
-            captured = StringIO()
-            real_stdout = sys.stdout
-            sys.stdout = captured
-            try:
-                _handle_remember_command(ws, "-w project uses pnpm not npm")
-            finally:
-                sys.stdout = real_stdout
-            workspace_memories = MemoryStore(ws).list("workspace")
-            if not workspace_memories:
-                return CheckResult("04 /remember + /forget", "FAIL",
-                                   "memory not saved to workspace scope",
-                                   time.monotonic() - started)
-            name = workspace_memories[0].name
-            captured = StringIO()
-            sys.stdout = captured
-            try:
-                _handle_forget_command(ws, name)
-            finally:
-                sys.stdout = real_stdout
-            if MemoryStore(ws).list("workspace"):
-                return CheckResult("04 /remember + /forget", "FAIL",
-                                   "memory not deleted after /forget",
-                                   time.monotonic() - started)
+            _handle_remember_command(ws, "-w project uses pnpm not npm")
         finally:
-            if original_home is not None:
-                os.environ["HOME"] = original_home
+            sys.stdout = real_stdout
+        workspace_memories = MemoryStore(ws).list("workspace")
+        if not workspace_memories:
+            return CheckResult("04 /remember + /forget", "FAIL",
+                               "memory not saved to workspace scope",
+                               time.monotonic() - started)
+        name = workspace_memories[0].name
+        captured = StringIO()
+        sys.stdout = captured
+        try:
+            _handle_forget_command(ws, name)
+        finally:
+            sys.stdout = real_stdout
+        if MemoryStore(ws).list("workspace"):
+            return CheckResult("04 /remember + /forget", "FAIL",
+                               "memory not deleted after /forget",
+                               time.monotonic() - started)
 
     return CheckResult("04 /remember + /forget", "PASS",
                        "save → list → delete round-trip OK",
@@ -267,25 +286,19 @@ def check_06_init_memory(live: bool) -> CheckResult:
         gather_facts,
     )
 
-    with tempfile.TemporaryDirectory() as tmp:
-        original_home = os.environ.get("HOME")
-        os.environ["HOME"] = tmp
-        try:
-            facts = gather_facts()
-            if "os" not in facts:
-                return CheckResult("06 init-memory", "FAIL",
-                                   f"gather_facts() missing OS: {facts}",
-                                   time.monotonic() - started)
-            ws = Path(tmp) / "ws"
-            ws.mkdir()
-            entry, was_new = bootstrap_user_profile(ws)
-            if not was_new or entry.name != USER_PROFILE_NAME:
-                return CheckResult("06 init-memory", "FAIL",
-                                   f"bootstrap result unexpected: was_new={was_new}, name={entry.name}",
-                                   time.monotonic() - started)
-        finally:
-            if original_home is not None:
-                os.environ["HOME"] = original_home
+    with tempfile.TemporaryDirectory() as tmp, _redirect_home(tmp):
+        facts = gather_facts()
+        if "os" not in facts:
+            return CheckResult("06 init-memory", "FAIL",
+                               f"gather_facts() missing OS: {facts}",
+                               time.monotonic() - started)
+        ws = Path(tmp) / "ws"
+        ws.mkdir()
+        entry, was_new = bootstrap_user_profile(ws)
+        if not was_new or entry.name != USER_PROFILE_NAME:
+            return CheckResult("06 init-memory", "FAIL",
+                               f"bootstrap result unexpected: was_new={was_new}, name={entry.name}",
+                               time.monotonic() - started)
 
     return CheckResult("06 init-memory", "PASS",
                        "gather_facts() + bootstrap_user_profile() OK",
@@ -298,35 +311,29 @@ def check_07_staleness(live: bool) -> CheckResult:
     started = time.monotonic()
     from coding_agent.memory.store import STALE_DAYS_THRESHOLD, MemoryStore
 
-    with tempfile.TemporaryDirectory() as tmp:
-        original_home = os.environ.get("HOME")
-        os.environ["HOME"] = tmp
-        try:
-            ws = Path(tmp) / "ws"
-            ws.mkdir()
-            store = MemoryStore(ws)
-            store.save("fresh", "fresh entry", "user", "body", scope="user")
-            # Forge a stale entry
-            stale_path = store.root_for("user") / "stale.md"
-            stale_path.write_text(
-                "---\nname: stale\ndescription: ancient\n"
-                "saved_at: 2020-01-01\nmetadata:\n  type: project\n---\n\nbody\n",
-                encoding="utf-8",
-            )
-            text = store.load_indexes_text()
-            if "[stale: " not in text:
+    with tempfile.TemporaryDirectory() as tmp, _redirect_home(tmp):
+        ws = Path(tmp) / "ws"
+        ws.mkdir()
+        store = MemoryStore(ws)
+        store.save("fresh", "fresh entry", "user", "body", scope="user")
+        # Forge a stale entry
+        stale_path = store.root_for("user") / "stale.md"
+        stale_path.write_text(
+            "---\nname: stale\ndescription: ancient\n"
+            "saved_at: 2020-01-01\nmetadata:\n  type: project\n---\n\nbody\n",
+            encoding="utf-8",
+        )
+        text = store.load_indexes_text()
+        if "[stale: " not in text:
+            return CheckResult("07 staleness markers", "FAIL",
+                               f"no [stale: marker in index: {text[:300]}",
+                               time.monotonic() - started)
+        # Fresh entry must NOT have stale marker
+        for line in text.splitlines():
+            if line.startswith("- `fresh`") and "[stale" in line:
                 return CheckResult("07 staleness markers", "FAIL",
-                                   f"no [stale: marker in index: {text[:300]}",
+                                   f"fresh entry incorrectly marked stale: {line}",
                                    time.monotonic() - started)
-            # Fresh entry must NOT have stale marker
-            for line in text.splitlines():
-                if line.startswith("- `fresh`") and "[stale" in line:
-                    return CheckResult("07 staleness markers", "FAIL",
-                                       f"fresh entry incorrectly marked stale: {line}",
-                                       time.monotonic() - started)
-        finally:
-            if original_home is not None:
-                os.environ["HOME"] = original_home
 
     return CheckResult("07 staleness markers", "PASS",
                        f"stale > {STALE_DAYS_THRESHOLD}d entries marked; fresh entries untouched",
