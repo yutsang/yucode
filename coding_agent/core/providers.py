@@ -557,18 +557,29 @@ def _fix_json_control_chars(text: str) -> str:
 
 
 class _TextToolCallFilter:
-    """Buffers streaming text so ``<tool_call>`` / ``<function_call>`` blocks
-    are never forwarded to the ``assistant_delta`` callback.
+    """Buffers streaming text so ``<tool_call>`` / ``<function_call>`` /
+    ``<think>`` / ``<thinking>`` / ``<reasoning>`` blocks are never forwarded
+    to the ``assistant_delta`` callback.
 
     The full text (including tool-call blocks) is still accumulated in
     ``text_parts`` so that ``_extract_text_tool_calls`` can parse them at the
     end of the stream.  This filter only governs what reaches the terminal.
+
+    Thinking-style tags are stripped because users see them as noise — the
+    streaming display prefixes intermediate text with "💭" already, so a
+    leaked "<think>" tag produces "💭 <think>..." which is doubly confusing.
     """
 
-    _OPEN_TAGS: tuple[str, ...] = ("<tool_call>", "<function_call>")
+    _OPEN_TAGS: tuple[str, ...] = (
+        "<tool_call>", "<function_call>",
+        "<think>", "<thinking>", "<reasoning>",
+    )
     _CLOSE: dict[str, str] = {
         "<tool_call>": "</tool_call>",
         "<function_call>": "</function_call>",
+        "<think>": "</think>",
+        "<thinking>": "</thinking>",
+        "<reasoning>": "</reasoning>",
     }
     _MAX_OPEN_LEN: int = max(len(t) for t in _OPEN_TAGS)
 

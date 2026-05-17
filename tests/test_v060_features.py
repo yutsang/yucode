@@ -388,3 +388,70 @@ class TestWebSearchFallback:
             result = json.loads(_web_search({"query": "asdfqwerzxcv"}))
         assert result["results"] == []
         assert "hint" in result["_meta"]
+
+
+# ---- broken-JSON tool-call sanitizer + thinking-tag filter ------------------
+
+class TestSessionSafeArgs:
+    def test_safe_tool_args_passes_valid_json(self):
+        from coding_agent.core.session import _safe_tool_args
+        assert _safe_tool_args('{"path": "foo.py"}') == '{"path": "foo.py"}'
+
+    def test_safe_tool_args_replaces_truncated(self):
+        from coding_agent.core.session import _safe_tool_args
+        # Unterminated string — exactly the failure mode the user hit
+        result = _safe_tool_args('{"path": "unterminated')
+        assert result == "{}"
+
+    def test_safe_tool_args_replaces_empty(self):
+        from coding_agent.core.session import _safe_tool_args
+        assert _safe_tool_args("") == "{}"
+
+    def test_to_provider_message_sanitizes(self):
+        from coding_agent.core.session import Message, ToolCall
+        msg = Message(
+            role="assistant",
+            content="",
+            tool_calls=[ToolCall(id="1", name="list_directory", arguments='{"path": "broken')],
+        )
+        payload = msg.to_provider_message()
+        assert payload["tool_calls"][0]["function"]["arguments"] == "{}"
+
+
+class TestThinkingTagFilter:
+    def test_strips_think_tag(self):
+        from coding_agent.core.providers import _TextToolCallFilter
+        f = _TextToolCallFilter()
+        out = f.push("Hello <think>internal reasoning</think> world")
+        out += f.flush()
+        assert out == "Hello  world"
+
+    def test_strips_thinking_tag(self):
+        from coding_agent.core.providers import _TextToolCallFilter
+        f = _TextToolCallFilter()
+        out = f.push("<thinking>plan</thinking>Answer")
+        out += f.flush()
+        assert out == "Answer"
+
+    def test_strips_reasoning_tag(self):
+        from coding_agent.core.providers import _TextToolCallFilter
+        f = _TextToolCallFilter()
+        out = f.push("X<reasoning>why</reasoning>Y")
+        out += f.flush()
+        assert out == "XY"
+
+    def test_still_strips_tool_call(self):
+        from coding_agent.core.providers import _TextToolCallFilter
+        f = _TextToolCallFilter()
+        out = f.push("before <tool_call>{x:1}</tool_call> after")
+        out += f.flush()
+        assert out == "before  after"
+
+    def test_chunked_think_tag_across_pushes(self):
+        from coding_agent.core.providers import _TextToolCallFilter
+        f = _TextToolCallFilter()
+        out = f.push("hi <thin")  # partial open tag
+        out += f.push("king>secret</thinking> bye")
+        out += f.flush()
+        assert "secret" not in out
+        assert "hi" in out and "bye" in out

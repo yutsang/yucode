@@ -646,6 +646,7 @@ class _InteractiveEventHandler:
         self._in_coordinator: bool = False
         self._tool_calls_this_turn: bool = False  # any tool call in current turn
         self._text_buf: str = ""                  # buffered assistant text, pending flush
+        self._worker_label_prefix: str = ""       # set per worker for step-progress label
 
     def __call__(self, event: dict[str, Any]) -> None:
         etype = event.get("type", "")
@@ -665,7 +666,8 @@ class _InteractiveEventHandler:
             idx = event.get("task_index", 0) + 1
             total = event.get("total_tasks", 1)
             counter = f" {idx}/{total}" if total > 1 else ""
-            self._progress.set_thinking(f"Worker [{role}{counter}]: {task}")
+            self._worker_label_prefix = f"Worker [{role}{counter}]"
+            self._progress.set_thinking(f"{self._worker_label_prefix}: {task}")
         elif etype == "validation_result":
             self._progress.stop()
             passed = event.get("passed", False)
@@ -690,6 +692,12 @@ class _InteractiveEventHandler:
                 self._text_buf = ""
             if not self._in_coordinator:
                 self._progress.set_thinking("Thinking")
+            elif getattr(self, "_worker_label_prefix", None):
+                # Surface step progress inside a worker so the user can see the
+                # worker is alive and on which iteration, not a frozen spinner.
+                self._progress.set_thinking(
+                    f"{self._worker_label_prefix} — step {self._current_iteration}"
+                )
         elif etype == "tool_call":
             # Close any in-flight streamed text so the spinner has a clean line.
             self._stream.finalize()
@@ -756,6 +764,7 @@ class _InteractiveEventHandler:
             self._progress.stop()
             was_coordinator = self._in_coordinator
             self._in_coordinator = False
+            self._worker_label_prefix = ""
             # Flush buffered text — only present when no tool calls occurred this turn.
             if self._text_buf and not was_coordinator:
                 print(agent_label(), end="")

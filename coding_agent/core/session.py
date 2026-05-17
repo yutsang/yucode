@@ -20,6 +20,24 @@ class ToolCall:
     arguments: str
 
 
+def _safe_tool_args(raw: str) -> str:
+    """Return *raw* if it parses as JSON, else "{}".
+
+    Some models occasionally produce truncated or malformed JSON in tool_call
+    arguments. The provider gateway rejects the WHOLE request with Bad Request
+    when this happens, killing the turn. Replacing with "{}" lets the assistant
+    message replay safely; the model already received the parse error in the
+    tool_result and can retry with valid arguments on the next iteration.
+    """
+    if not raw:
+        return "{}"
+    try:
+        json.loads(raw)
+        return raw
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return "{}"
+
+
 @dataclass
 class Message:
     role: Role
@@ -36,7 +54,12 @@ class Message:
                     "type": "function",
                     "function": {
                         "name": tool_call.name,
-                        "arguments": tool_call.arguments,
+                        # Sanitize: providers reject the WHOLE request with
+                        # Bad Request when any tool_call has malformed JSON in
+                        # arguments. Replace with "{}" so the call replays as
+                        # a no-arg invocation; the model already saw the error
+                        # in the tool_result and can retry with valid args.
+                        "arguments": _safe_tool_args(tool_call.arguments),
                     },
                 }
                 for tool_call in self.tool_calls
