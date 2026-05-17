@@ -125,16 +125,32 @@ _BASH_SUCCESS_PHRASES = (
 # overlaps). Word-boundary anchored where applicable to avoid false positives.
 import re as _re_module  # noqa: E402 (top-level import already done; alias for clarity)
 
+# Strong markers — almost always time-sensitive
 _TIME_SENSITIVE_RE = _re_module.compile(
-    r"\b(?:latest|newest|most\s+recent|current(?:ly)?|currently|nowadays|"
-    r"today|tonight|this\s+(?:week|month|year|quarter)|as\s+of|right\s+now|"
-    r"upcoming|stock\s+price|share\s+price|exchange\s+rate|live\s+score|"
-    r"who\s+is\s+the\s+(?:current|new)|what\s+is\s+the\s+(?:current|latest))\b"
-    # Chinese / Japanese — no word boundaries (CJK doesn't have them)
-    r"|最新|现在|現在|今天|今日|今年|本年|本月|当前|當前|目前|"
+    r"\b(?:latest|newest|most\s+recent|nowadays|tonight|right\s+now|upcoming|"
+    r"stock\s+price|share\s+price|exchange\s+rate|live\s+score|"
+    r"this\s+(?:week|month|year|quarter|season))\b"
+    # Chinese / Japanese strong markers
+    r"|最新|今天|今日|今年|本年|本月|"
     r"近期|最近|實時|实时|即時|"
-    r"股價|股价|匯率|汇率|價格|价格|"
-    r"誰是|谁是|什麼.*目前|什么.*目前",
+    r"股價|股价|匯率|汇率",
+    _re_module.IGNORECASE,
+)
+
+# Weak markers — only count when followed by a noun that makes them temporal
+# (avoids false positives like "current directory", "current file", "current
+# state of the code"). The trailing \b is critical so "director" doesn't
+# match inside "directory" and "state" doesn't match inside "statement".
+_WEAK_TEMPORAL_RE = _re_module.compile(
+    r"\b(?:current|currently|today|as\s+of)\s+"
+    r"(?:version|release|stable|price|ceo|president|"
+    r"government|champion|winner|owner|head|leader|news)\b"
+    r"|\b(?:current|latest)\s+(?:prime\s+minister|chairman|governor)\b"
+    r"|現在.*(?:是|有什麼|有哪些|多少|誰|價|價格|匯率)"
+    r"|目前.*(?:是|有什麼|有哪些|多少|誰|價|價格|匯率)"
+    r"|當前.*(?:是|有什麼|有哪些|多少|誰|價|價格|匯率)"
+    r"|当前.*(?:是|有什么|有哪些|多少|谁|价|价格|汇率)"
+    r"|誰是|谁是",
     _re_module.IGNORECASE,
 )
 
@@ -143,7 +159,9 @@ def _is_time_sensitive_prompt(prompt: str) -> bool:
     """Return True if *prompt* asks about something likely to have changed since training."""
     if not prompt:
         return False
-    return bool(_TIME_SENSITIVE_RE.search(prompt))
+    if _TIME_SENSITIVE_RE.search(prompt):
+        return True
+    return bool(_WEAK_TEMPORAL_RE.search(prompt))
 
 
 def _check_final_answer_grounding(

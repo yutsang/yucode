@@ -637,8 +637,16 @@ class AdminCoordinator:
         """Run language-level ground-truth validators on the current workspace.
 
         Returns ``(passed, output)`` or ``None`` when no applicable validator is
-        present. Currently runs pytest if ``tests/`` contains test files; future
-        additions (cargo check, npm test, …) hang off the same return shape."""
+        present OR the validator itself failed to start (e.g. pytest not
+        installed). Currently runs pytest if ``tests/`` contains test files;
+        future additions (cargo check, npm test, …) hang off the same return
+        shape.
+
+        Critical: when pytest is missing (`No module named pytest`) we return
+        ``None`` (inconclusive), NOT (False, ...). Returning False would
+        trigger the coordinator retry loop on every turn until max-retries —
+        a real failure mode that wasted ~50 minutes on a Windows box that
+        didn't have pytest installed."""
         import subprocess
         tests_dir = self.workspace_root / "tests"
         has_pytest_dir = tests_dir.is_dir() and any(tests_dir.rglob("test_*.py"))
@@ -657,8 +665,20 @@ class AdminCoordinator:
             return False, "pytest exceeded 120s timeout"
         except FileNotFoundError:
             return None  # python not on PATH — skip rather than fail
-        passed = result.returncode == 0
         combined = (result.stdout + ("\n" + result.stderr if result.stderr else "")).strip()
+        # Distinguish "tests failed" from "pytest couldn't even start". The
+        # latter (missing module, missing python, missing pytest plugin) is
+        # NOT a verdict on the agent's work — skip rather than mark failed.
+        startup_failure_markers = (
+            "No module named pytest",
+            "no module named pytest",
+            "ModuleNotFoundError: No module named",
+            "command not found",
+            "pytest.ini exception",
+        )
+        if result.returncode != 0 and any(m in combined for m in startup_failure_markers):
+            return None
+        passed = result.returncode == 0
         # Keep only the tail so a flood of test output doesn't fill the validator prompt.
         if len(combined) > 4000:
             combined = "…(truncated)…\n" + combined[-4000:]

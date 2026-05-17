@@ -78,6 +78,16 @@ class TestTimeSensitiveDetector:
         "refactor this module",
         "where is the validator defined",
         "",
+        # Regression: these all contain "current"/"now"/"今天" but in non-temporal
+        # contexts — must NOT trigger web_search. (Real failure mode: a prompt
+        # 'Read any .xlsx file in the current directory' was flagged time-
+        # sensitive and the agent web_searched 'current date verification' ~50x.)
+        "Read any .xlsx file in the current directory and tell me what's in it",
+        "What's the current state of the code in this file?",
+        "現在我們需要實作這個函數",
+        "Is there a current file open in the editor?",
+        "Go to the current working directory and list contents",
+        "List the top-level files and directories in the current workspace",
     ])
     def test_skips_static_prompts(self, prompt):
         assert not _is_time_sensitive_prompt(prompt), f"should not flag: {prompt}"
