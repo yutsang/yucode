@@ -1,0 +1,38 @@
+========================================================================
+yucode v0.6.0 smoke test report
+generated: 2026-05-17T12:42:40
+mode:      OFFLINE (code paths only)
+summary:   10 pass, 0 fail, 0 skip
+========================================================================
+
+[✓ PASS] 01 time-sensitive detection (offline)  (78ms)
+    regex + grounding check fire as expected (use --live for end-to-end)
+
+[✓ PASS] 02 office routing  (8ms)
+    xlsx → inspect_excel_sheets / read_excel_sheet; pdf → read_pdf_text
+
+[✓ PASS] 03 memory round-trip  (1ms)
+    save → fresh MemoryStore → read + index reload all OK
+
+[✓ PASS] 04 /remember + /forget  (5ms)
+    save → list → delete round-trip OK
+
+[✓ PASS] 05 /init AGENTS.md  (21ms)
+    detect_profile + write_agents_md round-trip OK
+
+[✓ PASS] 06 init-memory  (23ms)
+    gather_facts() + bootstrap_user_profile() OK
+
+[✓ PASS] 07 staleness markers  (1ms)
+    stale > 30d entries marked; fresh entries untouched
+
+[✓ PASS] 08 web_search fallback  (16ms)
+    zero-hit → relaxed retry recovered ('latest news today')
+
+[✓ PASS] 09 coordinator memory access  (0ms)
+    RESEARCH has list/read/search; WORK has list/read only
+
+[✓ PASS] 10 negative regression  (1ms)
+    README.md + AGENTS.md read as plain text (no office routing)
+
+>>> all assertions passed.
