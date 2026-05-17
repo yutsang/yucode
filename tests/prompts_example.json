@@ -1,0 +1,30 @@
+[
+  {
+    "name": "Dragonair regression",
+    "prompt": "香港站市區預辦登機現在有哪些航空公司？",
+    "expect_tools": ["web_search"],
+    "forbid_text": ["港龍", "Dragonair"]
+  },
+  {
+    "name": "Latest Python version",
+    "prompt": "What is the latest stable Python version released?",
+    "expect_tools": ["web_search"],
+    "forbid_tools": ["bash"]
+  },
+  {
+    "name": "Read README plainly",
+    "prompt": "Read README.md and summarise it in one line.",
+    "expect_tools": ["read_file"],
+    "forbid_tools": ["read_excel_sheet", "image_read", "read_pdf_text"]
+  },
+  {
+    "name": "Unknown package — don't fabricate",
+    "prompt": "What version is the npm package 'fooglefnordium-quux-7'?",
+    "forbid_text": ["v1.", "version 1", "1.0", "2.0"]
+  },
+  {
+    "name": "Memory list",
+    "prompt": "Use the memory_list tool and tell me what memories you have.",
+    "expect_tools": ["memory_list"]
+  }
+]

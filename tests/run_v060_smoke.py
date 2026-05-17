@@ -165,6 +165,38 @@ def check_02_office_routing(live: bool) -> CheckResult:
                                    f"pdf error didn't suggest read_pdf_text: {exc}",
                                    time.monotonic() - started)
 
+    if live:
+        # Find any .xlsx in cwd to test end-to-end; skip cleanly if none
+        xlsx_candidates = list(REPO_ROOT.glob("*.xlsx")) + list(Path.cwd().glob("*.xlsx"))
+        xlsx_candidates = [p for p in xlsx_candidates if "~$" not in p.name]
+        if not xlsx_candidates:
+            return CheckResult("02 office routing (LIVE)", "SKIP",
+                               "no .xlsx in repo root or cwd to test against",
+                               time.monotonic() - started)
+        xlsx = xlsx_candidates[0]
+        prompt = f"Read {xlsx.name} and tell me what's in it"
+        result = _run_live_prompt(prompt, workspace=xlsx.parent)
+        if result["error"]:
+            return CheckResult("02 office routing (LIVE)", "FAIL",
+                               result["error"][:300], time.monotonic() - started)
+        tools = result["tool_names"]
+        used_excel_tool = any(
+            t in tools for t in ("inspect_excel_sheets", "read_excel_sheet",
+                                 "read_excel_preview", "excel_to_json", "list_excel_sheets")
+        )
+        events = [f"tools={tools}", f"file={xlsx.name}"]
+        if "bash" in tools and not used_excel_tool:
+            return CheckResult("02 office routing (LIVE)", "FAIL",
+                               "agent used bash on xlsx instead of dedicated tool",
+                               time.monotonic() - started, events=events)
+        if not used_excel_tool:
+            return CheckResult("02 office routing (LIVE)", "FAIL",
+                               f"no excel tool called: tools={tools}",
+                               time.monotonic() - started, events=events)
+        return CheckResult("02 office routing (LIVE)", "PASS",
+                           f"used {[t for t in tools if 'excel' in t]} on {xlsx.name}",
+                           time.monotonic() - started, events=events)
+
     return CheckResult("02 office routing", "PASS",
                        "xlsx → inspect_excel_sheets / read_excel_sheet; pdf → read_pdf_text",
                        time.monotonic() - started)
@@ -199,6 +231,29 @@ def check_03_memory_roundtrip(live: bool) -> CheckResult:
             return CheckResult("03 memory round-trip", "FAIL",
                                f"prompt-loaded index missing entry: {idx[:200]}",
                                time.monotonic() - started)
+
+        if live:
+            # End-to-end: ask the agent about the saved preference and
+            # assert it either reads the memory file or surfaces the fact.
+            result = _run_live_prompt(
+                "What memories do you have saved about me? List them.",
+                workspace=ws,
+            )
+            if result["error"]:
+                return CheckResult("03 memory round-trip (LIVE)", "FAIL",
+                                   result["error"][:300], time.monotonic() - started)
+            tools = result["tool_names"]
+            text = result["final_text"]
+            events = [f"tools={tools}", f"answer={text[:150]}…"]
+            used_memory_tool = any(t.startswith("memory_") for t in tools)
+            mentioned_pref = "user-prefs" in text or "繁中" in text or "terse" in text.lower()
+            if not used_memory_tool and not mentioned_pref:
+                return CheckResult("03 memory round-trip (LIVE)", "FAIL",
+                                   "agent neither called memory_* nor surfaced saved fact",
+                                   time.monotonic() - started, events=events)
+            return CheckResult("03 memory round-trip (LIVE)", "PASS",
+                               f"memory tool: {used_memory_tool}; mentioned fact: {mentioned_pref}",
+                               time.monotonic() - started, events=events)
 
     return CheckResult("03 memory round-trip", "PASS",
                        "save → fresh MemoryStore → read + index reload all OK",
@@ -373,6 +428,38 @@ def check_08_web_fallback(live: bool) -> CheckResult:
                            "no results returned after relaxed retry",
                            time.monotonic() - started)
 
+    if live:
+        # End-to-end negative test: the agent must NOT invent a version
+        # for a fictitious package.
+        prompt = "What's the npm package version of 'fooglefnordium-quux-7'?"
+        result = _run_live_prompt(prompt)
+        if result["error"]:
+            return CheckResult("08 web_search fallback (LIVE)", "FAIL",
+                               result["error"][:300], time.monotonic() - started)
+        text = result["final_text"].lower()
+        tools = result["tool_names"]
+        events = [f"tools={tools}", f"answer={result['final_text'][:160]}…"]
+        denial_markers = (
+            "not found", "could not", "doesn't exist", "does not exist",
+            "no such", "no result", "unable to find", "couldn't find",
+            "找不到", "不存在", "無法找到", "无法找到",
+        )
+        denied = any(m in text for m in denial_markers)
+        # Detect fabricated version strings like "v1.2", "1.0.0", "version 3"
+        import re as _re
+        fabricated = bool(_re.search(r"\bv?\d+\.\d+(?:\.\d+)?\b|\bversion\s+\d+", text))
+        if not denied and fabricated:
+            return CheckResult("08 web_search fallback (LIVE)", "FAIL",
+                               "agent fabricated a version instead of denying existence",
+                               time.monotonic() - started, events=events)
+        if "web_search" not in tools:
+            return CheckResult("08 web_search fallback (LIVE)", "FAIL",
+                               "agent did not call web_search for an unknown package",
+                               time.monotonic() - started, events=events)
+        return CheckResult("08 web_search fallback (LIVE)", "PASS",
+                           f"web_search called; denied={denied}, fabricated={fabricated}",
+                           time.monotonic() - started, events=events)
+
     return CheckResult("08 web_search fallback", "PASS",
                        f"zero-hit → relaxed retry recovered ({calls[1]!r})",
                        time.monotonic() - started)
@@ -438,6 +525,36 @@ def check_10_negative_regression(live: bool) -> CheckResult:
             return CheckResult("10 negative regression", "FAIL",
                                "AGENTS.md not read as text",
                                time.monotonic() - started)
+
+    if live:
+        # End-to-end: ask agent to read a markdown file; assert read_file
+        # (not office tools) was called.
+        readme = REPO_ROOT / "README.md"
+        if not readme.exists():
+            return CheckResult("10 negative regression (LIVE)", "SKIP",
+                               "no README.md in repo root",
+                               time.monotonic() - started)
+        result = _run_live_prompt("Read README.md and summarise it in one sentence.",
+                                  workspace=REPO_ROOT)
+        if result["error"]:
+            return CheckResult("10 negative regression (LIVE)", "FAIL",
+                               result["error"][:300], time.monotonic() - started)
+        tools = result["tool_names"]
+        events = [f"tools={tools}"]
+        office_tools = {"read_excel_sheet", "inspect_excel_sheets", "read_pdf_text",
+                        "read_word_text", "read_pptx", "image_read"}
+        wrongly_used = [t for t in tools if t in office_tools]
+        if wrongly_used:
+            return CheckResult("10 negative regression (LIVE)", "FAIL",
+                               f"plain .md routed to office tool: {wrongly_used}",
+                               time.monotonic() - started, events=events)
+        if "read_file" not in tools and "read_files" not in tools:
+            return CheckResult("10 negative regression (LIVE)", "FAIL",
+                               f"no read_file call for plain .md: {tools}",
+                               time.monotonic() - started, events=events)
+        return CheckResult("10 negative regression (LIVE)", "PASS",
+                           f"plain markdown routed correctly via {[t for t in tools if 'read' in t]}",
+                           time.monotonic() - started, events=events)
 
     return CheckResult("10 negative regression", "PASS",
                        "README.md + AGENTS.md read as plain text (no office routing)",
@@ -507,6 +624,88 @@ def write_report(results: list[CheckResult], out_path: Path, *, live: bool) -> N
     out_path.write_text("\n".join(lines), encoding="utf-8")
 
 
+# ---- custom prompts file ---------------------------------------------------
+
+def run_custom_prompts(path: Path) -> list[CheckResult]:
+    """Run prompts from a JSON file against the live agent.
+
+    Schema (a list of objects):
+      [
+        {
+          "name": "Optional short name (default: prompt prefix)",
+          "prompt": "What's the latest Python version?",
+          "expect_tools":  ["web_search"],          # all must be called
+          "forbid_tools":  ["bash"],                # none may be called
+          "expect_text":   ["python.org"],          # all must appear in final text
+          "forbid_text":   ["Dragonair", "港龍"],   # none may appear
+          "workspace":     "/path/to/run-from"      # optional; default: cwd
+        },
+        ...
+      ]
+
+    Every field except 'prompt' is optional. JSON / YAML both work if pyyaml
+    is installed; otherwise JSON only.
+    """
+    raw = path.read_text(encoding="utf-8")
+    spec: list[dict]
+    if path.suffix in (".yml", ".yaml"):
+        try:
+            import yaml  # type: ignore
+        except ImportError as exc:
+            raise SystemExit(f"YAML prompts file requires PyYAML: pip install pyyaml ({exc})")
+        spec = yaml.safe_load(raw) or []
+    else:
+        spec = json.loads(raw)
+    if not isinstance(spec, list):
+        raise SystemExit(f"Prompts file must contain a JSON/YAML list; got {type(spec).__name__}")
+
+    results: list[CheckResult] = []
+    for idx, entry in enumerate(spec, start=1):
+        if not isinstance(entry, dict) or "prompt" not in entry:
+            results.append(CheckResult(f"custom #{idx}", "FAIL",
+                                       "missing 'prompt' field in entry", 0.0))
+            continue
+        name = entry.get("name") or f"custom #{idx}: {entry['prompt'][:40]}"
+        results.append(_run_custom_prompt(name, entry))
+    return results
+
+
+def _run_custom_prompt(name: str, entry: dict) -> CheckResult:
+    started = time.monotonic()
+    workspace = Path(entry["workspace"]).resolve() if entry.get("workspace") else Path.cwd()
+    result = _run_live_prompt(str(entry["prompt"]), workspace=workspace)
+    elapsed = time.monotonic() - started
+
+    if result["error"]:
+        return CheckResult(name, "FAIL", f"provider error: {result['error'][:200]}", elapsed)
+
+    tools = result["tool_names"]
+    text = result["final_text"]
+    text_lower = text.lower()
+    failures: list[str] = []
+
+    for must in entry.get("expect_tools", []) or []:
+        if must not in tools:
+            failures.append(f"expected tool `{must}` not called (saw: {tools})")
+    for banned in entry.get("forbid_tools", []) or []:
+        if banned in tools:
+            failures.append(f"forbidden tool `{banned}` was called")
+    for must in entry.get("expect_text", []) or []:
+        if str(must).lower() not in text_lower:
+            failures.append(f"expected text `{must}` missing from answer")
+    for banned in entry.get("forbid_text", []) or []:
+        if str(banned).lower() in text_lower:
+            failures.append(f"forbidden text `{banned}` present in answer")
+
+    events = [f"tools={tools}", f"answer={text[:160]}…" if len(text) > 160 else f"answer={text}"]
+    if failures:
+        return CheckResult(name, "FAIL", "; ".join(failures), elapsed, events=events)
+    return CheckResult(name, "PASS",
+                       f"{len(entry.get('expect_tools', []) or [])} tools + "
+                       f"{len(entry.get('expect_text', []) or [])} text assertions passed",
+                       elapsed, events=events)
+
+
 # ---- main ------------------------------------------------------------------
 
 CHECKS = [
@@ -531,20 +730,42 @@ def main(argv: list[str] | None = None) -> int:
                         help="Output report path (default: tests/results.txt).")
     parser.add_argument("--only", type=int, nargs="*", default=None,
                         help="Run only specific check numbers (1..10). Default: run all.")
+    parser.add_argument("--prompts", type=str, default=None,
+                        help="Path to a JSON/YAML file of custom prompts to run against the "
+                             "live agent (implies --live). See run_custom_prompts() docstring "
+                             "for schema. Skips the 10 built-in checks unless --include-builtins.")
+    parser.add_argument("--include-builtins", action="store_true",
+                        help="When --prompts is given, ALSO run the 10 built-in checks.")
     args = parser.parse_args(argv)
 
+    if args.prompts:
+        args.live = True  # custom prompts are always live
+
     results: list[CheckResult] = []
-    for i, check in enumerate(CHECKS, start=1):
-        if args.only and i not in args.only:
-            continue
-        try:
-            r = check(args.live)
-        except Exception as exc:
-            r = CheckResult(check.__name__, "FAIL",
-                            f"unexpected exception: {exc}\n{traceback.format_exc()}")
-        results.append(r)
-        marker = {"PASS": "✓", "FAIL": "✗", "SKIP": "—"}.get(r.status, "?")
-        print(f"  [{marker}] {r.name}", file=sys.stderr)
+    run_builtins = (not args.prompts) or args.include_builtins
+    if run_builtins:
+        for i, check in enumerate(CHECKS, start=1):
+            if args.only and i not in args.only:
+                continue
+            try:
+                r = check(args.live)
+            except Exception as exc:
+                r = CheckResult(check.__name__, "FAIL",
+                                f"unexpected exception: {exc}\n{traceback.format_exc()}")
+            results.append(r)
+            marker = {"PASS": "✓", "FAIL": "✗", "SKIP": "—"}.get(r.status, "?")
+            print(f"  [{marker}] {r.name}", file=sys.stderr)
+
+    if args.prompts:
+        prompts_path = Path(args.prompts)
+        if not prompts_path.exists():
+            print(f"Error: prompts file not found: {prompts_path}", file=sys.stderr)
+            return 1
+        custom = run_custom_prompts(prompts_path)
+        for r in custom:
+            marker = {"PASS": "✓", "FAIL": "✗", "SKIP": "—"}.get(r.status, "?")
+            print(f"  [{marker}] {r.name}", file=sys.stderr)
+        results.extend(custom)
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
