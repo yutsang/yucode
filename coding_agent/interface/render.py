@@ -27,8 +27,40 @@ _ANSI_CSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
 def _visible_len(s: str) -> int:
-    """Return the number of visible (non-ANSI) characters in *s*."""
-    return len(_ANSI_CSI_RE.sub("", s))
+    """Return the number of visible terminal CELLS occupied by *s*.
+
+    Strips ANSI escapes, then counts CJK/wide chars as 2 cells so that
+    line-wrap math for the spinner display is correct in Chinese/Japanese
+    terminals. (The previous char-count version undercounted CJK lines by
+    roughly 2x, which made `_erase` move the cursor up too few rows and
+    produced visible spinner spam.)"""
+    import unicodedata
+    visible = _ANSI_CSI_RE.sub("", s)
+    width = 0
+    for ch in visible:
+        eaw = unicodedata.east_asian_width(ch)
+        width += 2 if eaw in ("W", "F") else 1
+    return width
+
+
+def _truncate_to_cells(s: str, max_cells: int) -> str:
+    """Truncate *s* so it occupies at most *max_cells* terminal cells.
+
+    Cell-aware companion to _visible_len; used when budgeting a single
+    display line so CJK-heavy labels don't wrap."""
+    import unicodedata
+    if max_cells <= 0:
+        return ""
+    used = 0
+    out: list[str] = []
+    for ch in s:
+        eaw = unicodedata.east_asian_width(ch)
+        w = 2 if eaw in ("W", "F") else 1
+        if used + w > max_cells:
+            break
+        used += w
+        out.append(ch)
+    return "".join(out)
 
 # ---- Windows console support ------------------------------------------------
 
@@ -311,9 +343,10 @@ class ProgressDisplay:
             if self._spinning and self._doing_label:
                 frame = _SPINNER_FRAMES[self._frame % len(_SPINNER_FRAMES)]
                 self._frame += 1
-                # Truncate label so the whole spinner line never wraps.
-                # 12 chars: 2 indent + 1 spinner + 1 space + 3 "..." + 5 ANSI margin
-                label = self._doing_label[:max(10, cols - 12)]
+                # Cell-aware truncation: CJK chars take 2 cells so a char-based
+                # truncation can still produce a line that wraps. Allocate
+                # ~10 cells for spinner prefix + ellipsis + safety margin.
+                label = _truncate_to_cells(self._doing_label, max(10, cols - 12))
                 lines.append(
                     f"  {THEME.spinner_active}{frame}{RESET} "
                     f"{DIM}{label}...{RESET}"
@@ -335,10 +368,14 @@ class ProgressDisplay:
 
     def _erase(self) -> None:
         if self._lines_on_screen > 0 and _IS_STDERR_TTY:
-            sys.stderr.write(
-                f"\x1b[{self._lines_on_screen}A"
-                f"\x1b[J"
-            )
+            # Per-line erase (move up + clear-entire-line) is more reliable
+            # than `\x1b[<N>A\x1b[J` on Windows Terminal, where the
+            # "clear-to-end-of-screen" sequence occasionally leaves residual
+            # text below the cursor and produces visible spinner spam.
+            parts = ["\r"]
+            for _ in range(self._lines_on_screen):
+                parts.append("\x1b[1A\x1b[2K")
+            sys.stderr.write("".join(parts))
             sys.stderr.flush()
         self._lines_on_screen = 0
 

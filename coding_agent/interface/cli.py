@@ -1220,6 +1220,17 @@ def _run_interactive(args: argparse.Namespace) -> int:
         if parsed.kind == InputKind.SLASH:
             _dispatch_slash_interactive(parsed, config, workspace, runtime)
             continue
+        # Visible confirmation of @file references so the user knows which
+        # files were attached as context (otherwise the resolution is silent).
+        if parsed.file_references:
+            for ref in parsed.file_references:
+                try:
+                    rel = ref.resolved.relative_to(workspace)
+                except ValueError:
+                    rel = ref.resolved
+                size = len(ref.content.encode("utf-8"))
+                size_str = f"{size // 1024}K" if size >= 1024 else f"{size}B"
+                print(f"  {DIM}📎 attached: {rel} ({size_str}){RESET}", file=sys.stderr)
         try:
             summary = runtime.orchestrate(parsed.effective_prompt, event_callback=handler)
             if not summary.final_text.strip() and summary.usage.total_tokens() == 0:
