@@ -1039,6 +1039,7 @@ _AT_HIDDEN = frozenset({"__pycache__", ".git", ".DS_Store", ".mypy_cache", ".ruf
 def _make_pt_session(workspace: Path) -> Any:
     from prompt_toolkit import PromptSession
     from prompt_toolkit.completion import Completer, Completion
+    from prompt_toolkit.filters import in_paste_mode
     from prompt_toolkit.history import FileHistory
     from prompt_toolkit.key_binding import KeyBindings
 
@@ -1079,7 +1080,7 @@ def _make_pt_session(workspace: Path) -> Any:
 
     kb = KeyBindings()
 
-    @kb.add("enter", eager=True)
+    @kb.add("enter", eager=True, filter=~in_paste_mode)
     def _enter_submit(event):
         buf = event.current_buffer
         if buf.complete_state:
@@ -1087,6 +1088,12 @@ def _make_pt_session(workspace: Path) -> Any:
             buf.complete_state = None
             return
         buf.validate_and_handle()
+
+    @kb.add("enter", filter=in_paste_mode)
+    def _enter_in_paste(event):
+        # During bracketed paste the terminal emits Enter for embedded newlines;
+        # those must be inserted, not submit the buffer.
+        event.current_buffer.insert_text("\n")
 
     @kb.add("escape", "enter")
     def _alt_enter_newline(event):
@@ -1107,6 +1114,7 @@ def _make_pt_session(workspace: Path) -> Any:
         completer=_YuCompleter(),
         complete_while_typing=False,
         multiline=True,
+        enable_open_in_editor=True,
         prompt_continuation=lambda width, line_number, wrap_count: " " * (width - 1) + "·",
         history=FileHistory(str(history_file)),
         key_bindings=kb,
