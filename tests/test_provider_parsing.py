@@ -325,6 +325,47 @@ class TestExtractRejectedParam:
         assert _extract_rejected_param(detail) == "temperature"
 
 
+class TestBodyOverrides:
+    """Per-call body_overrides (e.g. dynamic reasoning_effort) — applied after
+    extra_body so a per-turn classification wins over the static config default,
+    but still subject to omit_params like everything else in the body."""
+
+    def test_build_body_applies_overrides_after_extra_body(self):
+        provider = _make_provider(extra_body={"reasoning_effort": "medium"})
+        body = provider._build_body([], [], False, {"reasoning_effort": "high"})
+        assert body["reasoning_effort"] == "high"
+
+    def test_build_body_without_overrides_keeps_extra_body_value(self):
+        provider = _make_provider(extra_body={"reasoning_effort": "medium"})
+        body = provider._build_body([], [], False, None)
+        assert body["reasoning_effort"] == "medium"
+
+    def test_build_body_overrides_do_not_add_unrelated_keys(self):
+        provider = _make_provider()
+        body = provider._build_body([], [], False, {"reasoning_effort": "low"})
+        assert body["reasoning_effort"] == "low"
+        assert set(body.keys()) == {"model", "messages", "stream", "temperature", "reasoning_effort"}
+
+    def test_omit_params_still_applies_with_overrides_present(self):
+        provider = _make_provider(omit_params=["temperature"])
+        body = provider._build_body([], [], False, {"reasoning_effort": "high"})
+        assert "temperature" not in body
+        assert body["reasoning_effort"] == "high"
+
+    def test_complete_threads_body_overrides_to_request(self, monkeypatch):
+        provider = _make_provider(extra_body={"reasoning_effort": "medium"}, streaming_mode="no_stream")
+        seen_bodies: list[dict] = []
+
+        def fake_urlopen(request, timeout=90, context=None):
+            seen_bodies.append(json.loads(request.data.decode("utf-8")))
+            return _FakeHTTPResponse('{"choices":[{"message":{"content":"OK"}}],"usage":{}}')
+
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        resp = provider.complete([{"role": "user", "content": "hi"}], [], body_overrides={"reasoning_effort": "low"})
+        assert resp.text == "OK"
+        assert seen_bodies[0]["reasoning_effort"] == "low"
+
+
 class TestOmitParamsAndSelfHeal:
     """WI-1: static omit_params + 400-driven self-heal in _do_complete."""
 
@@ -644,7 +685,7 @@ class TestHybridFallback:
         )
         call_count = 0
 
-        def fake_do_complete(self, messages, tools, *, stream, stream_callback=None, cancel_event=None):
+        def fake_do_complete(self, messages, tools, *, stream, stream_callback=None, cancel_event=None, body_overrides=None):
             nonlocal call_count
             call_count += 1
             from coding_agent.core.session import AssistantResponse, Usage
@@ -671,7 +712,7 @@ class TestHybridFallback:
         )
         call_count = 0
 
-        def fake_do_complete(self, messages, tools, *, stream, stream_callback=None, cancel_event=None):
+        def fake_do_complete(self, messages, tools, *, stream, stream_callback=None, cancel_event=None, body_overrides=None):
             nonlocal call_count
             call_count += 1
             from coding_agent.core.session import AssistantResponse, Usage
@@ -694,7 +735,7 @@ class TestHybridFallback:
         )
         streams_used: list[bool] = []
 
-        def fake_do_complete(self, messages, tools, *, stream, stream_callback=None, cancel_event=None):
+        def fake_do_complete(self, messages, tools, *, stream, stream_callback=None, cancel_event=None, body_overrides=None):
             streams_used.append(stream)
             from coding_agent.core.session import AssistantResponse, Usage
             return AssistantResponse(text="non-stream", tool_calls=[], usage=Usage(input_tokens=1))
@@ -716,7 +757,7 @@ class TestHybridFallback:
         )
         call_count = 0
 
-        def fake_do_complete(self, messages, tools, *, stream, stream_callback=None, cancel_event=None):
+        def fake_do_complete(self, messages, tools, *, stream, stream_callback=None, cancel_event=None, body_overrides=None):
             nonlocal call_count
             call_count += 1
             from coding_agent.core.session import AssistantResponse, Usage
@@ -739,7 +780,7 @@ class TestHybridFallback:
         )
         call_count = 0
 
-        def fake_do_complete(self, messages, tools, *, stream, stream_callback=None, cancel_event=None):
+        def fake_do_complete(self, messages, tools, *, stream, stream_callback=None, cancel_event=None, body_overrides=None):
             nonlocal call_count
             call_count += 1
             from coding_agent.core.session import AssistantResponse, Usage

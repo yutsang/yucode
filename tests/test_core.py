@@ -271,6 +271,43 @@ def test_weak_tier_triggers_earlier_than_strong() -> None:
     assert not is_complex_prompt(prompt, intelligence_tier="strong")
 
 
+# --- classify_reasoning_effort ---
+
+@pytest.mark.parametrize("prompt", [
+    "Please check why kedro tells me Pipeline does not contain nodes named [...]",
+    "refactor the auth module to use JWT instead of session cookies",
+    "為什麼 X 不存在",
+    "幫我調查這個 kedro 錯誤",
+    "implement a rate limiter for the API across all endpoints",
+])
+def test_classify_reasoning_effort_high_for_complex_prompts(prompt: str) -> None:
+    from coding_agent.core.coordinator import classify_reasoning_effort
+    assert classify_reasoning_effort(prompt) == "high", f"Should be high: {prompt!r}"
+
+
+@pytest.mark.parametrize("prompt", ["hello", "hi there", "ls", "thanks!", "continue", ""])
+def test_classify_reasoning_effort_low_for_trivial_prompts(prompt: str) -> None:
+    from coding_agent.core.coordinator import classify_reasoning_effort
+    assert classify_reasoning_effort(prompt) == "low", f"Should be low: {prompt!r}"
+
+
+@pytest.mark.parametrize("prompt", [
+    "Summarize the changes in the last three commits for the release notes",
+    "Format this JSON blob to be more readable and consistent",
+])
+def test_classify_reasoning_effort_medium_for_ambiguous_prompts(prompt: str) -> None:
+    from coding_agent.core.coordinator import classify_reasoning_effort
+    assert classify_reasoning_effort(prompt) == "medium", f"Should be medium: {prompt!r}"
+
+
+def test_classify_reasoning_effort_weak_tier_triggers_high_earlier() -> None:
+    """Same underlying signal as is_complex_prompt — weak tier is more aggressive."""
+    from coding_agent.core.coordinator import classify_reasoning_effort
+    prompt = "find function foo bar baz qux"
+    assert classify_reasoning_effort(prompt, intelligence_tier="weak") == "high"
+    assert classify_reasoning_effort(prompt, intelligence_tier="strong") in ("low", "medium")
+
+
 def test_intelligence_tier_auto_detects_weak_models() -> None:
     from coding_agent.config.settings import resolve_intelligence_tier
     assert resolve_intelligence_tier("auto", "qwen3-32b") == "weak"

@@ -462,6 +462,16 @@ class AgentRuntime:
         observations = _ToolObservations()
         forced_retry_done = False
 
+        # Per-turn reasoning_effort: only touched if the provider config already
+        # opts in via extra_body.reasoning_effort (e.g. Workbench/GPT-5.5) —
+        # providers that don't understand the param are left untouched. Computed
+        # once per turn (not per iteration) since the whole turn is one task.
+        reasoning_effort_overrides: dict[str, Any] | None = None
+        if self.config.provider.extra_body.get("reasoning_effort"):
+            from .coordinator import classify_reasoning_effort
+            effort = classify_reasoning_effort(prompt, intelligence_tier=self.config.provider.resolved_tier())
+            reasoning_effort_overrides = {"reasoning_effort": effort}
+
         summary = TurnSummary(final_text="", iterations=0)
         for iteration in range(1, max_steps + 1):
             summary.iterations = iteration
@@ -491,6 +501,7 @@ class AgentRuntime:
                     self.tools.definitions_for_provider(),
                     stream_callback=event_callback,
                     cancel_event=self._cancel_event,
+                    body_overrides=reasoning_effort_overrides,
                 )
             except Exception as exc:
                 _log.error("Provider call failed: %s", exc)

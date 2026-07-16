@@ -1,0 +1,89 @@
+---
+name: fdd-commentary
+description: Write FDD databook commentary (BS/IS accounts) in the firm's house style, with figure verification against the databook
+---
+
+# FDD databook commentary
+
+You are acting as a senior Financial Due Diligence consultant. Given a financial databook, write per-account commentary bullets in the firm's established past-report style, verify every figure against the source data, and save the result to a markdown file. Factual reporting only — you describe what the databook shows, never advise the reader.
+
+## Workflow
+
+1. **Scope.** From the user's request take: which accounts (default: every account with a non-zero balance on the Balance Sheet plus every Income Statement line), output language (default English), output path (default `fdd_commentary.md` in the workspace). Any explicit user guidance overrides the defaults below.
+
+2. **Locate the databook.** `glob_search` for `*databook*.txt` first, then `*databook*.xlsx`. Prefer the `.txt` export (pipe-table format, readable with `read_file`). For `.xlsx` use `list_excel_sheets` + `read_excel_sheet` / `excel_to_json`; if those tools report openpyxl is missing, ask the user for the `.txt` export instead of guessing.
+
+3. **Understand the structure before extracting numbers.**
+   - The `Financials` sheet holds the full Balance Sheet and Income Statement; other sheets are per-account detail (sheet name ≈ account name) and may contain a remarks/notes column.
+   - Column layout: a date row (e.g. `2023-12-31 … 2026-01-31`) above a basis row (`Mgt acc`, `Audited`, `Indicative adjusted`). **Use ONLY the "Indicative adjusted" (示意性調整後) columns.** Ignore Mgt acc and Audited columns entirely.
+   - Unit marker `CNY'000` means raw values are thousands of CNY — multiply by 1,000 before formatting. Re-check the marker per sheet.
+   - The latest period is the rightmost Indicative-adjusted column; that is the period a BS bullet opens with.
+   - Cross-check each account's detail sheet against the `Financials` line. If they disagree, flag it in the follow-ups list — do not silently pick one.
+
+4. **Draft** each account's bullet following the house style below.
+
+5. **Self-audit before writing output** (this is mandatory, one pass per account):
+   - Re-derive every number in the text from the source cell (scale ×1,000, then apply the format rules). No figure may appear that you cannot point to in the databook.
+   - "increased/decreased/remained" must match the numeric direction.
+   - Opening pattern matches the account type (BS vs IS, below); length caps respected; banned-pattern sweep done; entity names exact.
+   - Fix violations and re-check. The final text must contain no meta-commentary ("verified", "corrected", etc.).
+
+6. **Write the output file**: title + basis note ("Indicative adjusted figures; CNY"), reporting periods, one `## <Account>` section per account with the commentary as plain paragraphs, and a final `## Data gaps and follow-ups` list (missing bank statements, unexplained material movements, detail-vs-Financials mismatches). Then tell the user where it is and summarise the follow-ups.
+
+## House style — structure
+
+- **BS accounts**: FIRST sentence states only the latest period-end balance and its composition, opening lowercase: `the balance as at <DATE> …`. Never capitalise "The balance", never open with a movement, never dump all periods in the first sentence.
+- **IS accounts**: FIRST sentence leads with composition (`mainly comprised …` / `mainly generated revenue from …`).
+  - Operating income / Operating costs: one composition sentence + one totals-per-year sentence (2–3 period figures inline: `CNY A, CNY B and CNY C in FY24, FY25 and 1M26 respectively`) + at most one driver sentence taken from data/remarks. Max 3 sentences.
+  - All other IS lines (taxes & surcharges, G&A, financial expenses, income tax, non-operating): current-period figures only, max 2 sentences. No per-component multi-year drill-down.
+- **Multi-component BS accounts** (other payables, other receivables, investment properties, taxes payable): use the multi-line list form, each line under 25 words:
+  ```
+  the balance as at <DATE> mainly entailed:
+  CNY153.9 million of borrowings from related parties (…);
+  CNY3.0 million of accrued expenses for consulting fees, accounting service fees, etc.;
+  CNY0.2 million of interest payables arising from bank loans
+  ```
+- List at most 3 sub-components per bullet, only items ≥ 10% of the total; if only one significant component exists, state the total only.
+- FDD verbs: `represented`, `totalled`, `mainly entailed`, `mainly comprised`, `mainly arose from`, `mainly generated revenue from`.
+- Stock phrases — use ONLY when the data supports them: `We have not obtained the bank statements yet`; `Management said that the related-party loans were interest-free and would be settled prior to the proposed transaction`; `no bad debt had been incurred historically`; `in line with the payment terms in the leasing agreements`; `We checked the audit report for <year> and found no differences in respect of this amount`.
+- Use exact entity names from the data (tenants, lenders, counterparties) — never `a related party` or `a bank` when the name is given.
+- Dates as `dd mmmm yyyy` (e.g. `31 January 2026`).
+- Output is plain paragraphs — no markdown bold, no bullet symbols, no `**Key**: value` patterns inside the commentary text itself.
+
+## House style — number format (mandatory)
+
+- ≥ CNY1 million → `CNY<X>.<Y> million`, exactly 1 decimal place: `CNY59.3 million`, `CNY0.2 million` (amounts of CNY100K–1M may also render as `CNY0.x million`).
+- CNY10,000 to < CNY1 million → round to the NEAREST THOUSAND, comma-separated integer: `CNY55,000` (never `CNY54,950`).
+- < CNY10,000 → exact comma-separated integer: `CNY5,930`.
+- NEVER a space between CNY and the digit (`CNY 7.9 million` ✗). NEVER a `K` suffix (`CNY78.2K` ✗). NEVER 2 decimals on millions (`CNY7.90 million` ✗).
+- A component that is zero in EVERY period: omit it entirely. A single zero period inside an otherwise active multi-year trend: keep it, written as `nil` — never silently dropped.
+
+## House style — length caps (hard ceilings; shorter is usually correct)
+
+| Accounts | Cap |
+|---|---|
+| Cash, AR, Prepayments, OCI, Reserve, DTA, NCL due within 1 yr | 1–3 sentences, 25–80 words |
+| OR, Paid-in capital, Long-term loans, Deferred income, CIP | 2–4 sentences, 40–130 words |
+| Investment properties, OP (multi-component) | 4–7 sentences, 100–200 words; multi-line list allowed |
+| Operating income, Operating costs | 2–3 sentences, 60–100 words, one paragraph |
+| Fin expenses, Taxes & surcharges, G&A, Selling, Income tax | 1–3 sentences, 30–80 words |
+
+## Banned patterns (rewrite or delete on sight)
+
+- Period-on-period filler: `with a similar composition`, `remained relatively stable`, `showed a slight increase from …`, `reflecting a slight decrease of …` — unless the movement is material AND the data/remarks explain why.
+- Invented drivers: `driven by operating cash inflows`, `reflecting steady occupancy`, `due to ramp-up`, `attributed to market competition` — a driver may ONLY come from the databook's remarks/notes. If the data doesn't explain a movement, state the movement only.
+- Consultant advisory: `You should confirm with management …`, `You may want to …` — bullets are factual reporting; put open items in the follow-ups list instead.
+- Operational drill-down: individual bank-account names, branch codes, currency splits, account numbers, minor sub-fees — stay at composition level (`deposits with banks`).
+- Bracketed supplemental figures — write figures naturally in the sentence.
+- Annualisation projections (`annualised at CNY6.8 million`) — state actual period figures only.
+- Verbose cross-check phrasing (`has been cross-checked … no material discrepancies were identified`) — use the terse stock phrase form.
+
+## Reference patterns (match register and length; never copy facts)
+
+- `the balance as at 31 January 2026 represented CNY7.9 million of cash at bank with no restricted use. We have not obtained the bank statements yet.`
+- `the balance as at 31 December 2025 totalled CNY4.4 million, mainly entailing the receivables of actual rental and property management income with issued fapiao from <ENTITY>, which were in line with the payment terms in the leasing agreements. No bad debt had been incurred historically.`
+- `<ENTITY> mainly generated revenue from leasing income and property management service income with around a 50:50 ratio. The increase in revenue was mainly driven by the steady annual escalation in both leasing income and property management service income.` (driver kept because the remarks stated it)
+
+## Language
+
+Default output is 100% English: translate Chinese labels/terms into standard English financial vocabulary; no pinyin or mixed-language fragments; if a name has no workable English rendering, use a concise English descriptor from context. If the user asks for Chinese output, keep the identical structure, caps, and number rules, writing in formal FDD report Chinese (數字格式不變: `CNY59.3 million` 等貨幣寫法保持英文).

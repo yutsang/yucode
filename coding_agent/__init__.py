@@ -9,6 +9,15 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10 fallback
 
 
 def _read_repo_version() -> str:
+    # Installed (pip install ., editable or not) — the normal case once
+    # published to a user's machine. pyproject.toml isn't shipped inside the
+    # wheel, so this must come first; the file-based lookup below only ever
+    # succeeds when running from an unbuilt source checkout.
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+        return version("yucode-agent")
+    except (ImportError, PackageNotFoundError):
+        pass
     pyproject_path = Path(__file__).resolve().parent.parent / "pyproject.toml"
     if pyproject_path.is_file():
         data = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))

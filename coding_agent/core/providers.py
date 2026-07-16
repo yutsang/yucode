@@ -189,11 +189,13 @@ class OpenAICompatibleProvider:
         stream_callback: StreamCallback | None = None,
         *,
         cancel_event: threading.Event | None = None,
+        body_overrides: dict[str, Any] | None = None,
     ) -> AssistantResponse:
         use_stream = self.config.streaming_mode != "no_stream"
         response = self._do_complete(
             messages, tools, stream=use_stream,
             stream_callback=stream_callback, cancel_event=cancel_event,
+            body_overrides=body_overrides,
         )
 
         if (
@@ -211,11 +213,18 @@ class OpenAICompatibleProvider:
             response = self._do_complete(
                 messages, tools, stream=False,
                 stream_callback=stream_callback, cancel_event=cancel_event,
+                body_overrides=body_overrides,
             )
 
         return response
 
-    def _build_body(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]], stream: bool) -> dict[str, Any]:
+    def _build_body(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        stream: bool,
+        body_overrides: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "model": self.config.model,
             "messages": messages,
@@ -229,6 +238,8 @@ class OpenAICompatibleProvider:
             body["tool_choice"] = "auto"
         if self.config.extra_body:
             body.update(self.config.extra_body)
+        if body_overrides:
+            body.update(body_overrides)
         for renamed_from, renamed_to in self._learned_renames.items():
             if renamed_from in body:
                 body[renamed_to] = body.pop(renamed_from)
@@ -269,8 +280,9 @@ class OpenAICompatibleProvider:
         stream: bool,
         stream_callback: StreamCallback | None = None,
         cancel_event: threading.Event | None = None,
+        body_overrides: dict[str, Any] | None = None,
     ) -> AssistantResponse:
-        body = self._build_body(messages, tools, stream)
+        body = self._build_body(messages, tools, stream, body_overrides)
         url = self._build_url()
         headers = self._headers(stream=stream)
         context = self._ssl_context()

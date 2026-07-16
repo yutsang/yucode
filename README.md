@@ -13,6 +13,17 @@ pip install .             # standard install
 
 After installation the `yucode` command is available system-wide.
 
+**Windows note:** `[project.scripts]` (the `yucode` command) makes `pip` generate a
+tiny native launcher stub — `yucode.exe` in your Python `Scripts\` folder — since
+Windows has no shebang-line mechanism. It's not a compiled build of the project;
+`coding_agent/` stays pure `.py` files in site-packages either way. On a locked-down
+machine where any newly-created `.exe` gets flagged by security tooling, skip this
+entirely: don't `pip install` the package at all, only its dependencies
+(`pip install prompt_toolkit`, plus `tomli` on Python <3.11), then always invoke
+via `python -m coding_agent.interface.cli <command>` from the repo root — this
+never creates an executable of any kind. Already installed and want the exe gone?
+`pip uninstall yucode-agent` removes it along with the package.
+
 ## Methodology
 
 YuCode is built around the idea that a coding agent should not be a single monolithic ReAct loop. Real engineering tasks alternate between *understanding*, *changing*, and *verifying*, and each of those phases benefits from a different tool surface, a different prompt frame, and a different stopping rule. YuCode formalises that intuition into an **adaptive orchestration runtime** that can collapse to a single agent for trivial tasks and expand into a phased worker pool for complex ones -- without the caller having to choose.

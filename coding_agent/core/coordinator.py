@@ -251,6 +251,32 @@ def is_complex_prompt(prompt: str, intelligence_tier: str = "strong") -> bool:
     return False
 
 
+# Prompts at or under this length, once is_complex_prompt has already ruled
+# out complexity/investigation signals, are treated as trivial (greetings,
+# one-line lookups) rather than the ambiguous middle ground.
+_TRIVIAL_WORD_COUNT = 8
+
+
+def classify_reasoning_effort(prompt: str, intelligence_tier: str = "strong") -> str:
+    """Map a user prompt to a reasoning_effort level for reasoning-model gateways.
+
+    Reuses is_complex_prompt's coding-agent-tuned signals (refactor/implement/
+    investigate keywords, multi-file references, "why"/"how" question forms)
+    rather than a generic length heuristic, since those are what actually
+    distinguish a hard coding task from an easy one. Deliberately asymmetric:
+    under-reasoning on a hard task produces a worse answer, while
+    over-reasoning on an easy one only costs time — so "high" fires on any
+    complexity signal, and "low" only fires when no such signal is present
+    AND the prompt is short enough to be a trivial lookup/greeting. Everything
+    else defaults to "medium".
+    """
+    if is_complex_prompt(prompt, intelligence_tier=intelligence_tier):
+        return "high"
+    if len(prompt.split()) <= _TRIVIAL_WORD_COUNT:
+        return "low"
+    return "medium"
+
+
 class AdminCoordinator:
     """Orchestrates research/work/validate phases with retry."""
 

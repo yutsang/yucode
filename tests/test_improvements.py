@@ -368,3 +368,51 @@ class TestToolObservationRecording:
 def test_bash_success_phrases_nonempty():
     assert len(_BASH_SUCCESS_PHRASES) > 0
     assert "tests passed" in _BASH_SUCCESS_PHRASES
+
+
+# ---------------------------------------------------------------------------
+# Per-turn reasoning_effort (Workbench/GPT-5.5): opt-in via extra_body,
+# classified once per turn from the user prompt, not touched for providers
+# that never configured reasoning_effort in the first place.
+# ---------------------------------------------------------------------------
+
+class TestPerTurnReasoningEffort:
+    def _make_runtime(self, workspace: Path, extra_body: dict):
+        from coding_agent.core.runtime import AgentRuntime
+        config = AppConfig(
+            provider=ProviderConfig(
+                name="test", api_key="k", model="gpt-test", intelligence_tier="strong",
+                extra_body=extra_body,
+            ),
+            runtime=RuntimeOptions(permission_mode="danger-full-access"),
+        )
+        return AgentRuntime(workspace, config)
+
+    def _capture_body_overrides(self, runtime, monkeypatch) -> dict:
+        captured: dict = {}
+
+        def fake_complete(self, messages, tools, stream_callback=None, *, cancel_event=None, body_overrides=None):
+            captured["body_overrides"] = body_overrides
+            from coding_agent.core.session import AssistantResponse, Usage
+            return AssistantResponse(text="done", tool_calls=[], usage=Usage(input_tokens=1, output_tokens=1))
+
+        monkeypatch.setattr(type(runtime.provider), "complete", fake_complete)
+        return captured
+
+    def test_no_override_when_provider_has_not_opted_in(self, workspace: Path, monkeypatch):
+        runtime = self._make_runtime(workspace, extra_body={})
+        captured = self._capture_body_overrides(runtime, monkeypatch)
+        runtime.run_turn("refactor the auth module to use JWT")
+        assert captured["body_overrides"] is None
+
+    def test_low_effort_for_trivial_prompt_when_opted_in(self, workspace: Path, monkeypatch):
+        runtime = self._make_runtime(workspace, extra_body={"reasoning_effort": "medium"})
+        captured = self._capture_body_overrides(runtime, monkeypatch)
+        runtime.run_turn("hi")
+        assert captured["body_overrides"] == {"reasoning_effort": "low"}
+
+    def test_high_effort_for_complex_prompt_when_opted_in(self, workspace: Path, monkeypatch):
+        runtime = self._make_runtime(workspace, extra_body={"reasoning_effort": "medium"})
+        captured = self._capture_body_overrides(runtime, monkeypatch)
+        runtime.run_turn("refactor the auth module to use JWT instead of session cookies")
+        assert captured["body_overrides"] == {"reasoning_effort": "high"}
