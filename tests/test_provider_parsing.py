@@ -28,6 +28,7 @@ from coding_agent.core.providers import (
     OpenAICompatibleProvider,
     _extract_content_text,
     _extract_envelope_detail,
+    _extract_rejected_param,
     _extract_usage,
     _looks_like_openai_response,
     _merge_usage_max,
@@ -185,6 +186,55 @@ class TestBuildUrl:
         )
         assert provider._build_url() == "https://gateway.example.com/custom/chat"
 
+    def test_api_version_builds_azure_deployment_url(self):
+        provider = _make_provider(
+            base_url="https://api.workbench.kpmg/genai/azure/openai",
+            model="gpt-5-5-2026-04-24-gs-sdc",
+            api_version="2024-12-01-preview",
+        )
+        assert provider._build_url() == (
+            "https://api.workbench.kpmg/genai/azure/openai"
+            "/deployments/gpt-5-5-2026-04-24-gs-sdc/chat/completions"
+            "?api-version=2024-12-01-preview"
+        )
+
+    def test_api_version_overrides_chat_path(self):
+        provider = _make_provider(
+            base_url="https://api.workbench.kpmg/genai/azure/openai",
+            model="gpt-5-5",
+            api_version="2024-12-01-preview",
+            chat_path="/some/other/path",
+            append_chat_path=True,
+        )
+        assert "/some/other/path" not in provider._build_url()
+        assert provider._build_url().startswith(
+            "https://api.workbench.kpmg/genai/azure/openai/deployments/gpt-5-5/chat/completions"
+        )
+
+
+class TestHeaders:
+    def test_default_uses_bearer_auth(self):
+        provider = _make_provider(api_key="secret")
+        headers = provider._headers(stream=False)
+        assert headers["Authorization"] == "Bearer secret"
+        assert "api-key" not in headers
+
+    def test_api_version_uses_api_key_header_not_bearer(self):
+        provider = _make_provider(api_key="secret", api_version="2024-12-01-preview")
+        headers = provider._headers(stream=False)
+        assert headers["api-key"] == "secret"
+        assert "Authorization" not in headers
+
+    def test_extra_headers_still_applied_with_api_version(self):
+        provider = _make_provider(
+            api_key="secret",
+            api_version="2024-12-01-preview",
+            extra_headers={"Ocp-Apim-Subscription-Key": "secret", "x-kpmg-charge-code": "0000"},
+        )
+        headers = provider._headers(stream=False)
+        assert headers["Ocp-Apim-Subscription-Key"] == "secret"
+        assert headers["x-kpmg-charge-code"] == "0000"
+
 
 class _FakeHTTPResponse:
     def __init__(self, body: str, *, content_type: str = "application/json", status: int = 200):
@@ -243,6 +293,143 @@ class TestTlsVerification:
         monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
         with pytest.raises(ProviderError, match="provider.verify_tls: false"):
             provider._do_complete([{"role": "user", "content": "hi"}], [], stream=False)
+
+
+def _http_error(code: int, payload: dict[str, Any]) -> urllib.error.HTTPError:
+    body = json.dumps(payload).encode("utf-8")
+    return urllib.error.HTTPError(
+        url="https://example.com", code=code, msg="Bad Request",
+        hdrs=None, fp=io.BytesIO(body),
+    )
+
+
+class TestExtractRejectedParam:
+    def test_structured_error_param_field(self):
+        detail = json.dumps({"error": {"message": "nope", "param": "temperature"}})
+        assert _extract_rejected_param(detail) == "temperature"
+
+    def test_prose_unsupported_parameter(self):
+        detail = json.dumps({"error": {"message": "Unsupported parameter: 'top_p' is not supported with this model."}})
+        assert _extract_rejected_param(detail) == "top_p"
+
+    def test_prose_is_not_supported(self):
+        detail = json.dumps({"error": {"message": "'frequency_penalty' is not supported for this model."}})
+        assert _extract_rejected_param(detail) == "frequency_penalty"
+
+    def test_no_match_returns_empty(self):
+        detail = json.dumps({"error": {"message": "invalid api key"}})
+        assert _extract_rejected_param(detail) == ""
+
+    def test_non_json_body_falls_back_to_regex(self):
+        detail = "Unsupported parameter: 'temperature' is not supported with this model."
+        assert _extract_rejected_param(detail) == "temperature"
+
+
+class TestOmitParamsAndSelfHeal:
+    """WI-1: static omit_params + 400-driven self-heal in _do_complete."""
+
+    def test_omit_params_removes_key_from_body(self, monkeypatch):
+        provider = _make_provider(omit_params=["temperature"])
+        seen_bodies: list[dict] = []
+
+        def fake_urlopen(request, timeout=90, context=None):
+            seen_bodies.append(json.loads(request.data.decode("utf-8")))
+            return _FakeHTTPResponse('{"choices":[{"message":{"content":"OK"}}],"usage":{}}')
+
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        resp = provider._do_complete([{"role": "user", "content": "hi"}], [], stream=False)
+        assert resp.text == "OK"
+        assert "temperature" not in seen_bodies[0]
+
+    def test_400_with_param_retries_without_it_and_succeeds(self, monkeypatch):
+        provider = _make_provider()
+        calls: list[dict] = []
+
+        def fake_urlopen(request, timeout=90, context=None):
+            body = json.loads(request.data.decode("utf-8"))
+            calls.append(body)
+            if len(calls) == 1:
+                assert "temperature" in body
+                raise _http_error(400, {"error": {"message": "bad param", "param": "temperature"}})
+            return _FakeHTTPResponse('{"choices":[{"message":{"content":"OK"}}],"usage":{}}')
+
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        resp = provider._do_complete([{"role": "user", "content": "hi"}], [], stream=False)
+        assert resp.text == "OK"
+        assert len(calls) == 2
+        assert "temperature" not in calls[1]
+
+    def test_learned_omission_applies_to_later_call_without_retry(self, monkeypatch):
+        provider = _make_provider()
+        calls: list[dict] = []
+
+        def fake_urlopen_first_turn(request, timeout=90, context=None):
+            body = json.loads(request.data.decode("utf-8"))
+            calls.append(body)
+            if len(calls) == 1:
+                raise _http_error(400, {"error": {"message": "bad param", "param": "temperature"}})
+            return _FakeHTTPResponse('{"choices":[{"message":{"content":"OK"}}],"usage":{}}')
+
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen_first_turn)
+        provider._do_complete([{"role": "user", "content": "hi"}], [], stream=False)
+        assert len(calls) == 2  # one 400 + one corrected retry
+
+        def fake_urlopen_second_turn(request, timeout=90, context=None):
+            body = json.loads(request.data.decode("utf-8"))
+            calls.append(body)
+            return _FakeHTTPResponse('{"choices":[{"message":{"content":"OK2"}}],"usage":{}}')
+
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen_second_turn)
+        resp2 = provider._do_complete([{"role": "user", "content": "again"}], [], stream=False)
+        assert resp2.text == "OK2"
+        assert len(calls) == 3  # no 400 needed this time — learned omission applied up front
+        assert "temperature" not in calls[-1]
+
+    def test_max_tokens_rejection_renames_to_max_completion_tokens(self, monkeypatch):
+        provider = _make_provider(extra_body={"max_tokens": 500})
+        calls: list[dict] = []
+
+        def fake_urlopen(request, timeout=90, context=None):
+            body = json.loads(request.data.decode("utf-8"))
+            calls.append(body)
+            if len(calls) == 1:
+                assert body.get("max_tokens") == 500
+                raise _http_error(400, {"error": {"message": "bad", "param": "max_tokens"}})
+            return _FakeHTTPResponse('{"choices":[{"message":{"content":"OK"}}],"usage":{}}')
+
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        resp = provider._do_complete([{"role": "user", "content": "hi"}], [], stream=False)
+        assert resp.text == "OK"
+        assert len(calls) == 2
+        assert "max_tokens" not in calls[1]
+        assert calls[1].get("max_completion_tokens") == 500
+
+    def test_non_param_400_still_raises_provider_error(self, monkeypatch):
+        provider = _make_provider()
+
+        def fake_urlopen(request, timeout=90, context=None):
+            raise _http_error(400, {"error": {"message": "invalid api key"}})
+
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        with pytest.raises(ProviderError, match="invalid api key"):
+            provider._do_complete([{"role": "user", "content": "hi"}], [], stream=False)
+
+    def test_self_heal_gives_up_after_max_rounds(self, monkeypatch):
+        provider = _make_provider(extra_body={"a": 1, "b": 2, "c": 3, "d": 4, "e": 5})
+        calls: list[dict] = []
+        rejection_order = ["a", "b", "c", "d", "e"]
+
+        def fake_urlopen(request, timeout=90, context=None):
+            body = json.loads(request.data.decode("utf-8"))
+            calls.append(body)
+            param = rejection_order[len(calls) - 1]
+            raise _http_error(400, {"error": {"message": "bad", "param": param}})
+
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        with pytest.raises(ProviderError):
+            provider._do_complete([{"role": "user", "content": "hi"}], [], stream=False)
+        # 4 self-heal rounds + the final failing call that exhausts the budget.
+        assert len(calls) == 5
 
 
 class TestParseResponsePayload:

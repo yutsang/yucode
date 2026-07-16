@@ -20,6 +20,29 @@ def test_version_matches_repo() -> None:
     assert __version__ == "0.6.0"
 
 
+def test_pyproject_declares_tomli_for_python_310() -> None:
+    """coding_agent/__init__.py does `import tomli as tomllib` when the
+    stdlib tomllib (3.11+) isn't available. Without a declared dependency,
+    a genuinely clean `pip install` on Python 3.10 (e.g. a fresh company-PC
+    venv) crashes on the first `import coding_agent` — this only stays
+    invisible in dev environments where some *other* tool (black/pytest/
+    mypy/build) happens to pull tomli in transitively. Regression test for
+    that exact bug (found via WI-6's offline-install verification)."""
+    try:
+        import tomllib as _toml
+    except ModuleNotFoundError:
+        import tomli as _toml  # type: ignore[no-redef]
+
+    pyproject_path = Path(__file__).resolve().parent.parent / "pyproject.toml"
+    data = _toml.loads(pyproject_path.read_text(encoding="utf-8"))
+    deps = data["project"]["dependencies"]
+    tomli_deps = [d for d in deps if d.strip().lower().startswith("tomli")]
+    assert tomli_deps, "pyproject.toml must declare a tomli dependency for Python <3.11"
+    assert "python_version" in tomli_deps[0] and "3.11" in tomli_deps[0], (
+        f"tomli dependency should be conditioned on python_version < '3.11', got: {tomli_deps[0]!r}"
+    )
+
+
 def test_env_api_key_takes_priority() -> None:
     previous = os.environ.get("YUCODE_API_KEY")
     os.environ["YUCODE_API_KEY"] = "env-secret"

@@ -1,0 +1,36 @@
+# yucode provider config for the KPMG Workbench gateway (GPT-5.5 / GPT-5.4).
+#
+# Copy this file to:
+#   Windows:      %USERPROFILE%\.yucode\settings.yml
+#   Mac / Linux:  ~/.yucode/settings.yml
+#
+# Then fill in every value marked FILL-ME. Never commit this file with real
+# values — it is not tracked once filled in (keep it under your user home
+# directory, not inside a git-tracked project folder).
+#
+# Background / verified gateway facts / on-site checklist: see
+# WORKBENCH_PLAN.md at the repo root.
+
+provider:
+  name: workbench
+  type: openai_compatible
+  base_url: "https://api.workbench.kpmg/genai/azure/openai"
+  api_version: "2024-12-01-preview"   # builds .../deployments/{model}/chat/completions?api-version=...
+  model: "gpt-5-5-2026-04-24-gs-sdc"  # GPT-5.5. Alternate: gpt-5-4-2026-03-05-gs-sdc (GPT-5.4)
+  api_key: "FILL-ME"                  # subscription key; sent as the `api-key` header
+  verify_tls: false                   # corporate TLS interception — required, not optional
+  streaming_mode: no_stream           # revisit after running the WI-4 streaming probe on-site
+  request_timeout_seconds: 300        # reasoning models routinely exceed the 90s default
+  omit_params:
+    - temperature                     # this model only allows temperature=1 (its default)
+  extra_headers:
+    Ocp-Apim-Subscription-Key: "FILL-ME"   # same value as api_key above
+    x-kpmg-charge-code: "FILL-ME"          # e.g. "0000"
+    x-kpmg-region-override: "westeurope"
+  extra_body:
+    reasoning_effort: "medium"        # "high" | "medium" | "low" — raise for harder tasks
+
+runtime:
+  orchestration_mode: single          # single-agent loop; GPT-5.5 is strong-tier, doesn't need
+                                       # the multi-phase coordinator, and this keeps billable
+                                       # gateway calls predictable (charge-code!)

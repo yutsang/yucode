@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from coding_agent.observability.metrics import AuditLogger, MetricsCollector
 from coding_agent.security.bash_validation import (
     CommandIntent,
@@ -58,6 +60,95 @@ def test_audit_logger_writes_jsonl(tmp_path: Path, monkeypatch) -> None:
     assert "secret_redacted" in content
 
 
+# --- MetricsCollector.record_tool_audit: bash/write/edit -> persisted audit log ---
+
+
+def _audit_entries(tmp_path: Path, fake_state: Path, monkeypatch) -> "MetricsCollector":
+    import json as _json
+
+    monkeypatch.setattr(
+        "coding_agent.config.settings.state_dir",
+        lambda _ws: fake_state,
+    )
+    return MetricsCollector(audit_logger=AuditLogger(tmp_path, enabled=True))
+
+
+def _read_jsonl(fake_state: Path) -> list[dict]:
+    import json as _json
+
+    files = sorted((fake_state / "audit").glob("*.jsonl"))
+    assert len(files) == 1
+    return [_json.loads(line) for line in files[0].read_text(encoding="utf-8").splitlines()]
+
+
+def test_record_tool_audit_logs_bash_command_and_returncode(tmp_path: Path, monkeypatch) -> None:
+    fake_state = tmp_path / ".state"
+    collector = _audit_entries(tmp_path, fake_state, monkeypatch)
+    collector.record_tool_audit(
+        "bash", '{"command": "pip install requests"}',
+        '{"returncode": 0, "stdout": "ok", "stderr": ""}',
+        is_error=False,
+    )
+    entries = _read_jsonl(fake_state)
+    assert len(entries) == 1
+    assert entries[0]["type"] == "tool_audit"
+    assert entries[0]["tool_name"] == "bash"
+    assert entries[0]["command"] == "pip install requests"
+    assert entries[0]["returncode"] == 0
+    assert entries[0]["is_error"] is False
+    assert "logged_at" in entries[0]
+
+
+def test_record_tool_audit_logs_write_file_path(tmp_path: Path, monkeypatch) -> None:
+    fake_state = tmp_path / ".state"
+    collector = _audit_entries(tmp_path, fake_state, monkeypatch)
+    collector.record_tool_audit(
+        "write_file", '{"path": "src/main.py", "content": "..."}', "OK", is_error=False,
+    )
+    entries = _read_jsonl(fake_state)
+    assert entries[0]["tool_name"] == "write_file"
+    assert entries[0]["path"] == "src/main.py"
+
+
+def test_record_tool_audit_logs_edit_file_path(tmp_path: Path, monkeypatch) -> None:
+    fake_state = tmp_path / ".state"
+    collector = _audit_entries(tmp_path, fake_state, monkeypatch)
+    collector.record_tool_audit(
+        "edit_file", '{"path": "src/main.py", "old_string": "a", "new_string": "b"}', "OK", is_error=False,
+    )
+    entries = _read_jsonl(fake_state)
+    assert entries[0]["tool_name"] == "edit_file"
+    assert entries[0]["path"] == "src/main.py"
+
+
+def test_record_tool_audit_ignores_non_mutating_tools(tmp_path: Path, monkeypatch) -> None:
+    fake_state = tmp_path / ".state"
+    collector = _audit_entries(tmp_path, fake_state, monkeypatch)
+    collector.record_tool_audit("read_file", '{"path": "src/main.py"}', "contents", is_error=False)
+    collector.record_tool_audit("grep_search", '{"pattern": "foo"}', "[]", is_error=False)
+    assert not (fake_state / "audit").exists()
+
+
+def test_record_tool_audit_records_failed_bash_command(tmp_path: Path, monkeypatch) -> None:
+    fake_state = tmp_path / ".state"
+    collector = _audit_entries(tmp_path, fake_state, monkeypatch)
+    collector.record_tool_audit(
+        "bash", '{"command": "false"}', '{"returncode": 1, "stdout": "", "stderr": ""}', is_error=False,
+    )
+    entries = _read_jsonl(fake_state)
+    assert entries[0]["returncode"] == 1
+
+
+def test_record_tool_audit_handles_malformed_arguments_gracefully(tmp_path: Path, monkeypatch) -> None:
+    fake_state = tmp_path / ".state"
+    collector = _audit_entries(tmp_path, fake_state, monkeypatch)
+    collector.record_tool_audit("bash", "not json", "not json either", is_error=True)
+    entries = _read_jsonl(fake_state)
+    assert entries[0]["command"] == ""
+    assert "returncode" not in entries[0]
+    assert entries[0]["is_error"] is True
+
+
 # --- individual bash-check sub-functions ---
 
 
@@ -68,6 +159,55 @@ def test_check_destructive_fs_blocks_rm_rf_root() -> None:
 
 def test_check_destructive_fs_passes_safe_command() -> None:
     assert _check_destructive_fs("ls -la /tmp") is None
+
+
+# --- Windows / cmd.exe / PowerShell dangerous-fs parity ---
+# The bash tool runs through cmd.exe on Windows (no OS sandbox there); see
+# AGENT_UPGRADE_NOTES.md section 4.
+
+@pytest.mark.parametrize("command", [
+    "del /s /q C:\\",
+    "del C:\\ /s /q",
+    "del /s /q %USERPROFILE%",
+    "del /s /q %USERPROFILE%\\",
+    "rd /s /q C:\\",
+    "rmdir /s /q D:\\",
+    "rd /s /q ~",
+    "format C:",
+    "format C: /y",
+    "format D: /q /y",
+    "Remove-Item -Recurse -Force C:\\",
+    "Remove-Item -Path C:\\ -Recurse -Force",
+    "Remove-Item -Recurse -Force $env:USERPROFILE",
+    "Remove-Item -Recurse -Force ~",
+    "reg delete HKLM",
+    "reg delete HKLM /f",
+    "reg delete HKCU",
+    "diskpart",
+])
+def test_check_destructive_fs_blocks_windows_catastrophic_commands(command: str) -> None:
+    v = _check_destructive_fs(command)
+    assert v is not None and v.blocked and v.level == "critical"
+
+
+@pytest.mark.parametrize("command", [
+    "del /s /q C:\\Users\\me\\Documents\\OldReports\\*",
+    "del myfile.txt",
+    "rd /s /q C:\\Users\\me\\AppData\\Local\\Temp\\build",
+    "rmdir /s /q .\\node_modules",
+    "format-string.py",
+    "python format_output.py",
+    "Remove-Item -Recurse -Force .\\node_modules",
+    "Remove-Item -Path .\\dist -Recurse -Force",
+    "reg delete HKLM\\Software\\MyApp\\OldKey",
+    "reg query HKLM",
+    "del build\\*.o",
+    "record something",
+    "3rd party tool",
+    "dir C:\\",
+])
+def test_check_destructive_fs_passes_safe_windows_commands(command: str) -> None:
+    assert _check_destructive_fs(command) is None
 
 
 def test_check_exfiltration_blocks_curl_pipe_sh() -> None:
@@ -143,6 +283,40 @@ def test_is_read_only_command_recognises_env_prefix() -> None:
     assert _is_read_only_command("LANG=C git status") is True
     # Still rejects a write command even with env prefix.
     assert _is_read_only_command("FOO=bar rm -rf /tmp") is False
+
+
+# --- cmd.exe builtins (read-only mode must not over-block on Windows) ---
+
+@pytest.mark.parametrize("command", [
+    "dir",
+    "dir C:\\Projects",
+    "type README.md",
+    "findstr /s /i TODO *.py",
+    "where python",
+    "tree /F",
+    "ver",
+    "tasklist",
+    "systeminfo",
+])
+def test_is_read_only_command_recognises_cmd_builtins(command: str) -> None:
+    assert _is_read_only_command(command) is True
+
+
+@pytest.mark.parametrize("command", [
+    "DIR",
+    "Dir C:\\Projects",
+    "TYPE readme.txt",
+    "WHERE python",
+    "TaskList",
+])
+def test_is_read_only_command_cmd_builtins_are_case_insensitive(command: str) -> None:
+    assert _is_read_only_command(command) is True
+
+
+def test_is_read_only_command_still_rejects_mutating_windows_commands() -> None:
+    assert _is_read_only_command("del /s /q C:\\") is False
+    assert _is_read_only_command("copy a.txt b.txt") is False
+    assert _is_read_only_command("type nul > out.txt") is False
 
 
 # --- classify_command: semantic intent ---

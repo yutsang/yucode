@@ -5,6 +5,7 @@ from pathlib import Path
 
 from coding_agent.config import AppConfig, ProviderConfig, RuntimeOptions
 from coding_agent.config.settings import (
+    BUNDLED_CONFIG_PATH,
     _coerce_streaming_mode,
     app_config_from_dict,
     state_dir,
@@ -14,6 +15,7 @@ from coding_agent.config.simple_yaml import load_yaml
 from coding_agent.core.session import AssistantResponse, Usage
 from coding_agent.interface import cli
 from coding_agent.interface.cli import (
+    _apply_cli_overrides,
     _ensure_project_support_files,
     _has_configured_api_key,
     _probe_provider_connection,
@@ -272,6 +274,178 @@ def test_to_control_dict_includes_verify_tls() -> None:
         runtime=RuntimeOptions(),
     )
     assert config.to_control_dict()["provider"]["verify_tls"] is False
+
+
+def test_app_config_from_dict_reads_api_version() -> None:
+    config = app_config_from_dict({
+        "provider": {
+            "base_url": "https://api.workbench.example",
+            "api_key": "key",
+            "model": "gpt-5-5",
+            "api_version": "2024-12-01-preview",
+        }
+    })
+    assert config.provider.api_version == "2024-12-01-preview"
+
+
+def test_app_config_from_dict_api_version_defaults_empty() -> None:
+    config = app_config_from_dict({
+        "provider": {
+            "base_url": "https://api.example.com",
+            "api_key": "key",
+            "model": "demo-model",
+        }
+    })
+    assert config.provider.api_version == ""
+
+
+def test_to_control_dict_includes_api_version() -> None:
+    config = AppConfig(
+        provider=ProviderConfig(
+            base_url="https://api.workbench.example",
+            api_key="key",
+            model="gpt-5-5",
+            api_version="2024-12-01-preview",
+        ),
+        runtime=RuntimeOptions(),
+    )
+    assert config.to_control_dict()["provider"]["api_version"] == "2024-12-01-preview"
+
+
+def test_app_config_from_dict_reads_omit_params() -> None:
+    config = app_config_from_dict({
+        "provider": {
+            "base_url": "https://api.example.com",
+            "api_key": "key",
+            "model": "demo-model",
+            "omit_params": ["temperature"],
+        }
+    })
+    assert config.provider.omit_params == ["temperature"]
+
+
+def test_to_control_dict_includes_omit_params() -> None:
+    config = AppConfig(
+        provider=ProviderConfig(
+            base_url="https://api.example.com",
+            api_key="key",
+            model="demo-model",
+            omit_params=["temperature"],
+        ),
+        runtime=RuntimeOptions(),
+    )
+    assert config.to_control_dict()["provider"]["omit_params"] == ["temperature"]
+
+
+def test_bundled_config_defaults_to_workbench() -> None:
+    """WI-3: the bundled config.yml (becomes ~/.yucode/settings.yml on first
+    run) ships workbench as the default provider, not deepseek."""
+    text = BUNDLED_CONFIG_PATH.read_text(encoding="utf-8")
+    raw = load_yaml(text)
+    config = app_config_from_dict(raw)
+    assert config.provider.name == "workbench"
+    assert config.provider.api_version == "2024-12-01-preview"
+    assert config.provider.omit_params == ["temperature"]
+    assert config.provider.streaming_mode == "no_stream"
+    assert config.provider.request_timeout_seconds == 300
+    assert config.provider.verify_tls is False
+    assert config.runtime.orchestration_mode == "single"
+    assert config.provider.resolved_tier() == "strong"
+
+
+def test_bundled_config_builds_expected_azure_url_and_headers() -> None:
+    import dataclasses
+
+    from coding_agent.core.providers import OpenAICompatibleProvider
+
+    raw = load_yaml(BUNDLED_CONFIG_PATH.read_text(encoding="utf-8"))
+    config = app_config_from_dict(raw)
+    provider = OpenAICompatibleProvider(config=config.provider)
+    assert provider._build_url() == (
+        "https://api.workbench.kpmg/genai/azure/openai"
+        "/deployments/gpt-5-5-2026-04-24-gs-sdc/chat/completions"
+        "?api-version=2024-12-01-preview"
+    )
+    # api_key ships empty in the bundled default (real value lives only in
+    # the user's settings.yml) — no Authorization header without one either
+    # way, so verify the api-key-vs-Bearer switch with a filled-in copy.
+    headers_unfilled = provider._headers(stream=False)
+    assert "Authorization" not in headers_unfilled
+    assert "Ocp-Apim-Subscription-Key" in headers_unfilled
+
+    filled_provider = OpenAICompatibleProvider(config=dataclasses.replace(config.provider, api_key="TESTKEY"))
+    headers_filled = filled_provider._headers(stream=False)
+    assert headers_filled["api-key"] == "TESTKEY"
+    assert "Authorization" not in headers_filled
+
+    body = provider._build_body([{"role": "user", "content": "hi"}], [], False)
+    assert "temperature" not in body
+    assert body["reasoning_effort"] == "medium"
+
+
+def test_workbench_settings_template_parses_and_matches_bundled_shape() -> None:
+    """docs/settings.workbench.yml is the full copy-paste template for the
+    company PC — it must parse and produce the same request shape as the
+    bundled default (WI-3 verify step)."""
+    from coding_agent.core.providers import OpenAICompatibleProvider
+
+    template_path = Path(__file__).resolve().parents[1] / "docs" / "settings.workbench.yml"
+    raw = load_yaml(template_path.read_text(encoding="utf-8"))
+    config = app_config_from_dict(raw)
+    assert config.provider.omit_params == ["temperature"]  # regression: inline `[x]` mis-parses as a string
+    assert config.runtime.orchestration_mode == "single"
+    provider = OpenAICompatibleProvider(config=config.provider)
+    assert "/deployments/" in provider._build_url()
+    assert "api-version=2024-12-01-preview" in provider._build_url()
+    body = provider._build_body([{"role": "user", "content": "hi"}], [], False)
+    assert "temperature" not in body
+
+
+def test_cli_model_override_preserves_workbench_provider_fields() -> None:
+    """Regression: --model must not silently drop omit_params/api_version/
+    intelligence_tier — a workbench user switching GPT-5.5 <-> 5.4 on the CLI
+    would otherwise lose the Azure URL building and the temperature omission."""
+    config = AppConfig(
+        provider=ProviderConfig(
+            base_url="https://api.workbench.kpmg/genai/azure/openai",
+            api_key="key",
+            model="gpt-5-5-2026-04-24-gs-sdc",
+            api_version="2024-12-01-preview",
+            omit_params=["temperature"],
+            intelligence_tier="strong",
+            extra_headers={"Ocp-Apim-Subscription-Key": "key"},
+            extra_body={"reasoning_effort": "medium"},
+        ),
+        runtime=RuntimeOptions(),
+    )
+    args = argparse.Namespace(model="gpt-5-4-2026-03-05-gs-sdc", permission_mode=None, allowed_tools=None)
+    updated = _apply_cli_overrides(config, args)
+    assert updated.provider.model == "gpt-5-4-2026-03-05-gs-sdc"
+    assert updated.provider.api_version == "2024-12-01-preview"
+    assert updated.provider.omit_params == ["temperature"]
+    assert updated.provider.intelligence_tier == "strong"
+    assert updated.provider.extra_headers == {"Ocp-Apim-Subscription-Key": "key"}
+    assert updated.provider.extra_body == {"reasoning_effort": "medium"}
+
+
+def test_api_version_and_omit_params_round_trip_through_yaml(tmp_path: Path) -> None:
+    from coding_agent.config.simple_yaml import dump_yaml
+
+    config = AppConfig(
+        provider=ProviderConfig(
+            base_url="https://api.workbench.example",
+            api_key="key",
+            model="gpt-5-5",
+            api_version="2024-12-01-preview",
+            omit_params=["temperature"],
+        ),
+        runtime=RuntimeOptions(),
+    )
+    text = dump_yaml(config.to_control_dict())
+    raw = load_yaml(text)
+    reloaded = app_config_from_dict(raw)
+    assert reloaded.provider.api_version == "2024-12-01-preview"
+    assert reloaded.provider.omit_params == ["temperature"]
 
 
 def test_probe_provider_connection_uses_base_url_when_append_disabled(
