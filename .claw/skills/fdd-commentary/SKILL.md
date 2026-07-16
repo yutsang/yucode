@@ -11,15 +11,19 @@ You are acting as a senior Financial Due Diligence consultant. Given a financial
 
 1. **Scope.** From the user's request take: which accounts (default: every account with a non-zero balance on the Balance Sheet plus every Income Statement line), output language (default English), output path (default `fdd_commentary.md` in the workspace). Any explicit user guidance overrides the defaults below. **If the user provides or references a PowerPoint template** (a `.pptx` path, or "export to the deck/report"), this is a PPTX-export request — do steps 1–5 exactly as below to produce verified commentary, then continue to the "PPTX export" section instead of (or in addition to) writing the markdown file.
 
-2. **Locate the databook(s).** `glob_search` for `*databook*.txt` first, then `*databook*.xlsx`. Prefer the `.txt` export (pipe-table format, readable with `read_file`). For `.xlsx` use `list_excel_sheets` + `read_excel_sheet` / `excel_to_json`; if those tools report openpyxl is missing, ask the user for the `.txt` export instead of guessing.
-   - **If more than one databook is found, this is a multi-project report — process each independently, never merge them.** Each databook's filename/title normally names its project/entity (e.g. a name containing "松江"/"Songjiang" or "昆明"/"Kunming"). Produce one markdown output section per project (or one file per project if the user prefers) and keep every downstream step (account list, commentary, self-audit) scoped to a single project's own numbers at a time — never mix figures across projects even if two accounts share a name.
+2. **Locate the input files.**
+   - Databook(s): `glob_search` for `*databook*.txt` first, then `*databook*.xlsx`. Prefer the `.txt` export (pipe-table format, readable with `read_file`). For `.xlsx` use `list_excel_sheets` + `read_excel_sheet` / `excel_to_json`; if those tools report openpyxl is missing, ask the user for the `.txt` export instead of guessing.
+     **If more than one databook is found, this is a multi-project report — process each independently, never merge them.** Each databook's filename/title normally names its project/entity (e.g. a name containing "松江"/"Songjiang" or "昆明"/"Kunming"). Produce one markdown output section per project (or one file per project if the user prefers) and keep every downstream step (account list, commentary, self-audit) scoped to a single project's own numbers at a time — never mix figures across projects even if two accounts share a name.
+   - PPTX template (only for a PPTX-export request): `glob_search` for `*template*.pptx`. It can live anywhere in the workspace — there's no fixed folder requirement. If none is found, or more than one candidate turns up, ask the user for the exact filename/path rather than guessing.
 
-3. **Understand the structure before extracting numbers.**
-   - The `Financials` sheet holds the full Balance Sheet and Income Statement; other sheets are per-account detail (sheet name ≈ account name) and may contain a remarks/notes column.
+3. **Extract and cross-check — mandatory, per account, before drafting a single sentence.**
+   - The `Financials` sheet holds the full Balance Sheet and Income Statement; other sheets are per-account detail (sheet name ≈ account name).
    - Column layout: a date row (e.g. `2023-12-31 … 2026-01-31`) above a basis row (`Mgt acc`, `Audited`, `Indicative adjusted`). **Use ONLY the "Indicative adjusted" (示意性調整後) columns.** Ignore Mgt acc and Audited columns entirely.
    - Unit marker `CNY'000` means raw values are thousands of CNY — multiply by 1,000 before formatting. Re-check the marker per sheet.
    - The latest period is the rightmost Indicative-adjusted column; that is the period a BS bullet opens with.
-   - Cross-check each account's detail sheet against the `Financials` line. If they disagree, flag it in the follow-ups list — do not silently pick one.
+   - **For every single account, before writing anything:** (a) read its line on the `Financials` sheet, (b) read its own detail sheet **in full** — not just the number columns; specifically look for a remarks/notes column or any adjacent free-text cells, (c) reconcile (a) and (b). This is not a background note, it's a gate — do not draft a bullet for an account you haven't done this for.
+   - If the Financials line and the detail sheet's figures disagree, you **must** flag it in the follow-ups list — never silently pick one value, never average or guess.
+   - If the detail sheet's remarks explain a movement, or give entity-specific facts (lender/counterparty/tenant names, special circumstances, management explanations), that information belongs in the commentary (subject to the length caps and banned-pattern rules below) — don't discard qualitative context just because it isn't a number.
 
 4. **Draft** each account's bullet following the house style below.
 
