@@ -167,6 +167,13 @@ _PROBE_TOOL = {
     },
 }
 
+# tool_choice="auto" lets the model decide whether to call anything — a
+# message that doesn't actually need the tool (e.g. the generic "Reply with
+# exactly OK.") produces a text answer even on a gateway that supports
+# function calling perfectly, which looks identical to a FAIL. This message
+# only makes sense answered via the tool above.
+_TOOL_PROBE_MESSAGE = "What is the current weather in Paris? You must call the get_weather function to find out — do not guess or answer from memory."
+
 
 def _auth_headers(api_key: str, auth_mode: str) -> dict[str, str]:
     if auth_mode == "bearer":
@@ -530,11 +537,11 @@ def _run_azure_probe(args: argparse.Namespace) -> int:
     print(f"include_stream:  {args.include_stream}")
     print()
 
-    def _run(attempt: AzureAttempt) -> dict[str, Any]:
+    def _run(attempt: AzureAttempt, *, message: str | None = None) -> dict[str, Any]:
         result = _run_azure_attempt(
             attempt, url=url, api_key=args.api_key, subscription_key=subscription_key,
             charge_code=args.charge_code, region_override=args.region_override,
-            model=args.model, timeout=args.timeout, message=args.message,
+            model=args.model, timeout=args.timeout, message=message if message is not None else args.message,
         )
         _print_azure_result(attempt.label, url, result)
         return result
@@ -544,7 +551,10 @@ def _run_azure_probe(args: argparse.Namespace) -> int:
 
     tools_ok: bool | None = None
     if args.test_tools:
-        tools_result = _run(AzureAttempt(label="function calling (tools + tool_choice=auto)", stream=False, with_tools=True, verify_tls=verify_tls))
+        tools_result = _run(
+            AzureAttempt(label="function calling (tools + tool_choice=auto)", stream=False, with_tools=True, verify_tls=verify_tls),
+            message=_TOOL_PROBE_MESSAGE,
+        )
         tools_ok = bool(tools_result.get("ok")) and int(tools_result.get("tool_calls") or 0) >= 1
 
     streaming_ok: bool | None = None
