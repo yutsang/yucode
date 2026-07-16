@@ -891,12 +891,9 @@ def handle_chat(args: argparse.Namespace) -> int:
     if not _ensure_api_key(args.config_path):
         return 1
     if args.prompt is None:
-        print(render_error(
-            "`yucode chat` requires a prompt.\n"
-            "  Usage:  yucode chat \"<your task>\"\n"
-            "  For interactive mode run:  yucode"
-        ), file=sys.stderr)
-        return 1
+        # Matches the chat subcommand's own help text ("... or start
+        # interactive mode with no prompt") — same setup as bare `yucode`.
+        return handle_default(args)
     return _run_single_turn(args)
 
 

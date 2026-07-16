@@ -433,6 +433,28 @@ def test_slash_model_command_preserves_workbench_provider_fields(tmp_path: Path)
     assert runtime.provider.config.api_version == "2024-12-01-preview"
 
 
+def test_handle_chat_with_no_prompt_starts_interactive_mode(monkeypatch) -> None:
+    """Regression: `chat` subcommand's own help text says "or start interactive
+    mode with no prompt" but handle_chat used to print a usage error instead
+    of actually doing that — found while confirming interactive-mode usage
+    for a user (chat --workspace . silently didn't work as documented)."""
+    monkeypatch.setattr(cli, "_ensure_api_key", lambda config_path: True)
+    captured: dict = {}
+
+    def fake_run_interactive(args):
+        captured["args"] = args
+        return 0
+
+    monkeypatch.setattr(cli, "_run_interactive", fake_run_interactive)
+    args = argparse.Namespace(
+        prompt=None, workspace=".", config_path=None, model=None, permission_mode=None,
+    )
+    result = cli.handle_chat(args)
+    assert result == 0
+    assert "args" in captured, "handle_chat must delegate to interactive mode, not error out"
+    assert captured["args"].workspace == "."
+
+
 def test_cli_model_override_preserves_workbench_provider_fields() -> None:
     """Regression: --model must not silently drop omit_params/api_version/
     intelligence_tier — a workbench user switching GPT-5.5 <-> 5.4 on the CLI
