@@ -13,7 +13,6 @@ from ..config import (
     AppConfig,
     ConfigError,
     McpServerConfig,
-    ProviderConfig,
     add_mcp_server_to_config,
     dump_yaml,
     ensure_default_config,
@@ -292,20 +291,15 @@ def _probe_provider_connection(
     if not config.provider.model.strip():
         return False, "error", "No provider model configured."
 
-    test_provider = ProviderConfig(
-        name=config.provider.name,
-        type=config.provider.type,
-        base_url=config.provider.base_url,
-        api_key=config.provider.api_key,
-        model=config.provider.model,
-        chat_path=config.provider.chat_path,
-        append_chat_path=config.provider.append_chat_path,
-        verify_tls=config.provider.verify_tls,
+    # dataclasses.replace (not a manual field-by-field copy) so this probe
+    # can never silently drop a ProviderConfig field it doesn't know about
+    # (e.g. api_version/omit_params — an Azure-style gateway config would
+    # otherwise get probed against the wrong URL with a rejected temperature).
+    test_provider = dataclasses.replace(
+        config.provider,
         stream=stream,
         streaming_mode="stream" if stream else "no_stream",
         temperature=0.0,
-        extra_headers=dict(config.provider.extra_headers),
-        extra_body=dict(config.provider.extra_body),
     )
     provider = OpenAICompatibleProvider(test_provider)
     effective_url = provider._build_url()  # noqa: SLF001
@@ -1504,18 +1498,8 @@ def _handle_slash_command_interactive(command: str, arguments: str, config: Any,
         if arguments.strip():
             new_model = arguments.strip()
             old_model = config.provider.model
-            from ..config import AppConfig, ProviderConfig
-            new_provider = ProviderConfig(
-                name=config.provider.name, type=config.provider.type,
-                base_url=config.provider.base_url, api_key=config.provider.api_key,
-                model=new_model, chat_path=config.provider.chat_path,
-                append_chat_path=config.provider.append_chat_path,
-                verify_tls=config.provider.verify_tls,
-                stream=config.provider.stream, streaming_mode=config.provider.streaming_mode,
-                temperature=config.provider.temperature,
-                extra_headers=dict(config.provider.extra_headers),
-                extra_body=dict(config.provider.extra_body),
-            )
+            from ..config import AppConfig
+            new_provider = dataclasses.replace(config.provider, model=new_model)
             new_config = AppConfig(
                 provider=new_provider, runtime=config.runtime,
                 tools=config.tools, mcp=config.mcp, vscode=config.vscode,

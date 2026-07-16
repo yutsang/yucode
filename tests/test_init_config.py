@@ -401,6 +401,38 @@ def test_workbench_settings_template_parses_and_matches_bundled_shape() -> None:
     assert "temperature" not in body
 
 
+def test_slash_model_command_preserves_workbench_provider_fields(tmp_path: Path) -> None:
+    """Regression: the interactive /model command manually reconstructed
+    ProviderConfig field-by-field, same bug class as _apply_cli_overrides —
+    switching model mid-session (e.g. GPT-5.5 -> GPT-5.4) would silently
+    drop api_version/omit_params and break the Workbench URL/body shape."""
+    from coding_agent.core.runtime import AgentRuntime
+    from coding_agent.interface.cli import _handle_slash_command_interactive
+
+    config = AppConfig(
+        provider=ProviderConfig(
+            name="workbench",
+            api_key="key",
+            base_url="https://api.workbench.kpmg/genai/azure/openai",
+            api_version="2024-12-01-preview",
+            model="gpt-5-5-2026-04-24-gs-sdc",
+            omit_params=["temperature"],
+            extra_headers={"Ocp-Apim-Subscription-Key": "key"},
+        ),
+        runtime=RuntimeOptions(permission_mode="danger-full-access"),
+    )
+    runtime = AgentRuntime(tmp_path, config)
+
+    _handle_slash_command_interactive("model", "gpt-5-4-2026-03-05-gs-sdc", config, tmp_path, runtime)
+
+    assert runtime.config.provider.model == "gpt-5-4-2026-03-05-gs-sdc"
+    assert runtime.config.provider.api_version == "2024-12-01-preview"
+    assert runtime.config.provider.omit_params == ["temperature"]
+    assert runtime.config.provider.extra_headers == {"Ocp-Apim-Subscription-Key": "key"}
+    assert runtime.provider.config.model == "gpt-5-4-2026-03-05-gs-sdc"
+    assert runtime.provider.config.api_version == "2024-12-01-preview"
+
+
 def test_cli_model_override_preserves_workbench_provider_fields() -> None:
     """Regression: --model must not silently drop omit_params/api_version/
     intelligence_tier — a workbench user switching GPT-5.5 <-> 5.4 on the CLI
@@ -504,6 +536,45 @@ def test_probe_provider_connection_preserves_verify_tls(tmp_path: Path, monkeypa
     assert ok is True
     assert status == "ok"
     assert "Non-streaming request succeeded" in message
+
+
+def test_probe_provider_connection_preserves_api_version_and_omit_params(tmp_path: Path, monkeypatch) -> None:
+    """Regression: _probe_provider_connection used to manually reconstruct
+    ProviderConfig field-by-field and dropped api_version/omit_params — the
+    built-in `yucode init-config` / `yucode doctor` connectivity check would
+    silently probe an Azure-style gateway at the wrong (non-deployment) URL
+    with a rejected `temperature` in the body."""
+    config = AppConfig(
+        provider=ProviderConfig(
+            name="workbench",
+            api_key="key",
+            base_url="https://api.workbench.kpmg/genai/azure/openai",
+            api_version="2024-12-01-preview",
+            model="gpt-5-5-2026-04-24-gs-sdc",
+            omit_params=["temperature"],
+            stream=True,
+        ),
+        runtime=RuntimeOptions(),
+    )
+
+    monkeypatch.setattr(cli, "load_app_config", lambda *args, **kwargs: config)
+
+    def fake_complete_probe(self, messages, tools, stream_callback=None):
+        assert self.config.api_version == "2024-12-01-preview"
+        assert self._build_url() == (
+            "https://api.workbench.kpmg/genai/azure/openai"
+            "/deployments/gpt-5-5-2026-04-24-gs-sdc/chat/completions"
+            "?api-version=2024-12-01-preview"
+        )
+        body = self._build_body(messages, tools, False)
+        assert "temperature" not in body
+        return AssistantResponse(text="OK", usage=Usage(input_tokens=1, output_tokens=1))
+
+    monkeypatch.setattr(cli.OpenAICompatibleProvider, "complete", fake_complete_probe)
+
+    ok, status, message = _probe_provider_connection(None, workspace=tmp_path, stream=False)
+    assert ok is True
+    assert status == "ok"
 
 
 def test_handle_init_config_saves_append_chat_path(tmp_path: Path, monkeypatch) -> None:
