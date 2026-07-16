@@ -252,6 +252,87 @@ def office_tools(registry: ToolRegistry) -> list[ToolDefinition]:
         ),
         ToolDefinition(
             ToolSpec(
+                "inspect_pptx_shapes",
+                "Inspect a PowerPoint (.pptx) file's actual shape structure, per slide: each "
+                "shape's name, type, position, and (for tables) row/column count with a cell "
+                "preview, or (for text frames) a text preview. Call this before "
+                "fill_pptx_shape_text/fill_pptx_table on a template whose shape names you don't "
+                "already know — house-style templates typically name their content "
+                "placeholders (e.g. a shape called 'textMainBullets' or 'Table Placeholder').",
+                {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Path to .pptx file."},
+                    },
+                    "required": ["path"],
+                },
+                "read-only",
+                RiskLevel.LOW,
+            ),
+            lambda args: _inspect_pptx_shapes(registry, args),
+        ),
+        ToolDefinition(
+            ToolSpec(
+                "fill_pptx_shape_text",
+                "Write text into a specific named shape (text box or placeholder) on a specific "
+                "slide of a .pptx file. Matches shape name case-insensitively. Use "
+                "inspect_pptx_shapes first to find the right slide_index/shape_name. Pass the "
+                "same path as output_path to keep progressively filling the same in-progress file.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Path to .pptx file to read."},
+                        "output_path": {"type": "string", "description": "Path to save the result to."},
+                        "slide_index": {"type": "integer", "description": "0-based slide index."},
+                        "shape_name": {"type": "string", "description": "Target shape's name (case-insensitive)."},
+                        "paragraphs": {
+                            "type": "array",
+                            "description": "List of paragraph strings; each becomes one paragraph/bullet.",
+                            "items": {"type": "string"},
+                        },
+                    },
+                    "required": ["path", "output_path", "slide_index", "shape_name", "paragraphs"],
+                },
+                "workspace-write",
+                RiskLevel.MEDIUM,
+            ),
+            lambda args: _fill_pptx_shape_text(registry, args),
+        ),
+        ToolDefinition(
+            ToolSpec(
+                "fill_pptx_table",
+                "Write row data into a named table (or table placeholder) shape on a specific "
+                "slide of a .pptx file. The target shape is always replaced with a freshly built "
+                "table sized exactly to the given data, at the same position — this never "
+                "silently crops data to an existing table's size. Optionally pass style_id to set "
+                "a table style GUID. Matches shape name case-insensitively. Use "
+                "inspect_pptx_shapes first to find slide_index/shape_name.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Path to .pptx file to read."},
+                        "output_path": {"type": "string", "description": "Path to save the result to."},
+                        "slide_index": {"type": "integer", "description": "0-based slide index."},
+                        "shape_name": {"type": "string", "description": "Target shape's name (case-insensitive)."},
+                        "rows": {
+                            "type": "array",
+                            "description": "Row data: list of rows, each a list of cell strings.",
+                            "items": {"type": "array", "items": {"type": "string"}},
+                        },
+                        "style_id": {
+                            "type": "string",
+                            "description": "Optional table style GUID (e.g. '{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}') to apply.",
+                        },
+                    },
+                    "required": ["path", "output_path", "slide_index", "shape_name", "rows"],
+                },
+                "workspace-write",
+                RiskLevel.MEDIUM,
+            ),
+            lambda args: _fill_pptx_table(registry, args),
+        ),
+        ToolDefinition(
+            ToolSpec(
                 "read_excel_preview",
                 "Read an Excel file with schema inference. Returns headers, types, and a preview of the data.",
                 {
@@ -561,6 +642,153 @@ def _write_pptx_from_template(registry: ToolRegistry, args: dict[str, Any]) -> s
             slide.notes_slide.notes_text_frame.text = notes
     prs.save(str(output_path))
     return f"Created {output_path} from template with {len(args.get('slides', []))} slides"
+
+
+# ---- PPTX shape-level inspection / filling ----------------------------------
+# Discovery-first design: rather than assuming a fixed template's shape names
+# (e.g. a specific firm's house style), inspect_pptx_shapes lets the agent
+# learn ANY given template's actual structure at runtime, then fill_pptx_shape_text
+# / fill_pptx_table act on whatever names that discovery turns up.
+
+_EMU_PER_INCH = 914400
+
+
+def _shape_dims_in(shape: Any) -> dict[str, float | None]:
+    def _to_inches(value: Any) -> float | None:
+        return round(value / _EMU_PER_INCH, 2) if value is not None else None
+    return {
+        "left_in": _to_inches(shape.left),
+        "top_in": _to_inches(shape.top),
+        "width_in": _to_inches(shape.width),
+        "height_in": _to_inches(shape.height),
+    }
+
+
+def _find_shape_by_name(slide: Any, shape_name: str) -> Any:
+    target_name = shape_name.strip().lower()
+    for shape in slide.shapes:
+        if shape.name.strip().lower() == target_name:
+            return shape
+    available = [shape.name for shape in slide.shapes]
+    raise ValueError(f"No shape named '{shape_name}' on this slide. Available shapes: {available}")
+
+
+def _resolve_slide(prs: Any, slide_index: int) -> Any:
+    if slide_index < 0 or slide_index >= len(prs.slides):
+        raise ValueError(f"slide_index {slide_index} out of range (presentation has {len(prs.slides)} slides).")
+    return prs.slides[slide_index]
+
+
+def _inspect_pptx_shapes(registry: ToolRegistry, args: dict[str, Any]) -> str:
+    pptx = _require("pptx", "python-pptx>=1.0", "pptx")
+    path = registry._resolve_path(str(args["path"]))
+    prs = pptx.Presentation(str(path))
+    slides_info = []
+    for slide_index, slide in enumerate(prs.slides):
+        shapes_info = []
+        for shape in slide.shapes:
+            entry: dict[str, Any] = {"name": shape.name, "shape_type": str(shape.shape_type)}
+            entry.update(_shape_dims_in(shape))
+            if shape.has_table:
+                table = shape.table
+                entry["is_table"] = True
+                entry["rows"] = len(table.rows)
+                entry["cols"] = len(table.columns)
+                entry["preview"] = [
+                    [cell.text for cell in row.cells] for row in list(table.rows)[:3]
+                ]
+            else:
+                entry["is_table"] = False
+                if shape.has_text_frame:
+                    entry["text_preview"] = shape.text_frame.text[:150]
+            shapes_info.append(entry)
+        slides_info.append({"slide_index": slide_index, "shapes": shapes_info})
+    return json.dumps({"slides": slides_info}, indent=2)
+
+
+def _fill_pptx_shape_text(registry: ToolRegistry, args: dict[str, Any]) -> str:
+    pptx = _require("pptx", "python-pptx>=1.0", "pptx")
+    path = registry._resolve_path(str(args["path"]))
+    output_path = registry._resolve_path(str(args["output_path"]))
+    slide_index = int(args["slide_index"])
+    shape_name = str(args["shape_name"])
+    paragraphs = [str(p) for p in args.get("paragraphs", [])]
+
+    prs = pptx.Presentation(str(path))
+    slide = _resolve_slide(prs, slide_index)
+    shape = _find_shape_by_name(slide, shape_name)
+    if not shape.has_text_frame:
+        raise ValueError(
+            f"Shape '{shape.name}' on slide {slide_index} has no text frame "
+            f"(is_table={shape.has_table}) — use fill_pptx_table instead."
+        )
+
+    tf = shape.text_frame
+    tf.clear()
+    for i, para_text in enumerate(paragraphs):
+        p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
+        p.text = para_text
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    prs.save(str(output_path))
+    return json.dumps({
+        "status": "ok", "slide_index": slide_index, "shape_name": shape.name,
+        "paragraphs_written": len(paragraphs), "output_path": str(output_path),
+    }, indent=2)
+
+
+def _set_table_style_id(table: Any, style_id: str) -> None:
+    from pptx.oxml.ns import qn
+    tbl_pr = table._tbl.find(qn("a:tblPr"))
+    if tbl_pr is None:
+        return
+    style_el = tbl_pr.find(qn("a:tableStyleId"))
+    if style_el is not None:
+        style_el.text = style_id
+
+
+def _fill_pptx_table(registry: ToolRegistry, args: dict[str, Any]) -> str:
+    pptx = _require("pptx", "python-pptx>=1.0", "pptx")
+    path = registry._resolve_path(str(args["path"]))
+    output_path = registry._resolve_path(str(args["output_path"]))
+    slide_index = int(args["slide_index"])
+    shape_name = str(args["shape_name"])
+    rows_data = [[str(cell) for cell in row] for row in args["rows"]]
+    style_id = str(args.get("style_id", ""))
+
+    n_rows = len(rows_data)
+    n_cols = max((len(row) for row in rows_data), default=0)
+    if n_rows == 0 or n_cols == 0:
+        raise ValueError("`rows` must be a non-empty list of non-empty lists.")
+
+    prs = pptx.Presentation(str(path))
+    slide = _resolve_slide(prs, slide_index)
+    shape = _find_shape_by_name(slide, shape_name)
+
+    # Always delete-and-rebuild rather than filling an existing table in place:
+    # an existing table's row/col count rarely matches fresh data exactly, and
+    # silently cropping to whatever size was already there is a worse surprise
+    # than a clean rebuild — this also matches the reference project's own
+    # approach (it never reuses a placeholder's table, always rebuilds it).
+    left, top, width, height = shape.left, shape.top, shape.width, shape.height
+    original_name = shape.name
+    element = shape._element
+    element.getparent().remove(element)
+    graphic_frame = slide.shapes.add_table(n_rows, n_cols, left, top, width, height)
+    graphic_frame.name = original_name
+    new_table = graphic_frame.table
+    for r_idx, row_values in enumerate(rows_data):
+        for c_idx, value in enumerate(row_values):
+            new_table.cell(r_idx, c_idx).text = value
+    if style_id:
+        _set_table_style_id(new_table, style_id)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    prs.save(str(output_path))
+    return json.dumps({
+        "status": "ok", "slide_index": slide_index, "shape_name": shape_name,
+        "rows_written": n_rows, "cols_written": n_cols, "output_path": str(output_path),
+    }, indent=2)
 
 
 # ---- Excel preview handler --------------------------------------------------
