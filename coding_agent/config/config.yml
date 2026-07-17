@@ -40,7 +40,12 @@ runtime:
   permission_mode: workspace-write
   max_iterations: 32
   max_worker_steps: 20
-  orchestration_mode: single
+  # Coordinator retry rounds (research->work->validate) on validation failure --
+  # separate from max_iterations because one retry here reruns a whole worker,
+  # not one LLM turn. Keeps a rejected validation from redoing the work phase
+  # up to max_iterations times.
+  max_coordinator_retries: 3
+  orchestration_mode: auto
   parallel_workers: false
   max_tool_calls: 80
   dedup_tool_threshold: 3

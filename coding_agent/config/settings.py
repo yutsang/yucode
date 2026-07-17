@@ -115,6 +115,13 @@ class RuntimeOptions:
     permission_mode: PermissionMode = "workspace-write"
     max_iterations: int = 25
     max_worker_steps: int = 20
+    # Coordinator-only: how many full research->work->validate rounds to retry
+    # on validation failure. Deliberately separate from max_iterations -- each
+    # retry here reruns a whole worker (itself up to max_worker_steps turns),
+    # so reusing max_iterations (a single-agent turn budget) as this bound let
+    # one rejected validation redo the entire work phase up to max_iterations
+    # times, which is what actually caused runs to spiral.
+    max_coordinator_retries: int = 3
     orchestration_mode: OrchestrationMode = "auto"
     parallel_workers: bool = False
     max_tool_calls: int = 80
@@ -243,6 +250,7 @@ class AppConfig:
                 "permission_mode": self.runtime.permission_mode,
                 "max_iterations": self.runtime.max_iterations,
                 "max_worker_steps": self.runtime.max_worker_steps,
+                "max_coordinator_retries": self.runtime.max_coordinator_retries,
                 "orchestration_mode": self.runtime.orchestration_mode,
                 "parallel_workers": self.runtime.parallel_workers,
                 "max_tool_calls": self.runtime.max_tool_calls,
@@ -486,6 +494,7 @@ def app_config_from_dict(raw: dict[str, Any]) -> AppConfig:
         permission_mode=_coerce_permission_mode(runtime_raw.get("permission_mode", "workspace-write")),
         max_iterations=_coerce_positive_int(runtime_raw.get("max_iterations", 25), "runtime.max_iterations"),
         max_worker_steps=_coerce_positive_int(runtime_raw.get("max_worker_steps", 20), "runtime.max_worker_steps"),
+        max_coordinator_retries=_coerce_positive_int(runtime_raw.get("max_coordinator_retries", 3), "runtime.max_coordinator_retries"),
         orchestration_mode=_coerce_orchestration_mode(runtime_raw.get("orchestration_mode", "auto")),
         parallel_workers=bool(runtime_raw.get("parallel_workers", False)),
         max_tool_calls=_coerce_positive_int(runtime_raw.get("max_tool_calls", 80), "runtime.max_tool_calls"),

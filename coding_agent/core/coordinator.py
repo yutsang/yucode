@@ -359,7 +359,7 @@ class AdminCoordinator:
                 event_callback({"type": "completed", "text": summary.final_text})
             return summary
 
-        max_retries = self.config.runtime.max_iterations
+        max_retries = self.config.runtime.max_coordinator_retries
         for attempt in range(1, max_retries + 1):
             summary.total_retries = attempt
             summary.iterations = attempt
@@ -808,7 +808,7 @@ class AdminCoordinator:
         if max_retries_reached:
             note = (
                 f"\n\n[Note: Reached maximum retry depth "
-                f"({self.config.runtime.max_iterations})."
+                f"({self.config.runtime.max_coordinator_retries})."
             )
             if validation.feedback:
                 note += f" Validation feedback: {validation.feedback}"

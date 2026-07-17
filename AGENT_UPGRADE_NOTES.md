@@ -54,9 +54,11 @@ Findings, in decreasing severity:
 
 - **P2** — a "strong-tier" system-prompt trim (the prompt carries weak-model guidance like the bash quick-map at `:340`) — only if prompt-token cost at the gateway turns out to matter. Measure first via `usage` from non-stream responses.
 
-## 6. Orchestration — single-agent is the company default
+## 6. Orchestration — `auto` (coordinator kept), retry rounds decoupled from `max_iterations`
 
-`orchestration_mode: single` goes into the default config (plan WI-3). The multi-phase coordinator multiplies billable gateway calls and its value-add (plan parsing retries, investigation forcing, cross-worker dedup) targets weak models. GPT-5.5 + full toolset in one loop is the right shape.
+Superseded: this section originally recommended `orchestration_mode: single` for the company default, on cost/predictability grounds. Reversed after real on-site use of the fdd-commentary skill (multi-account, multi-project, cross-checked commentary + PPTX export) showed genuine value from the work→validate loop — the task is exactly the kind of multi-step, verifiable-output work the coordinator is for. Bundled default is now `orchestration_mode: auto`.
+
+The actual problem observed on-site wasn't the coordinator existing — it was that its validation-failure retry loop reused `runtime.max_iterations` (a single-agent-turn budget, default 32) as the number of full research→work→validate rounds to retry. Each round reruns an entire worker (itself up to `max_worker_steps` turns), so one rejected validation could redo the whole work phase up to 32 times — this is what actually caused a real run to spiral through dozens of retries and repeated "reached maximum iterations" messages. Fixed by adding a dedicated `runtime.max_coordinator_retries` (default 3), used in `orchestrate()`'s retry loop instead of `max_iterations`, which now only governs single-agent-turn and per-worker step budgets. See `tests/test_coordinator.py` for the regression proof (old code: 999 `max_iterations` → 999 retries instead of the intended 2).
 
 - **P2** — the one coordinator feature worth porting to single mode: `_run_concrete_validators` (auto-pytest when `tests/` exists, `core/coordinator.py`). In single mode nothing verifies the model's "done" claim except the bash-returncode grounding check. A post-answer pytest hook in single mode would close that — but it changes behaviour for every user, so design it as opt-in config and do it only after on-site experience shows the need.
 - Grounding framework (`_ToolObservations`, `_check_final_answer_grounding` in `core/runtime.py`) is tier-independent and cheap — keep as is; `claimed_success_but_bash_failed` applies to all tiers already.

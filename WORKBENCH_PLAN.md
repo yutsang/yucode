@@ -63,7 +63,7 @@ New `ProviderConfig.api_version: str = ""`. When non-empty, `_build_url()` retur
 ### WI-3 — workbench becomes the default provider
 Full switch-over, per the owner's decision (GPT-5.5 ≫ Qwen3-32B):
 1. Replace the `provider:` section of the bundled `coding_agent/config/config.yml` with the workbench settings from §6 (`api_key`/`Ocp-Apim-Subscription-Key`/charge-code as empty strings — the real values live only in the user's `~/.yucode/settings.yml`). Keep the old deepseek block as a commented-out example.
-2. Set the bundled runtime defaults to the §5 posture (`orchestration_mode: single`, `streaming_mode: no_stream`, `request_timeout_seconds: 300`).
+2. Set the bundled runtime defaults to the §5 posture (`streaming_mode: no_stream`, `request_timeout_seconds: 300`; `orchestration_mode` — see §5 note, superseded to `auto` after on-site use).
 3. Also check in the full user-facing template from §6 (e.g. `docs/settings.workbench.yml`) for copy-paste onto the company PC. Never commit real keys.
 - **Verify:** `load_yaml` parses both; a config loaded from the template produces the expected URL/headers/body in a unit test; existing tests that assume deepseek defaults are updated deliberately (not papered over).
 
@@ -93,7 +93,7 @@ Workbench accepts per-call `reasoning_effort`. Today yucode can only set it glob
 
 ## 5. Recommended runtime posture for GPT-5.5 (config, not code)
 
-- `orchestration_mode: single` — GPT-5.5 is strong-tier; the multi-phase coordinator exists to babysit weak models and multiplies billable gateway calls (charge-code!). Single-agent loop with full toolset is the right default here. (`auto` also behaves sanely, but `single` is predictable for cost.)
+- **Superseded** — `orchestration_mode: auto` (was `single`). Original reasoning: GPT-5.5 is strong-tier, the coordinator exists to babysit weak models and multiplies billable gateway calls. Reversed after real on-site use of the fdd-commentary skill showed the work→validate loop earns its keep on multi-account, cross-checked, verifiable-output tasks. The actual cost/predictability problem was the retry loop reusing `max_iterations` (32) as its retry-round count — fixed with a dedicated `max_coordinator_retries` (default 3, see `AGENT_UPGRADE_NOTES.md` §6) instead of disabling the coordinator.
 - `streaming_mode: no_stream` until the WI-4 probe proves SSE works through APIM; `hybrid` won't save you because a 400/buffered stream isn't the "empty response" case hybrid falls back on.
 - `request_timeout_seconds: 300` — reasoning models routinely exceed the 90 s default in no_stream mode (reference uses 180 s for single short completions; agent turns are longer).
 - `extra_body: {reasoning_effort: "medium"}` — good default for agentic tool loops; the user can raise to `high` for hard tasks. Per-phase effort is WI-7 (later). Do NOT set `max_completion_tokens` (empty-content trap, §2).
@@ -121,7 +121,8 @@ provider:
   extra_body:
     reasoning_effort: "medium"
 runtime:
-  orchestration_mode: single
+  orchestration_mode: auto
+  max_coordinator_retries: 3
 ```
 
 ## 7. On-site checklist (user runs on the company PC, in order)

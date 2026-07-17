@@ -83,16 +83,25 @@ def _bash(registry: ToolRegistry, args: dict[str, Any]) -> str:
             bg_output["safety_warning"] = verdict.reason
         return json.dumps(bg_output, indent=2)
 
+    # encoding="utf-8" (not the text=True default, which falls back to the OS
+    # locale's preferred encoding — cp1252 on a Western-locale Windows box)
+    # is required so output containing non-ASCII text (e.g. Chinese account
+    # names/remarks in a databook) decodes instead of crashing the reader
+    # thread with a UnicodeDecodeError. errors="replace" is a safety net for
+    # any tool that genuinely emits a different encoding, rather than a hard
+    # crash on the rare byte sequence UTF-8 can't decode.
     if sandbox_cmd:
         env = dict(sandbox_cmd.env)
         result = subprocess.run(
             [sandbox_cmd.program, *sandbox_cmd.args],
             cwd=cwd, capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
             timeout=timeout, check=False, env={**os.environ, **env},
         )
     else:
         result = subprocess.run(
             command, cwd=cwd, capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
             shell=True, timeout=timeout, check=False,
         )
 

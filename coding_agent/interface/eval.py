@@ -278,6 +278,7 @@ def run(argv: list[str] | None = None) -> int:
         "intelligence_tier_resolved": tier_resolved,
         "orchestration_mode": config.runtime.orchestration_mode,
         "max_iterations": config.runtime.max_iterations,
+        "max_coordinator_retries": config.runtime.max_coordinator_retries,
         "max_tool_calls": config.runtime.max_tool_calls,
         "suite": str(suite_path),
         "results": [r.to_dict() for r in results],

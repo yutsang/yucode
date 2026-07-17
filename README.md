@@ -37,7 +37,7 @@ The runtime exposes three modes via `runtime.orchestration_mode`: `single` alway
 
 ### Phased workers and scoped tools
 
-When the coordinator picks the multi-worker path, it runs four phases: **Plan** decomposes the task; **Research** workers (read-only tools: read, grep, web search) gather context; **Work** workers (write tools: edit, write, bash, notebook) make changes; and **Validate** workers (read + bash) check the result. If validation fails, the coordinator loops back into Work with the validator's feedback as additional context, up to `max_iterations` times. Each individual worker is bounded by `max_worker_steps` LLM rounds so a stuck sub-task cannot consume the whole budget. Tool scoping is not advisory -- it is enforced at the `ToolRegistry` layer of the child runtime, so a research worker cannot write files even if the model tries.
+When the coordinator picks the multi-worker path, it runs four phases: **Plan** decomposes the task; **Research** workers (read-only tools: read, grep, web search) gather context; **Work** workers (write tools: edit, write, bash, notebook) make changes; and **Validate** workers (read + bash) check the result. If validation fails, the coordinator loops back into Work with the validator's feedback as additional context, up to `max_coordinator_retries` times (a separate, smaller budget from `max_iterations` -- each retry here reruns a whole worker, not one LLM turn). Each individual worker is bounded by `max_worker_steps` LLM rounds so a stuck sub-task cannot consume the whole budget. Tool scoping is not advisory -- it is enforced at the `ToolRegistry` layer of the child runtime, so a research worker cannot write files even if the model tries.
 
 ### Unified runtime flow
 
@@ -72,7 +72,7 @@ flowchart TD
         Research --> Work["Phase 3: Work workers\n(write tools)"]
         Work --> Validate["Phase 4: Validate worker\n(read + bash)"]
         Validate -->|"pass"| Done["Result"]
-        Validate -->|"fail & retry < max_iterations"| Work
+        Validate -->|"fail & retry < max_coordinator_retries"| Work
         Validate -->|"fail & out of retries"| Done
     end
 

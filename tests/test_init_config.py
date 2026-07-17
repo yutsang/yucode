@@ -349,7 +349,7 @@ def test_bundled_config_defaults_to_workbench() -> None:
     assert config.provider.streaming_mode == "no_stream"
     assert config.provider.request_timeout_seconds == 300
     assert config.provider.verify_tls is False
-    assert config.runtime.orchestration_mode == "single"
+    assert config.runtime.orchestration_mode == "auto"
     assert config.provider.resolved_tier() == "strong"
 
 
@@ -393,7 +393,7 @@ def test_workbench_settings_template_parses_and_matches_bundled_shape() -> None:
     raw = load_yaml(template_path.read_text(encoding="utf-8"))
     config = app_config_from_dict(raw)
     assert config.provider.omit_params == ["temperature"]  # regression: inline `[x]` mis-parses as a string
-    assert config.runtime.orchestration_mode == "single"
+    assert config.runtime.orchestration_mode == "auto"
     provider = OpenAICompatibleProvider(config=config.provider)
     assert "/deployments/" in provider._build_url()
     assert "api-version=2024-12-01-preview" in provider._build_url()
@@ -480,6 +480,29 @@ def test_cli_model_override_preserves_workbench_provider_fields() -> None:
     assert updated.provider.intelligence_tier == "strong"
     assert updated.provider.extra_headers == {"Ocp-Apim-Subscription-Key": "key"}
     assert updated.provider.extra_body == {"reasoning_effort": "medium"}
+
+
+def test_cli_permission_mode_override_preserves_runtime_fields() -> None:
+    """Regression: --permission-mode manually reconstructed RuntimeOptions
+    field-by-field, same bug class as the ProviderConfig cases above -- it
+    had already silently dropped compact_strategy/error_strategy (both
+    non-default fields below) on every --permission-mode override, and would
+    have dropped max_coordinator_retries too."""
+    config = AppConfig(
+        provider=ProviderConfig(base_url="https://x", api_key="key", model="m"),
+        runtime=RuntimeOptions(
+            permission_mode="workspace-write",
+            max_coordinator_retries=7,
+            compact_strategy="llm",
+            error_strategy="strict",
+        ),
+    )
+    args = argparse.Namespace(model=None, permission_mode="danger-full-access", allowed_tools=None)
+    updated = _apply_cli_overrides(config, args)
+    assert updated.runtime.permission_mode == "danger-full-access"
+    assert updated.runtime.max_coordinator_retries == 7
+    assert updated.runtime.compact_strategy == "llm"
+    assert updated.runtime.error_strategy == "strict"
 
 
 def test_api_version_and_omit_params_round_trip_through_yaml(tmp_path: Path) -> None:

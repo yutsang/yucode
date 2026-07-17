@@ -31,6 +31,10 @@ provider:
     reasoning_effort: "medium"        # "high" | "medium" | "low" — raise for harder tasks
 
 runtime:
-  orchestration_mode: single          # single-agent loop; GPT-5.5 is strong-tier, doesn't need
-                                       # the multi-phase coordinator, and this keeps billable
-                                       # gateway calls predictable (charge-code!)
+  orchestration_mode: auto           # multi-phase coordinator for complex/investigation prompts,
+                                      # single-agent otherwise. GPT-5.5 is strong-tier and doesn't
+                                      # need it as often, but validated multi-account work (e.g.
+                                      # the fdd-commentary skill) benefits from the work->validate
+                                      # retry loop -- worth the extra billable gateway calls.
+  max_coordinator_retries: 3          # validation-failure retry rounds; each one reruns the whole
+                                      # work phase, so keep this well below max_iterations

@@ -481,6 +481,7 @@ runtime:
   permission_mode: workspace-write
   max_iterations: 32
   max_worker_steps: 20
+  max_coordinator_retries: 3
   orchestration_mode: auto
   parallel_workers: false
   shell_timeout_seconds: 30
@@ -898,7 +899,7 @@ def handle_chat(args: argparse.Namespace) -> int:
 
 
 def _apply_cli_overrides(config: Any, args: argparse.Namespace) -> Any:
-    from ..config import RuntimeOptions, ToolOptions
+    from ..config import ToolOptions
     changes: dict[str, Any] = {}
     if getattr(args, "model", None):
         # dataclasses.replace (not a manual field-by-field copy) so a --model
@@ -907,22 +908,12 @@ def _apply_cli_overrides(config: Any, args: argparse.Namespace) -> Any:
         # setup breaks silently if either is lost on a model override).
         changes["provider"] = dataclasses.replace(config.provider, model=args.model)
     if getattr(args, "permission_mode", None):
-        old_rt = config.runtime
-        changes["runtime"] = RuntimeOptions(
-            permission_mode=args.permission_mode,
-            max_iterations=old_rt.max_iterations,
-            max_worker_steps=old_rt.max_worker_steps,
-            orchestration_mode=old_rt.orchestration_mode,
-            parallel_workers=old_rt.parallel_workers,
-            max_tool_calls=old_rt.max_tool_calls,
-            dedup_tool_threshold=old_rt.dedup_tool_threshold,
-            auto_save_session=old_rt.auto_save_session,
-            auto_resume_latest=old_rt.auto_resume_latest,
-            compact_preserve_recent=old_rt.compact_preserve_recent,
-            compact_token_threshold=old_rt.compact_token_threshold,
-            shell_timeout_seconds=old_rt.shell_timeout_seconds,
-            include_git_context=old_rt.include_git_context,
-            config_dump_in_prompt=old_rt.config_dump_in_prompt,
+        # dataclasses.replace (not a manual field-by-field copy) so this can
+        # never silently drop a RuntimeOptions field it doesn't enumerate --
+        # the previous manual reconstruction here had already dropped
+        # compact_strategy/error_strategy on any --permission-mode override.
+        changes["runtime"] = dataclasses.replace(
+            config.runtime, permission_mode=args.permission_mode,
         )
     if getattr(args, "allowed_tools", None) is not None:
         changes["tools"] = ToolOptions(
@@ -1890,6 +1881,7 @@ def handle_status(args: argparse.Namespace) -> int:
             "model": config.provider.model,
             "permission_mode": config.runtime.permission_mode,
             "max_iterations": config.runtime.max_iterations,
+            "max_coordinator_retries": config.runtime.max_coordinator_retries,
             "orchestration_mode": config.runtime.orchestration_mode,
             "mcp_server_count": len(config.mcp),
             "tools_allowed": list(config.tools.allowed) if config.tools.allowed else None,
