@@ -39,17 +39,40 @@ ROLE_TOOLS: dict[WorkerRole, list[str]] = {
         "web_search", "web_fetch", "tool_search",
         "memory_list", "memory_read", "memory_search",
         # Office/PDF inspection so research can answer "what's in this spreadsheet?"
-        "inspect_excel_sheets", "read_excel_sheet", "read_excel_preview",
-        "read_word_text", "read_pptx", "read_pdf_text",
+        "inspect_excel_sheets", "read_excel_sheet", "list_excel_sheets", "excel_to_json",
+        "read_excel_preview", "read_word_text", "read_word_paragraphs",
+        "read_pptx", "inspect_pptx_shapes", "estimate_pptx_text_capacity",
+        "read_pdf_text", "image_read",
     ],
     WorkerRole.WORK: [
         "read_file", "read_files", "write_file", "edit_file", "list_directory",
         "grep_search", "glob_search", "bash", "notebook_edit",
         "memory_list", "memory_read",
+        # Office/PPTX read+write -- a "simple" plan runs everything (including
+        # the databook cross-check and the actual PPTX export) through this
+        # one role with no separate research phase, so WORK needs the full
+        # office toolset, not just the write-capable half. Missing from this
+        # list entirely (rather than just from a curated subset) meant a
+        # coordinator-routed FDD/PPTX task could produce commentary from
+        # research context but had no way to ever call fill_pptx_table or
+        # even inspect_pptx_shapes -- found from a real run where the output
+        # deck's financial table was never filled.
+        "inspect_excel_sheets", "read_excel_sheet", "list_excel_sheets", "excel_to_json",
+        "write_excel_cell", "read_excel_preview",
+        "read_word_text", "read_word_paragraphs", "write_word", "append_word",
+        "read_pptx", "write_pptx", "write_pptx_from_template",
+        "inspect_pptx_shapes", "fill_pptx_shape_text", "fill_pptx_table",
+        "estimate_pptx_text_capacity", "read_pdf_text", "image_read",
     ],
     WorkerRole.VALIDATE: [
         "read_file", "read_files", "list_directory", "grep_search", "glob_search",
         "bash",
+        # Read-only office/PPTX access so validation can check the ACTUAL
+        # produced artifact (e.g. "is the table shape really filled, is the
+        # commentary non-trivial") instead of only judging the worker's
+        # self-reported text.
+        "inspect_excel_sheets", "read_excel_sheet", "excel_to_json", "read_excel_preview",
+        "read_pptx", "inspect_pptx_shapes",
     ],
 }
 

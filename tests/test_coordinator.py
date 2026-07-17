@@ -15,12 +15,46 @@ import pytest
 
 from coding_agent.config import AppConfig, ProviderConfig, RuntimeOptions
 from coding_agent.core.coordinator import (
+    ROLE_TOOLS,
     AdminCoordinator,
     TaskPlan,
     ValidationResult,
     WorkerResult,
     WorkerRole,
 )
+
+
+class TestRoleToolsIncludeOfficeTools:
+    """Regression: WorkerRole.WORK/VALIDATE had NO office/PPTX tools at all --
+    a coordinator-routed FDD/PPTX task (any multi-project or multi-step
+    request is complex enough to route through the coordinator under
+    orchestration_mode: auto) could produce markdown commentary from research
+    context, but the WORK-phase worker had no way to ever call
+    fill_pptx_table or even inspect_pptx_shapes. Found from a real run whose
+    output deck had its financial table never filled."""
+
+    def test_work_role_can_write_pptx_and_read_databooks(self) -> None:
+        work_tools = ROLE_TOOLS[WorkerRole.WORK]
+        for tool in (
+            "inspect_pptx_shapes", "fill_pptx_shape_text", "fill_pptx_table",
+            "estimate_pptx_text_capacity", "write_pptx_from_template",
+            "read_excel_sheet", "excel_to_json", "inspect_excel_sheets",
+        ):
+            assert tool in work_tools, f"{tool} missing from WorkerRole.WORK"
+
+    def test_validate_role_can_inspect_but_not_write_pptx(self) -> None:
+        validate_tools = ROLE_TOOLS[WorkerRole.VALIDATE]
+        for tool in ("inspect_pptx_shapes", "read_pptx", "read_excel_sheet"):
+            assert tool in validate_tools, f"{tool} missing from WorkerRole.VALIDATE"
+        for tool in ("fill_pptx_shape_text", "fill_pptx_table", "write_pptx_from_template"):
+            assert tool not in validate_tools, f"{tool} should not be writable from VALIDATE"
+
+    def test_research_role_can_inspect_pptx_shapes(self) -> None:
+        # Already had read_pptx/read_excel_sheet; inspect_pptx_shapes and
+        # estimate_pptx_text_capacity were missing even from research.
+        research_tools = ROLE_TOOLS[WorkerRole.RESEARCH]
+        assert "inspect_pptx_shapes" in research_tools
+        assert "estimate_pptx_text_capacity" in research_tools
 
 
 @pytest.fixture()

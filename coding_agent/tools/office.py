@@ -333,6 +333,39 @@ def office_tools(registry: ToolRegistry) -> list[ToolDefinition]:
         ),
         ToolDefinition(
             ToolSpec(
+                "estimate_pptx_text_capacity",
+                "Estimate whether commentary text fits a named shape's slot on a .pptx slide, "
+                "using real font-glyph measurement (not a rough chars-per-inch guess). Pass the "
+                "SAME paragraphs list you're about to write with fill_pptx_shape_text. Returns "
+                "fill_ratio and remaining_lines_estimate -- use these to decide whether to add "
+                "more genuinely-supported detail (a slot at fill_ratio 0.2-0.3 has room to spare) "
+                "or trim (fill_ratio > 1.0 means it overflows). Call inspect_pptx_shapes first to "
+                "find slide_index/shape_name.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Path to .pptx file."},
+                        "slide_index": {"type": "integer", "description": "0-based slide index."},
+                        "shape_name": {"type": "string", "description": "Target shape's name (case-insensitive)."},
+                        "paragraphs": {
+                            "type": "array",
+                            "description": "Candidate paragraph strings, same shape as fill_pptx_shape_text's `paragraphs`.",
+                            "items": {"type": "string"},
+                        },
+                        "is_chinese": {
+                            "type": "boolean",
+                            "description": "Optional override; auto-detected (>30% CJK characters) if omitted.",
+                        },
+                    },
+                    "required": ["path", "slide_index", "shape_name", "paragraphs"],
+                },
+                "read-only",
+                RiskLevel.LOW,
+            ),
+            lambda args: _estimate_pptx_text_capacity(registry, args),
+        ),
+        ToolDefinition(
+            ToolSpec(
                 "read_excel_preview",
                 "Read an Excel file with schema inference. Returns headers, types, and a preview of the data.",
                 {
@@ -789,6 +822,38 @@ def _fill_pptx_table(registry: ToolRegistry, args: dict[str, Any]) -> str:
         "status": "ok", "slide_index": slide_index, "shape_name": shape_name,
         "rows_written": n_rows, "cols_written": n_cols, "output_path": str(output_path),
     }, indent=2)
+
+
+def _estimate_pptx_text_capacity(registry: ToolRegistry, args: dict[str, Any]) -> str:
+    pptx = _require("pptx", "python-pptx>=1.0", "pptx")
+    _require("PIL", "Pillow>=9.0", "pptx")
+    from . import text_metrics
+
+    path = registry._resolve_path(str(args["path"]))
+    slide_index = int(args["slide_index"])
+    shape_name = str(args["shape_name"])
+    paragraphs = [str(p) for p in args.get("paragraphs", [])]
+    is_chinese = args.get("is_chinese")
+    if is_chinese is not None:
+        is_chinese = bool(is_chinese)
+
+    prs = pptx.Presentation(str(path))
+    slide = _resolve_slide(prs, slide_index)
+    shape = _find_shape_by_name(slide, shape_name)
+    if not shape.has_text_frame:
+        raise ValueError(
+            f"Shape '{shape.name}' on slide {slide_index} has no text frame "
+            f"(is_table={shape.has_table}) — capacity estimation only applies to text shapes."
+        )
+
+    try:
+        result = text_metrics.estimate_capacity(shape, paragraphs, is_chinese=is_chinese)
+    except FileNotFoundError as exc:
+        raise ValueError(str(exc)) from exc
+
+    result["slide_index"] = slide_index
+    result["shape_name"] = shape.name
+    return json.dumps(result, indent=2)
 
 
 # ---- Excel preview handler --------------------------------------------------

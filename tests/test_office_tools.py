@@ -256,3 +256,59 @@ class TestFillPptxTable:
         }))
         payload = json.loads(output)
         assert payload["error_code"] == "tool_error"
+
+
+# ---------------------------------------------------------------------------
+# estimate_pptx_text_capacity: real glyph-width fit check, built so the skill
+# can ask "does this commentary use the slot's space" instead of eyeballing a
+# rough chars-per-inch heuristic (see tests/test_text_metrics.py for the
+# underlying module's own unit tests).
+# ---------------------------------------------------------------------------
+
+class TestEstimatePptxTextCapacity:
+    def test_reports_low_fill_ratio_for_short_text_in_a_large_slot(self, runtime: AgentRuntime, sample_pptx: Path) -> None:
+        output = runtime._execute_tool("estimate_pptx_text_capacity", json.dumps({
+            "path": "template.pptx", "slide_index": 0, "shape_name": "textMainBullets_L",
+            "paragraphs": ["Cash increased."], "is_chinese": False,
+        }))
+        payload = json.loads(output)
+        assert payload["fits"] is True
+        assert payload["fill_ratio"] < 0.5
+        assert payload["shape_name"] == "textMainBullets_L"
+
+    def test_wrong_shape_type_reports_clear_error(self, runtime: AgentRuntime, sample_pptx: Path) -> None:
+        output = runtime._execute_tool("estimate_pptx_text_capacity", json.dumps({
+            "path": "template.pptx", "slide_index": 0, "shape_name": "Table Placeholder",
+            "paragraphs": ["hi"],
+        }))
+        payload = json.loads(output)
+        assert payload["error_code"] == "tool_error"
+        assert "text frame" in payload["error"]
+
+    def test_missing_pillow_dependency_error_is_clean(self, runtime: AgentRuntime, sample_pptx: Path, monkeypatch) -> None:
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "PIL" or name.startswith("PIL."):
+                raise ImportError(f"No module named {name!r}")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        output = runtime._execute_tool("estimate_pptx_text_capacity", json.dumps({
+            "path": "template.pptx", "slide_index": 0, "shape_name": "textMainBullets_L",
+            "paragraphs": ["hi"],
+        }))
+        assert "Traceback" not in output
+        payload = json.loads(output)
+        assert payload["error_code"] == "tool_error"
+        assert "Pillow" in payload["error"]
+        assert "pip install" in payload["error"]
+
+    def test_unknown_shape_name_reports_available_shapes(self, runtime: AgentRuntime, sample_pptx: Path) -> None:
+        output = runtime._execute_tool("estimate_pptx_text_capacity", json.dumps({
+            "path": "template.pptx", "slide_index": 0, "shape_name": "doesNotExist",
+            "paragraphs": ["hi"],
+        }))
+        payload = json.loads(output)
+        assert payload["error_code"] == "tool_error"
+        assert "textMainBullets_L" in payload["error"]
