@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+from . import trust as _trust
 from .simple_yaml import YamlError, dump_yaml, load_yaml
 
 PermissionMode = Literal["read-only", "workspace-write", "danger-full-access", "prompt", "allow"]
@@ -192,11 +193,14 @@ class VscodeOptions:
 
 @dataclass(frozen=True)
 class HookOptions:
-    pre_tool_use: list[str] = field(default_factory=list)
-    post_tool_use: list[str] = field(default_factory=list)
-    post_tool_use_failure: list[str] = field(default_factory=list)
-    pre_compact: list[str] = field(default_factory=list)
-    post_compact: list[str] = field(default_factory=list)
+    # Each entry is either a plain command string (runs on every call of the
+    # event it's registered under) or {"command": ..., "matcher": ...} to
+    # scope it to specific tools -- see coding_agent/hooks/__init__.py.
+    pre_tool_use: list[Any] = field(default_factory=list)
+    post_tool_use: list[Any] = field(default_factory=list)
+    post_tool_use_failure: list[Any] = field(default_factory=list)
+    pre_compact: list[Any] = field(default_factory=list)
+    post_compact: list[Any] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -472,13 +476,32 @@ def load_app_config(explicit_path: str | None = None, workspace: Path | None = N
         raise ConfigError(f"Invalid YAML in {path}: {exc}") from exc
     raw_dict = _expect_dict(raw, "config")
 
+    # Repo-local config (<workspace>/.yucode/settings*.yml or mcp.yml) can
+    # define hook commands / MCP servers that would otherwise auto-execute
+    # just by running yucode inside a cloned/opened repo. Gate those two
+    # keys behind a persisted per-directory trust decision, and always clamp
+    # permission_mode to be no less restrictive than the home-level config
+    # already set -- see config/trust.py.
+    home_yucode_dir = Path.home().resolve() / ".yucode"
+    workspace_yucode_dir = (workspace or Path.cwd()).resolve() / ".yucode"
+    gate_repo_local = workspace_yucode_dir != home_yucode_dir
+    trusted = gate_repo_local and _trust.is_trusted(workspace or Path.cwd())
+
     if not explicit_path:
         for overlay_path in discover_config_paths(workspace):
             overlay = _load_config_file(overlay_path)
-            if overlay:
-                raw_dict = _deep_merge(raw_dict, overlay)
+            if not overlay:
+                continue
+            if gate_repo_local and overlay_path.resolve().parent == workspace_yucode_dir:
+                overlay = _trust.sanitize_repo_local_overlay(overlay, trusted=trusted)
+                base_mode = raw_dict.get("runtime", {}).get("permission_mode", "workspace-write")
+                overlay = _trust.clamp_permission_overlay(overlay, base_mode)
+            raw_dict = _deep_merge(raw_dict, overlay)
 
+    ws_mcp_path = _resolve_workspace_mcp_path(workspace)
     ws_servers = _load_workspace_mcp_servers(workspace)
+    if ws_servers and gate_repo_local and ws_mcp_path.resolve().parent == workspace_yucode_dir and not trusted:
+        ws_servers = []
     if ws_servers:
         mcp_container = raw_dict.setdefault("mcp", {})
         if not isinstance(mcp_container, dict):
@@ -600,11 +623,11 @@ def app_config_from_dict(raw: dict[str, Any]) -> AppConfig:
     mcp = [mcp_server_from_dict(item) for item in mcp_raw]
     hooks_raw = _expect_dict(raw.get("hooks", {}), "hooks")
     hooks = HookOptions(
-        pre_tool_use=_coerce_string_list(hooks_raw.get("pre_tool_use", []), "hooks.pre_tool_use"),
-        post_tool_use=_coerce_string_list(hooks_raw.get("post_tool_use", []), "hooks.post_tool_use"),
-        post_tool_use_failure=_coerce_string_list(hooks_raw.get("post_tool_use_failure", []), "hooks.post_tool_use_failure"),
-        pre_compact=_coerce_string_list(hooks_raw.get("pre_compact", []), "hooks.pre_compact"),
-        post_compact=_coerce_string_list(hooks_raw.get("post_compact", []), "hooks.post_compact"),
+        pre_tool_use=_coerce_hook_list(hooks_raw.get("pre_tool_use", []), "hooks.pre_tool_use"),
+        post_tool_use=_coerce_hook_list(hooks_raw.get("post_tool_use", []), "hooks.post_tool_use"),
+        post_tool_use_failure=_coerce_hook_list(hooks_raw.get("post_tool_use_failure", []), "hooks.post_tool_use_failure"),
+        pre_compact=_coerce_hook_list(hooks_raw.get("pre_compact", []), "hooks.pre_compact"),
+        post_compact=_coerce_hook_list(hooks_raw.get("post_compact", []), "hooks.post_compact"),
     )
     plugins_raw = _expect_dict(raw.get("plugins", {}), "plugins")
     plugins = PluginOptions(
@@ -734,6 +757,21 @@ def _coerce_string_list(value: Any, label: str) -> list[str]:
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
         raise ConfigError(f"{label} must be a list of strings")
     return list(value)
+
+
+def _coerce_hook_list(value: Any, label: str) -> list[Any]:
+    """Each entry is a plain command string, or {"command": ..., "matcher": ...}."""
+    if not isinstance(value, list):
+        raise ConfigError(f"{label} must be a list")
+    result: list[Any] = []
+    for item in value:
+        if isinstance(item, str):
+            result.append(item)
+        elif isinstance(item, dict) and isinstance(item.get("command"), str):
+            result.append({"command": item["command"], "matcher": item.get("matcher")})
+        else:
+            raise ConfigError(f"{label} entries must be a string or {{command, matcher}} object")
+    return result
 
 
 def _coerce_string_dict(value: Any, label: str) -> dict[str, str]:

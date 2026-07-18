@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import threading
+import uuid
 from typing import TYPE_CHECKING, Any
 
 from ..core.errors import tool_error_response
@@ -20,7 +22,12 @@ def agent_tools(registry: ToolRegistry) -> list[ToolDefinition]:
                 (
                     "Launch a sub-agent with a scoped task. Optionally specify a "
                     "role (research/work/validate) for automatic tool scoping, "
-                    "or provide explicit allowed_tools."
+                    "or provide explicit allowed_tools. By default this blocks "
+                    "until the sub-agent finishes (or times out after 5 minutes). "
+                    "Pass run_in_background=true for a long task to get a task_id "
+                    "back immediately instead of blocking — its result is delivered "
+                    "as a system-reminder on a later tool call, same as a "
+                    "background bash command."
                 ),
                 {
                     "type": "object",
@@ -35,6 +42,10 @@ def agent_tools(registry: ToolRegistry) -> list[ToolDefinition]:
                             "type": "array",
                             "items": {"type": "string"},
                             "description": "Explicit tool whitelist (overrides role).",
+                        },
+                        "run_in_background": {
+                            "type": "boolean",
+                            "description": "Return immediately with a task_id instead of blocking (default false).",
                         },
                     },
                     "required": ["prompt"],
@@ -68,6 +79,7 @@ def _resolve_allowed_tools(args: dict[str, Any]) -> list[str] | None:
 def _agent(registry: ToolRegistry, args: dict[str, Any]) -> str:
     prompt = str(args["prompt"])
     allowed = _resolve_allowed_tools(args)
+    run_in_background = bool(args.get("run_in_background", False))
 
     from ..core.runtime import AgentRuntime
     sub_config = registry.config
@@ -89,8 +101,8 @@ def _agent(registry: ToolRegistry, args: dict[str, Any]) -> str:
     timeout = _DEFAULT_AGENT_TIMEOUT
     sub_runtime = AgentRuntime(registry.workspace_root, sub_config, mcp_manager=registry.mcp_manager)
 
-    result_holder: list[Any] = []
-    error_holder: list[Exception] = []
+    result_holder: list[str] = []
+    error_holder: list[BaseException] = []
 
     def _run() -> None:
         try:
@@ -101,13 +113,38 @@ def _agent(registry: ToolRegistry, args: dict[str, Any]) -> str:
 
     thread = threading.Thread(target=_run, daemon=True)
     thread.start()
+    task_id = f"agent_{uuid.uuid4().hex[:8]}"
+
+    if run_in_background:
+        registry.register_subagent_task(task_id, prompt, thread, result_holder, error_holder)
+        return json.dumps({
+            "status": "started_background",
+            "task_id": task_id,
+            "message": (
+                f"Sub-agent '{task_id}' started in the background. Its result will be "
+                "delivered as a system-reminder after a later tool call — continue with "
+                "other work in the meantime instead of waiting."
+            ),
+        }, indent=2)
+
     thread.join(timeout=timeout)
 
     if thread.is_alive():
-        return tool_error_response(
-            f"Sub-agent timed out after {timeout}s",
-            error_code="agent_timeout",
-        )
+        # The thread keeps running regardless (Python threads can't be
+        # force-killed) -- track it instead of abandoning whatever it
+        # eventually produces. Mirrors auto_background_on_timeout for bash
+        # (tools/shell.py), but unconditional: there's no "kill" alternative
+        # for a thread the way there is for a subprocess.
+        registry.register_subagent_task(task_id, prompt, thread, result_holder, error_holder)
+        return json.dumps({
+            "status": "started_background",
+            "task_id": task_id,
+            "message": (
+                f"Sub-agent '{task_id}' exceeded {timeout}s and was moved to the "
+                "background instead of being abandoned; it is still running. Its result "
+                "will be delivered as a system-reminder after a later tool call."
+            ),
+        }, indent=2)
 
     if error_holder:
         return tool_error_response(

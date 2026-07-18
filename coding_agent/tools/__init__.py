@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
+import threading
 import time
 from collections.abc import Callable
 from contextlib import suppress
@@ -33,6 +34,25 @@ class BackgroundTask:
     command: str
     popen: subprocess.Popen
     output_path: Path
+    started_at: float = field(default_factory=time.monotonic)
+    reported: bool = False
+
+
+@dataclass
+class SubagentTask:
+    """A subagent (spawned via the `agent` tool with run_in_background=true)
+    running detached from the tool-call that started it.
+
+    Mirrors BackgroundTask's role for bash commands (tracked so the runtime
+    can poll for completion after each tool call and surface a
+    system-reminder instead of the model blocking on it) but a subagent's
+    "output" is a full run_turn() result, not a stdout stream -- so it has
+    its own result_holder/error_holder instead of a Popen/output_path."""
+    task_id: str
+    prompt: str
+    thread: threading.Thread
+    result_holder: list[str] = field(default_factory=list)
+    error_holder: list[BaseException] = field(default_factory=list)
     started_at: float = field(default_factory=time.monotonic)
     reported: bool = False
 
@@ -389,6 +409,7 @@ class ToolRegistry:
         self._builtin_names: set[str] = set()
         self._tools: dict[str, ToolDefinition] = {}
         self.background_tasks: dict[str, BackgroundTask] = {}
+        self.subagent_tasks: dict[str, SubagentTask] = {}
 
         for tool in self._builtin_tools():
             self._tools[tool.spec.name] = tool
@@ -615,6 +636,17 @@ class ToolRegistry:
         completion after each tool call (see tools/shell.py)."""
         self.background_tasks[task_id] = BackgroundTask(
             task_id=task_id, command=command, popen=popen, output_path=output_path,
+        )
+
+    def register_subagent_task(
+        self, task_id: str, prompt: str, thread: threading.Thread,
+        result_holder: list[str], error_holder: list[BaseException],
+    ) -> None:
+        """Track a detached subagent so the runtime can poll it for
+        completion after each tool call (see tools/agent_tool.py)."""
+        self.subagent_tasks[task_id] = SubagentTask(
+            task_id=task_id, prompt=prompt, thread=thread,
+            result_holder=result_holder, error_holder=error_holder,
         )
 
 

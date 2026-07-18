@@ -1161,6 +1161,9 @@ class AgentRuntime:
         bg = self._check_completed_background_tasks()
         if bg:
             reminders.append(bg)
+        sub = self._check_completed_subagent_tasks()
+        if sub:
+            reminders.append(sub)
         nudge = self._check_todo_nudge()
         if nudge:
             reminders.append(nudge)
@@ -1204,6 +1207,43 @@ class AgentRuntime:
                 f"Output{preview_note}:\n{preview}\n"
                 f"Full output at: {task.output_path}"
             )
+        if not lines:
+            return ""
+        return "<system-reminder>\n" + "\n\n---\n\n".join(lines) + "\n</system-reminder>"
+
+    def _check_completed_subagent_tasks(self) -> str:
+        """Poll tracked background subagents (spawned via the `agent` tool
+        with run_in_background=true, or auto-backgrounded on timeout) for
+        completions since the last check. Mirrors
+        _check_completed_background_tasks for bash commands, but a
+        subagent's "output" is a full run_turn() result rather than a
+        stdout stream -- see tools/agent_tool.py."""
+        import time as _time
+        lines: list[str] = []
+        for task in self.tools.subagent_tasks.values():
+            if task.reported or task.thread.is_alive():
+                continue
+            task.reported = True
+            elapsed = _time.monotonic() - task.started_at
+            prompt_preview = task.prompt[:200] + ("..." if len(task.prompt) > 200 else "")
+            if task.error_holder:
+                lines.append(
+                    f'Sub-agent "{task.task_id}" failed after {elapsed:.1f}s '
+                    f"(prompt: {prompt_preview!r}): {task.error_holder[0]}"
+                )
+            elif task.result_holder:
+                result_text = task.result_holder[0]
+                preview = result_text[-4000:] if len(result_text) > 4000 else result_text
+                preview_note = f" (last 4,000 of {len(result_text):,} chars)" if len(result_text) > 4000 else ""
+                lines.append(
+                    f'Sub-agent "{task.task_id}" completed (ran {elapsed:.1f}s, '
+                    f"prompt: {prompt_preview!r}).\nResult{preview_note}:\n{preview}"
+                )
+            else:
+                lines.append(
+                    f'Sub-agent "{task.task_id}" finished with no output after {elapsed:.1f}s '
+                    f"(prompt: {prompt_preview!r})."
+                )
         if not lines:
             return ""
         return "<system-reminder>\n" + "\n\n---\n\n".join(lines) + "\n</system-reminder>"

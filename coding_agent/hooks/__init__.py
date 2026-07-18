@@ -19,9 +19,11 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 import subprocess
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Any
 
 
 class HookEvent(Enum):
@@ -46,13 +48,34 @@ class HookRunResult:
         return self.denied
 
 
+HookEntry = str | dict[str, Any]
+"""A hook config entry. Either a plain command string (runs on every call of
+the event it's registered under), or {"command": ..., "matcher": ...} to
+scope it to specific tools -- matcher is an exact tool name, a "|"-separated
+list of tool names, or a /regex/ (matched against the tool name)."""
+
+
+def _entry_command_and_matcher(entry: HookEntry) -> tuple[str, str | None]:
+    if isinstance(entry, str):
+        return entry, None
+    return str(entry.get("command", "")), entry.get("matcher") or None
+
+
+def _matcher_matches(matcher: str | None, tool_name: str) -> bool:
+    if not matcher:
+        return True
+    if matcher.startswith("/") and matcher.endswith("/") and len(matcher) > 1:
+        return re.match(matcher[1:-1], tool_name) is not None
+    return tool_name in {part.strip() for part in matcher.split("|")}
+
+
 @dataclass
 class HookConfig:
-    pre_tool_use: list[str] = field(default_factory=list)
-    post_tool_use: list[str] = field(default_factory=list)
-    post_tool_use_failure: list[str] = field(default_factory=list)
-    pre_compact: list[str] = field(default_factory=list)
-    post_compact: list[str] = field(default_factory=list)
+    pre_tool_use: list[HookEntry] = field(default_factory=list)
+    post_tool_use: list[HookEntry] = field(default_factory=list)
+    post_tool_use_failure: list[HookEntry] = field(default_factory=list)
+    pre_compact: list[HookEntry] = field(default_factory=list)
+    post_compact: list[HookEntry] = field(default_factory=list)
 
 
 class HookRunner:
@@ -117,13 +140,17 @@ class HookRunner:
     def _run_commands(
         self,
         event: HookEvent,
-        commands: list[str],
+        commands: list[HookEntry],
         tool_name: str,
         tool_input: str,
         tool_output: str | None = None,
         is_error: bool = False,
     ) -> HookRunResult:
-        if not commands:
+        matching = [
+            cmd for cmd, matcher in (_entry_command_and_matcher(entry) for entry in commands)
+            if cmd and _matcher_matches(matcher, tool_name)
+        ]
+        if not matching:
             return HookRunResult.allow()
 
         try:
@@ -141,7 +168,7 @@ class HookRunner:
         })
 
         messages: list[str] = []
-        for command in commands:
+        for command in matching:
             outcome = self._run_single(command, event, tool_name, tool_input, tool_output, is_error, payload)
             if outcome.kind == _OutcomeKind.ALLOW:
                 if outcome.message:

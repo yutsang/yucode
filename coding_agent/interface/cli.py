@@ -75,6 +75,15 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("config-path", help="Print the active config path.").set_defaults(handler=handle_config_path)
     subparsers.add_parser("bridge", help="Start the JSONL bridge used by VS Code.").set_defaults(handler=handle_bridge)
 
+    trust_cmd = subparsers.add_parser(
+        "trust",
+        help="Trust (or revoke/list trust for) a workspace's repo-local .yucode/ hooks and MCP servers.",
+    )
+    trust_cmd.add_argument("--workspace", default=".", help="Workspace directory (default: current dir).")
+    trust_cmd.add_argument("--remove", action="store_true", help="Revoke trust for this workspace instead of granting it.")
+    trust_cmd.add_argument("--list", action="store_true", dest="list_trusted", help="List all trusted workspace directories.")
+    trust_cmd.set_defaults(handler=handle_trust)
+
     init = subparsers.add_parser("init", help="Scaffold a new project directory with config and instruction files.")
     init.add_argument("target", nargs="?", default=".", help="Target directory (default: current dir).")
     init.set_defaults(handler=handle_init)
@@ -445,6 +454,34 @@ def handle_config_path(args: argparse.Namespace) -> int:
 
 def handle_bridge(args: argparse.Namespace) -> int:
     return BridgeServer().serve_forever()
+
+
+def handle_trust(args: argparse.Namespace) -> int:
+    from ..config.trust import list_trusted_workspaces, trust_workspace, untrust_workspace
+
+    if getattr(args, "list_trusted", False):
+        trusted = list_trusted_workspaces()
+        if not trusted:
+            print("No trusted workspace directories.")
+        else:
+            for entry in trusted:
+                print(entry)
+        return 0
+
+    workspace = Path(args.workspace).resolve()
+    if args.remove:
+        untrust_workspace(workspace)
+        render_success(
+            f"Revoked trust for {workspace} — its repo-local .yucode/ hooks and MCP servers will no "
+            "longer be applied until trusted again."
+        )
+    else:
+        trust_workspace(workspace)
+        render_success(
+            f"Trusted {workspace} — its repo-local .yucode/settings*.yml hooks and MCP servers will "
+            "now be applied. Run `yucode trust --remove` to revoke."
+        )
+    return 0
 
 
 _DEFAULT_YUCODE_MD = """\
@@ -1190,6 +1227,11 @@ def _run_interactive(args: argparse.Namespace) -> int:
     workspace = Path(args.workspace).resolve()
     config = load_app_config(args.config_path, workspace=workspace)
     config = _apply_cli_overrides(config, args)
+
+    from ..config.trust import describe_untrusted_repo_local_config
+    _trust_warning = describe_untrusted_repo_local_config(workspace)
+    if _trust_warning:
+        print(render_warning(_trust_warning))
 
     session = None
     session_info = ""
