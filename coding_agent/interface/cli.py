@@ -1031,7 +1031,6 @@ def _make_pt_session(workspace: Path) -> Any:
     try:
         from prompt_toolkit import PromptSession
         from prompt_toolkit.completion import Completer, Completion
-        from prompt_toolkit.filters import in_paste_mode
         from prompt_toolkit.history import FileHistory
         from prompt_toolkit.key_binding import KeyBindings
     except ImportError:
@@ -1074,20 +1073,48 @@ def _make_pt_session(workspace: Path) -> Any:
 
     kb = KeyBindings()
 
-    @kb.add("enter", eager=True, filter=~in_paste_mode)
+    @kb.add("enter", eager=True)
     def _enter_submit(event):
+        # A genuinely successful bracketed paste never reaches this handler
+        # at all -- prompt_toolkit's own built-in binding for Keys.BracketedPaste
+        # (registered separately, merged in by PromptSession) inserts the
+        # whole pasted blob as one atomic operation. This handler only sees
+        # individual "enter" keys, which is exactly what happens when a
+        # paste's embedded newlines leak through as standalone keystrokes
+        # instead of being bundled into that one atomic event.
+        #
+        # That leak is common on Windows: prompt_toolkit's Win32 console
+        # reader has no native bracketed-paste signal to work with (unlike
+        # POSIX terminals, which get real \x1b[200~/\x1b[201~ markers), so it
+        # guesses by reading a whole batch of console input events in one
+        # non-blocking call and heuristically deciding "this batch looks like
+        # a paste" only if that SAME batch contains at least one newline AND
+        # at least one other character (see prompt_toolkit's
+        # ConsoleInputReader._is_paste). If the OS/terminal happens to
+        # deliver the paste split across multiple such batches -- plausible
+        # for a large paste, slow terminal, or redirected console -- any
+        # sub-batch containing just an isolated newline fails that check and
+        # arrives as a bare "enter" KeyPress instead. (An earlier attempt to
+        # fix this checked `in_paste_mode`, but that filter reflects
+        # Application.paste_mode -- a static per-session flag nobody here
+        # ever sets to True, not a live "currently receiving a paste" signal
+        # -- so it never actually took effect.)
+        #
+        # The robust, protocol-independent signal: a real standalone Enter
+        # keypress has nothing else queued up behind it. A leaked paste
+        # newline arrives back-to-back with the rest of that same input
+        # batch, which is fed into the key processor's queue before being
+        # handled one key at a time -- so if more keys are already waiting
+        # here, this "enter" is almost certainly mid-paste, not a submit.
         buf = event.current_buffer
         if buf.complete_state:
             # Accept the selected completion but don't submit yet
             buf.complete_state = None
             return
+        if event.key_processor.input_queue:
+            buf.insert_text("\n")
+            return
         buf.validate_and_handle()
-
-    @kb.add("enter", filter=in_paste_mode)
-    def _enter_in_paste(event):
-        # During bracketed paste the terminal emits Enter for embedded newlines;
-        # those must be inserted, not submit the buffer.
-        event.current_buffer.insert_text("\n")
 
     @kb.add("escape", "enter")
     def _alt_enter_newline(event):

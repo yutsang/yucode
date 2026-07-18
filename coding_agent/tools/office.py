@@ -366,6 +366,34 @@ def office_tools(registry: ToolRegistry) -> list[ToolDefinition]:
         ),
         ToolDefinition(
             ToolSpec(
+                "locate_databook_stage_columns",
+                "Scan a financial databook sheet's header rows for reporting 'basis/stage' "
+                "labels (Indicative adjusted, Mgt acc, Audited, Audit adjustment, Indicative "
+                "adjustment -- including common Traditional/Simplified Chinese and typo "
+                "variants) and return exactly which column each canonical stage occupies, "
+                "with its associated period date. Call this BEFORE reading account figures "
+                "from a databook, instead of visually picking which of many similarly-dated "
+                "column groups is the required one (e.g. 'use only the Indicative adjusted "
+                "columns') -- real databooks routinely place 10-30+ date columns side by "
+                "side across 2-5 basis groups with only a text label distinguishing them, no "
+                "cell merging or other structural hint. Returns found=false if the sheet "
+                "doesn't have a recognizable multi-basis header.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Path to .xlsx file."},
+                        "sheet": {"type": "string", "description": "Sheet name (default: active sheet)."},
+                        "max_scan_rows": {"type": "integer", "description": "Max rows to scan for the basis/header row (default 20)."},
+                    },
+                    "required": ["path"],
+                },
+                "read-only",
+                RiskLevel.LOW,
+            ),
+            lambda args: _locate_databook_stage_columns(registry, args),
+        ),
+        ToolDefinition(
+            ToolSpec(
                 "read_excel_preview",
                 "Read an Excel file with schema inference. Returns headers, types, and a preview of the data.",
                 {
@@ -854,6 +882,26 @@ def _estimate_pptx_text_capacity(registry: ToolRegistry, args: dict[str, Any]) -
     result["slide_index"] = slide_index
     result["shape_name"] = shape.name
     return json.dumps(result, indent=2)
+
+
+def _locate_databook_stage_columns(registry: ToolRegistry, args: dict[str, Any]) -> str:
+    openpyxl = _require("openpyxl", "openpyxl>=3.1", "excel")
+    from . import databook_metrics
+
+    path = registry._resolve_path(str(args["path"]))
+    sheet_name = args.get("sheet")
+    max_scan_rows = int(args.get("max_scan_rows", 20))
+
+    wb = openpyxl.load_workbook(str(path), data_only=True)
+    ws = wb[sheet_name] if sheet_name else wb.active
+    scan_end = min(ws.min_row + max_scan_rows, ws.max_row)
+    rows = [[c.value for c in row_cells] for row_cells in ws.iter_rows(min_row=ws.min_row, max_row=scan_end)]
+    resolved_sheet_name = ws.title
+    wb.close()
+
+    result = databook_metrics.locate_stage_columns(rows)
+    result["sheet"] = resolved_sheet_name
+    return json.dumps(result, indent=2, ensure_ascii=False, default=str)
 
 
 # ---- Excel preview handler --------------------------------------------------

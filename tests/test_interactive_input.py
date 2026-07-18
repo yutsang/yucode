@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import os
+from collections import deque
 from pathlib import Path
 
 import pytest
+from prompt_toolkit.buffer import Buffer, CompletionState
 from prompt_toolkit.document import Document
+from prompt_toolkit.keys import Keys
 
-from coding_agent.interface.cli import _SLASH_COMMANDS, _AT_HIDDEN, _make_pt_session, _read_prompt_line
+from coding_agent.interface.cli import _AT_HIDDEN, _SLASH_COMMANDS, _make_pt_session, _read_prompt_line
 
 
 @pytest.fixture()
@@ -191,3 +194,100 @@ class TestPromptToolkitFallback:
         fake = _FakeSession()
         assert _read_prompt_line(fake) == "from prompt_toolkit"
         assert len(fake.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Enter key binding: distinguishing a real submit from a paste's embedded
+# newlines leaking through as individual "enter" keystrokes.
+#
+# Windows has no native bracketed-paste signal (unlike POSIX terminals'
+# \x1b[200~/\x1b[201~ markers): prompt_toolkit's Win32 console reader
+# heuristically re-synthesizes a paste event from a batch of raw console
+# input records only when that SAME batch contains >=1 newline AND >=1
+# other character (see prompt_toolkit.input.win32.ConsoleInputReader
+# ._is_paste). If the OS/terminal delivers a paste split across multiple
+# such batches, a sub-batch containing an isolated newline fails that check
+# and arrives as a bare "enter" KeyPress instead -- indistinguishable, at
+# that point, from the user actually pressing Enter.
+#
+# The fix checks KeyPressEvent.key_processor.input_queue instead: a real,
+# standalone Enter has nothing else queued up behind it, while a leaked
+# paste-newline arrives back-to-back with the rest of the same burst
+# (fed into the queue before being processed one key at a time). This is
+# protocol-independent -- it doesn't matter whether the terminal supports
+# bracketed paste at all.
+# ---------------------------------------------------------------------------
+
+class _FakeKeyProcessor:
+    def __init__(self, input_queue):
+        self.input_queue = input_queue
+
+
+class _FakeEnterEvent:
+    def __init__(self, buffer, input_queue):
+        self.current_buffer = buffer
+        self.key_processor = _FakeKeyProcessor(input_queue)
+
+
+def _find_enter_handler(session):
+    for binding in session.key_bindings.bindings:
+        if tuple(binding.keys) == (Keys.ControlM,):
+            return binding.handler
+    raise AssertionError("no plain 'enter' binding found on the session")
+
+
+class TestEnterKeyPasteHandling:
+    def test_leaked_newline_with_more_keys_queued_inserts_newline_not_submit(self, tmp_workspace: Path) -> None:
+        session = _make_pt_session(tmp_workspace)
+        handler = _find_enter_handler(session)
+        buf = Buffer()
+        buf.insert_text("line1")
+        submitted: list[str] = []
+        buf.accept_handler = lambda b: submitted.append(b.text) or True
+        handler(_FakeEnterEvent(buf, deque(["still-queued"])))
+        assert buf.text == "line1\n"
+        assert submitted == []
+
+    def test_standalone_enter_with_empty_queue_submits(self, tmp_workspace: Path) -> None:
+        session = _make_pt_session(tmp_workspace)
+        handler = _find_enter_handler(session)
+        buf = Buffer()
+        buf.insert_text("hello")
+        submitted: list[str] = []
+        buf.accept_handler = lambda b: submitted.append(b.text) or True
+        handler(_FakeEnterEvent(buf, deque()))
+        assert "\n" not in buf.text
+        assert submitted == ["hello"]
+
+    def test_full_multiline_paste_with_leaked_enters_submits_as_one_block(self, tmp_workspace: Path) -> None:
+        """End-to-end simulation of the actual bug: a 3-line paste whose
+        embedded newlines leak through individually must still be preserved
+        as ONE multi-line prompt, not split into 3 premature submissions."""
+        session = _make_pt_session(tmp_workspace)
+        handler = _find_enter_handler(session)
+        buf = Buffer()
+        submitted: list[str] = []
+        buf.accept_handler = lambda b: submitted.append(b.text) or True
+
+        buf.insert_text("line1")
+        handler(_FakeEnterEvent(buf, deque(["x"])))  # leaked newline #1, more queued
+        buf.insert_text("line2")
+        handler(_FakeEnterEvent(buf, deque(["y"])))  # leaked newline #2, more queued
+        buf.insert_text("line3")
+        handler(_FakeEnterEvent(buf, deque()))  # the real, final Enter
+
+        assert submitted == ["line1\nline2\nline3"]
+
+    def test_open_completion_popup_still_takes_precedence(self, tmp_workspace: Path) -> None:
+        """Accepting a completion (e.g. a slash command) must win even if
+        keys happen to be queued behind this Enter."""
+        session = _make_pt_session(tmp_workspace)
+        handler = _find_enter_handler(session)
+        buf = Buffer()
+        buf.insert_text("/mo")
+        buf.complete_state = CompletionState(original_document=Document("/mo"))
+        submitted: list[str] = []
+        buf.accept_handler = lambda b: submitted.append(b.text) or True
+        handler(_FakeEnterEvent(buf, deque(["queued"])))
+        assert buf.complete_state is None
+        assert submitted == []
