@@ -184,6 +184,110 @@ class TestFillPptxShapeText:
         assert payload["error_code"] == "tool_error"
         assert "out of range" in payload["error"]
 
+    def test_missing_pillow_dependency_error_is_clean(self, runtime: AgentRuntime, sample_pptx: Path, monkeypatch) -> None:
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "PIL" or name.startswith("PIL."):
+                raise ImportError(f"No module named {name!r}")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        output = runtime._execute_tool("fill_pptx_shape_text", json.dumps({
+            "path": "template.pptx", "output_path": "report.pptx",
+            "slide_index": 0, "shape_name": "textMainBullets_L",
+            "paragraphs": ["hi"],
+        }))
+        assert "Traceback" not in output
+        payload = json.loads(output)
+        assert payload["error_code"] == "tool_error"
+        assert "Pillow" in payload["error"]
+        assert "pip install" in payload["error"]
+
+    def test_applies_fixed_font_and_size_matching_capacity_estimate(self, runtime: AgentRuntime, sample_pptx: Path) -> None:
+        """fill_pptx_shape_text must render at the same 9pt Arial / single
+        spacing / 3pt gap that estimate_pptx_text_capacity assumes when
+        predicting fit -- otherwise the two tools silently disagree."""
+        runtime._execute_tool("fill_pptx_shape_text", json.dumps({
+            "path": "template.pptx", "output_path": "report.pptx",
+            "slide_index": 0, "shape_name": "textMainBullets_L",
+            "paragraphs": ["Cash increased.", "Mainly due to operating inflows."],
+        }))
+        from pptx import Presentation
+        result = Presentation(str(runtime.workspace_root / "report.pptx"))
+        shape = next(s for s in result.slides[0].shapes if s.name == "textMainBullets_L")
+        for p in shape.text_frame.paragraphs:
+            assert p.line_spacing == 1.0
+            assert p.space_after.pt == 3.0
+            for run in p.runs:
+                assert run.font.name == "Arial"
+                assert run.font.size.pt == 9.0
+
+    def test_selects_chinese_font_by_auto_detection(self, runtime: AgentRuntime, sample_pptx: Path) -> None:
+        runtime._execute_tool("fill_pptx_shape_text", json.dumps({
+            "path": "template.pptx", "output_path": "report.pptx",
+            "slide_index": 0, "shape_name": "textMainBullets_L",
+            "paragraphs": ["示意性调整数变动主要由于经营性现金流入增加所致。"],
+        }))
+        from pptx import Presentation
+        result = Presentation(str(runtime.workspace_root / "report.pptx"))
+        shape = next(s for s in result.slides[0].shapes if s.name == "textMainBullets_L")
+        assert shape.text_frame.paragraphs[0].runs[0].font.name == "Microsoft YaHei"
+
+    def test_is_chinese_override_forces_font_regardless_of_content(self, runtime: AgentRuntime, sample_pptx: Path) -> None:
+        output = runtime._execute_tool("fill_pptx_shape_text", json.dumps({
+            "path": "template.pptx", "output_path": "report.pptx",
+            "slide_index": 0, "shape_name": "textMainBullets_L",
+            "paragraphs": ["Cash increased."], "is_chinese": True,
+        }))
+        payload = json.loads(output)
+        assert payload["font_name"] == "Microsoft YaHei"
+
+    def test_sets_no_autofit_when_text_fits_the_shape(self, runtime: AgentRuntime, sample_pptx: Path) -> None:
+        output = runtime._execute_tool("fill_pptx_shape_text", json.dumps({
+            "path": "template.pptx", "output_path": "report.pptx",
+            "slide_index": 0, "shape_name": "textMainBullets_L",
+            "paragraphs": ["Short line."],
+        }))
+        payload = json.loads(output)
+        assert payload["autofit"] == "none"
+
+        from pptx import Presentation
+        from pptx.oxml.ns import qn
+        result = Presentation(str(runtime.workspace_root / "report.pptx"))
+        shape = next(s for s in result.slides[0].shapes if s.name == "textMainBullets_L")
+        body_pr = shape.text_frame._txBody.bodyPr
+        assert body_pr.find(qn("a:noAutofit")) is not None
+
+    def test_sets_bounded_shrink_autofit_when_text_overflows(self, runtime: AgentRuntime) -> None:
+        from pptx import Presentation
+        from pptx.util import Inches
+
+        prs = Presentation()
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+        box = slide.shapes.add_textbox(Inches(1), Inches(1), Inches(2), Inches(0.3))
+        box.name = "tinyBox"
+        path = runtime.workspace_root / "tiny.pptx"
+        prs.save(str(path))
+
+        output = runtime._execute_tool("fill_pptx_shape_text", json.dumps({
+            "path": "tiny.pptx", "output_path": "tiny_out.pptx",
+            "slide_index": 0, "shape_name": "tinyBox",
+            "paragraphs": [
+                "This sentence is far too long to fit inside a two inch by "
+                "point three inch text box at nine point Arial font size.",
+            ],
+        }))
+        payload = json.loads(output)
+        assert payload["autofit"] == "bounded_shrink"
+
+        from pptx.oxml.ns import qn
+        result = Presentation(str(runtime.workspace_root / "tiny_out.pptx"))
+        shape = next(s for s in result.slides[0].shapes if s.name == "tinyBox")
+        autofit_el = shape.text_frame._txBody.bodyPr.find(qn("a:normAutofit"))
+        assert autofit_el is not None
+        assert int(autofit_el.get("fontScale")) <= 100000
+
 
 class TestFillPptxTable:
     def test_rebuilds_table_matching_data_size_exactly(self, runtime: AgentRuntime, sample_pptx: Path) -> None:

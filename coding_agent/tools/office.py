@@ -277,7 +277,12 @@ def office_tools(registry: ToolRegistry) -> list[ToolDefinition]:
                 "Write text into a specific named shape (text box or placeholder) on a specific "
                 "slide of a .pptx file. Matches shape name case-insensitively. Use "
                 "inspect_pptx_shapes first to find the right slide_index/shape_name. Pass the "
-                "same path as output_path to keep progressively filling the same in-progress file.",
+                "same path as output_path to keep progressively filling the same in-progress file. "
+                "Applies the same fixed formatting estimate_pptx_text_capacity assumes (9pt "
+                "Arial/Microsoft YaHei, single spacing, 3pt paragraph gap) so the two tools never "
+                "disagree, and sets the shape's autofit accordingly: noAutofit when the text fits "
+                "(exact size, no surprise PowerPoint shrink), or a bounded shrink-to-fit when it "
+                "doesn't (visible, not silently clipped).",
                 {
                     "type": "object",
                     "properties": {
@@ -289,6 +294,10 @@ def office_tools(registry: ToolRegistry) -> list[ToolDefinition]:
                             "type": "array",
                             "description": "List of paragraph strings; each becomes one paragraph/bullet.",
                             "items": {"type": "string"},
+                        },
+                        "is_chinese": {
+                            "type": "boolean",
+                            "description": "Optional override for font selection; auto-detected (>30% CJK characters) if omitted.",
                         },
                     },
                     "required": ["path", "output_path", "slide_index", "shape_name", "paragraphs"],
@@ -767,13 +776,64 @@ def _inspect_pptx_shapes(registry: ToolRegistry, args: dict[str, Any]) -> str:
     return json.dumps({"slides": slides_info}, indent=2)
 
 
+_AUTOFIT_TAGS = ("a:spAutoFit", "a:normAutofit", "a:noAutofit")
+_BOUNDED_AUTOFIT_MIN_SCALE = 0.70
+
+
+def _clear_autofit(body_pr: Any) -> None:
+    from pptx.oxml.ns import qn
+    for tag in _AUTOFIT_TAGS:
+        for child in body_pr.findall(qn(tag)):
+            body_pr.remove(child)
+
+
+def _force_no_autofit(text_frame: Any) -> None:
+    """Set bodyPr autofit to <a:noAutofit/> so text renders at exactly the
+    size just applied. A freshly-added or template placeholder shape often
+    ships with <a:spAutoFit/> (resize shape to text) or a stale
+    <a:normAutofit fontScale=".."/> computed by PowerPoint for whatever text
+    was there before -- either would silently override the size for newly
+    written content that estimate_pptx_text_capacity never accounted for."""
+    from pptx.oxml import parse_xml
+    body_pr = text_frame._txBody.bodyPr
+    _clear_autofit(body_pr)
+    body_pr.append(parse_xml(
+        '<a:noAutofit xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"/>'
+    ))
+
+
+def _apply_bounded_autofit(text_frame: Any, font_scale: float) -> None:
+    """Set a real <a:normAutofit> so PowerPoint visibly shrinks text that
+    doesn't fit at the fixed size, instead of silently clipping it at the
+    shape edge. Bounded at _BOUNDED_AUTOFIT_MIN_SCALE so extreme overflow
+    still clips rather than rendering illegibly small text."""
+    from pptx.oxml import parse_xml
+    scale = max(_BOUNDED_AUTOFIT_MIN_SCALE, min(1.0, float(font_scale)))
+    font_pct = int(round(scale * 100000))
+    line_pct = int(round(max(0.0, (1.0 - scale) * 0.5) * 100000))
+    body_pr = text_frame._txBody.bodyPr
+    _clear_autofit(body_pr)
+    body_pr.append(parse_xml(
+        f'<a:normAutofit xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
+        f'fontScale="{font_pct}" lnSpcReduction="{line_pct}"/>'
+    ))
+
+
 def _fill_pptx_shape_text(registry: ToolRegistry, args: dict[str, Any]) -> str:
     pptx = _require("pptx", "python-pptx>=1.0", "pptx")
+    _require("PIL", "Pillow>=9.0", "pptx")
+    from pptx.util import Pt
+
+    from . import text_metrics
+
     path = registry._resolve_path(str(args["path"]))
     output_path = registry._resolve_path(str(args["output_path"]))
     slide_index = int(args["slide_index"])
     shape_name = str(args["shape_name"])
     paragraphs = [str(p) for p in args.get("paragraphs", [])]
+    is_chinese = args.get("is_chinese")
+    if is_chinese is not None:
+        is_chinese = bool(is_chinese)
 
     prs = pptx.Presentation(str(path))
     slide = _resolve_slide(prs, slide_index)
@@ -784,17 +844,48 @@ def _fill_pptx_shape_text(registry: ToolRegistry, args: dict[str, Any]) -> str:
             f"(is_table={shape.has_table}) — use fill_pptx_table instead."
         )
 
+    chinese = (
+        text_metrics.is_predominantly_chinese("\n".join(paragraphs))
+        if is_chinese is None else is_chinese
+    )
+    font_name = "Microsoft YaHei" if chinese else "Arial"
+
+    # Same fixed 9pt / single-spacing / 3pt-gap formatting that
+    # estimate_pptx_text_capacity assumes when predicting fit -- without
+    # this, the two tools silently disagree: capacity says "fits" for
+    # formatting that fill_pptx_shape_text never actually applies.
     tf = shape.text_frame
     tf.clear()
     for i, para_text in enumerate(paragraphs):
         p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
         p.text = para_text
+        p.line_spacing = text_metrics.ESTIMATE_LINE_SPACING
+        p.space_before = Pt(0)
+        p.space_after = Pt(text_metrics.ESTIMATE_PARA_GAP_PT)
+        for run in p.runs:
+            run.font.name = font_name
+            run.font.size = Pt(text_metrics.ESTIMATE_FONT_SIZE_PT)
+
+    try:
+        capacity = text_metrics.estimate_capacity(shape, paragraphs, is_chinese=chinese)
+    except FileNotFoundError:
+        capacity = None
+    if capacity is None or capacity["fits"]:
+        _force_no_autofit(tf)
+        autofit = "none"
+    else:
+        used = capacity["used_height_pt"]
+        font_scale = capacity["box_height_pt"] / used if used > 0 else 1.0
+        _apply_bounded_autofit(tf, font_scale)
+        autofit = "bounded_shrink"
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     prs.save(str(output_path))
     return json.dumps({
         "status": "ok", "slide_index": slide_index, "shape_name": shape.name,
         "paragraphs_written": len(paragraphs), "output_path": str(output_path),
+        "font_name": font_name, "font_size_pt": text_metrics.ESTIMATE_FONT_SIZE_PT,
+        "autofit": autofit,
     }, indent=2)
 
 
