@@ -47,6 +47,15 @@ class CompactionConfig:
     max_estimated_tokens: int = 10_000
     strategy: CompactStrategy = "heuristic"
     llm_compactor: Any = None
+    # Path to a full pre-compaction archive (see runtime.py::_archive_before_compact).
+    # When set, the continuation text points the model at it so summary-dropped
+    # detail (exact code, error text, earlier tool output) can be read back.
+    transcript_path: str | None = None
+    # Pre-rendered <system-reminder> block (edited files / open todos /
+    # running background tasks — see runtime.py::_build_compaction_state_reminder)
+    # appended to the continuation so this session state survives compaction
+    # instead of only living in the summary's prose.
+    state_reminder: str | None = None
 
 
 @dataclass
@@ -118,7 +127,13 @@ def compact_session(
 
     summary = _merge_summaries(existing_summary, raw_summary)
     formatted = format_compact_summary(summary)
-    continuation = get_compact_continuation(summary, suppress_follow_up=True, recent_preserved=bool(preserved))
+    continuation = get_compact_continuation(
+        summary,
+        suppress_follow_up=True,
+        recent_preserved=bool(preserved),
+        transcript_path=cfg.transcript_path,
+        state_reminder=cfg.state_reminder,
+    )
 
     compacted = [Msg(role="system", content=continuation)] + list(preserved)
     return CompactionResult(
@@ -258,13 +273,46 @@ def format_compact_summary(summary: str) -> str:
     return _collapse_blank_lines(formatted).strip()
 
 
+# Floor for a cleaned LLM-generated summary. Below this it's almost
+# certainly a degenerate response (e.g. "I'll summarize the conversation:"
+# with no actual content, or a truncated/empty completion) rather than a
+# real summary that can carry a compacted session's task state.
+MIN_SUMMARY_SEED_CHARS = 500
+
+
+def is_degenerate_summary(raw_summary: str) -> bool:
+    """True when *raw_summary* is too small to plausibly carry the task state
+    of the conversation it would replace. Callers should retry once (like a
+    transient failure) before falling back to the heuristic summarizer."""
+    return len(format_compact_summary(raw_summary)) < MIN_SUMMARY_SEED_CHARS
+
+
+def format_transcript_location(path: str) -> str:
+    """A pointer block telling the model where to recover pre-compaction detail.
+
+    Appended to the compaction continuation so summary-dropped detail (exact
+    code, error text, earlier tool output) is recoverable via read_file/grep
+    instead of gone for good."""
+    return (
+        "\n\nIf you need specific details that were dropped from the summary "
+        "above (exact code, error messages, or content from earlier in this "
+        f"conversation), read the full pre-compaction transcript at:\n{path}"
+    )
+
+
 def get_compact_continuation(
     summary: str,
     *,
     suppress_follow_up: bool = True,
     recent_preserved: bool = True,
+    transcript_path: str | None = None,
+    state_reminder: str | None = None,
 ) -> str:
     base = f"{_CONTINUATION_PREAMBLE}{format_compact_summary(summary)}"
+    if state_reminder:
+        base += f"\n\n{state_reminder}"
+    if transcript_path:
+        base += format_transcript_location(transcript_path)
     if recent_preserved:
         base += f"\n\n{_RECENT_MESSAGES_NOTE}"
     if suppress_follow_up:

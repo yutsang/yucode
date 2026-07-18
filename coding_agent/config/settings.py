@@ -135,6 +135,35 @@ class RuntimeOptions:
     shell_timeout_seconds: int = 30
     include_git_context: bool = True
     config_dump_in_prompt: bool = True
+    # Tool-result pruning: shrinks old tool results in the *request copy* sent
+    # to the provider (the on-disk session history is untouched). Gated on
+    # estimated context usage exceeding half of compact_token_threshold, so
+    # it acts as an earlier, softer step before full compaction kicks in.
+    prune_tool_results: bool = True
+    prune_keep_last_turns: int = 3
+    prune_soft_trim_threshold: int = 4000
+    prune_soft_trim_head: int = 1500
+    prune_soft_trim_tail: int = 1500
+    prune_hard_clear_turns: int = 10
+    # Convert a foreground bash command that hits its timeout into a
+    # background task instead of killing it outright.
+    auto_background_on_timeout: bool = False
+    # TodoWrite nudge: remind the model to track work with todo_write if it
+    # hasn't called it in a while.
+    todo_nudge_enabled: bool = True
+    todo_nudge_turns_since_write: int = 3
+    todo_nudge_min_gap_turns: int = 5
+    # TodoWrite turn-end gate: force another iteration when the model tries
+    # to stop with pending/in_progress todos still open. Opt-in (costs extra
+    # inference), capped per prompt.
+    todo_gate_enabled: bool = False
+    todo_gate_max_fires_per_prompt: int = 2
+    # Remind the model once per session about instruction files (CLAUDE.md
+    # etc.) discovered near paths it touches outside the initial cwd chain.
+    agents_md_discovery_enabled: bool = True
+    # Same idea as agents_md_discovery_enabled, but for skill directories
+    # (.yucode/skills etc.) found near a path the model just touched.
+    skill_discovery_enabled: bool = True
 
 
 @dataclass(frozen=True)
@@ -264,6 +293,20 @@ class AppConfig:
                 "shell_timeout_seconds": self.runtime.shell_timeout_seconds,
                 "include_git_context": self.runtime.include_git_context,
                 "config_dump_in_prompt": self.runtime.config_dump_in_prompt,
+                "prune_tool_results": self.runtime.prune_tool_results,
+                "prune_keep_last_turns": self.runtime.prune_keep_last_turns,
+                "prune_soft_trim_threshold": self.runtime.prune_soft_trim_threshold,
+                "prune_soft_trim_head": self.runtime.prune_soft_trim_head,
+                "prune_soft_trim_tail": self.runtime.prune_soft_trim_tail,
+                "prune_hard_clear_turns": self.runtime.prune_hard_clear_turns,
+                "auto_background_on_timeout": self.runtime.auto_background_on_timeout,
+                "todo_nudge_enabled": self.runtime.todo_nudge_enabled,
+                "todo_nudge_turns_since_write": self.runtime.todo_nudge_turns_since_write,
+                "todo_nudge_min_gap_turns": self.runtime.todo_nudge_min_gap_turns,
+                "todo_gate_enabled": self.runtime.todo_gate_enabled,
+                "todo_gate_max_fires_per_prompt": self.runtime.todo_gate_max_fires_per_prompt,
+                "agents_md_discovery_enabled": self.runtime.agents_md_discovery_enabled,
+                "skill_discovery_enabled": self.runtime.skill_discovery_enabled,
             },
             "tools": {
                 "allowed": list(self.tools.allowed),
@@ -511,6 +554,36 @@ def app_config_from_dict(raw: dict[str, Any]) -> AppConfig:
         ),
         include_git_context=bool(runtime_raw.get("include_git_context", True)),
         config_dump_in_prompt=bool(runtime_raw.get("config_dump_in_prompt", True)),
+        prune_tool_results=bool(runtime_raw.get("prune_tool_results", True)),
+        prune_keep_last_turns=_coerce_positive_int(
+            runtime_raw.get("prune_keep_last_turns", 3), "runtime.prune_keep_last_turns",
+        ),
+        prune_soft_trim_threshold=_coerce_positive_int(
+            runtime_raw.get("prune_soft_trim_threshold", 4000), "runtime.prune_soft_trim_threshold",
+        ),
+        prune_soft_trim_head=_coerce_positive_int(
+            runtime_raw.get("prune_soft_trim_head", 1500), "runtime.prune_soft_trim_head",
+        ),
+        prune_soft_trim_tail=_coerce_positive_int(
+            runtime_raw.get("prune_soft_trim_tail", 1500), "runtime.prune_soft_trim_tail",
+        ),
+        prune_hard_clear_turns=_coerce_positive_int(
+            runtime_raw.get("prune_hard_clear_turns", 10), "runtime.prune_hard_clear_turns",
+        ),
+        auto_background_on_timeout=bool(runtime_raw.get("auto_background_on_timeout", False)),
+        todo_nudge_enabled=bool(runtime_raw.get("todo_nudge_enabled", True)),
+        todo_nudge_turns_since_write=_coerce_positive_int(
+            runtime_raw.get("todo_nudge_turns_since_write", 3), "runtime.todo_nudge_turns_since_write",
+        ),
+        todo_nudge_min_gap_turns=_coerce_positive_int(
+            runtime_raw.get("todo_nudge_min_gap_turns", 5), "runtime.todo_nudge_min_gap_turns",
+        ),
+        todo_gate_enabled=bool(runtime_raw.get("todo_gate_enabled", False)),
+        todo_gate_max_fires_per_prompt=_coerce_positive_int(
+            runtime_raw.get("todo_gate_max_fires_per_prompt", 2), "runtime.todo_gate_max_fires_per_prompt",
+        ),
+        agents_md_discovery_enabled=bool(runtime_raw.get("agents_md_discovery_enabled", True)),
+        skill_discovery_enabled=bool(runtime_raw.get("skill_discovery_enabled", True)),
     )
     tools = ToolOptions(
         allowed=_coerce_string_list(tools_raw.get("allowed", []), "tools.allowed"),

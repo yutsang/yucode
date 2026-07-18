@@ -88,17 +88,56 @@ def load_skill(workspace: Path, name: str) -> SkillInfo | None:
     return None
 
 
-def skill_summaries_for_prompt(workspace: Path) -> str:
+# Default budget for the injected skill list. Unbounded injection means the
+# prompt grows linearly with skill count forever; grok-build caps its skill
+# listing similarly (50% of context window) and degrades through the same
+# full -> shortened -> names-only tiers rather than hard-truncating mid-line.
+DEFAULT_SKILLS_SUMMARY_MAX_CHARS = 4_000
+
+_HEADER = "# Available skills"
+_FOOTER = "\nUse the `load_skill` tool with a skill name to read its full instructions."
+
+
+def skill_summaries_for_prompt(workspace: Path, max_chars: int = DEFAULT_SKILLS_SUMMARY_MAX_CHARS) -> str:
     skills = list_skills(workspace)
     if not skills:
         return ""
-    lines = ["# Available skills"]
-    for skill in skills:
-        desc = f" -- {skill.description}" if skill.description else ""
-        lines.append(f"- {skill.name}{desc}")
-    lines.append("")
-    lines.append("Use the `load_skill` tool with a skill name to read its full instructions.")
-    return "\n".join(lines)
+
+    def _render(desc_cap: int | None) -> str:
+        lines = [_HEADER]
+        for skill in skills:
+            if not skill.description or desc_cap == 0:
+                desc = ""
+            elif desc_cap is None:
+                desc = f" -- {skill.description}"
+            else:
+                d = skill.description[:desc_cap]
+                truncated_mark = "…" if len(skill.description) > desc_cap else ""
+                desc = f" -- {d}{truncated_mark}"
+            lines.append(f"- {skill.name}{desc}")
+        return "\n".join(lines) + _FOOTER
+
+    full = _render(desc_cap=None)
+    if len(full) <= max_chars:
+        return full
+
+    # Tier 2: cap each skill's description, trying progressively shorter caps.
+    for cap in (200, 80, 30):
+        candidate = _render(desc_cap=cap)
+        if len(candidate) <= max_chars:
+            return candidate
+
+    # Tier 3: names only, no descriptions.
+    names_only = _render(desc_cap=0)
+    if len(names_only) <= max_chars:
+        return names_only
+
+    # Even names-only doesn't fit (huge skill count) -- summarize by count.
+    return (
+        f"{_HEADER}\n{len(skills)} skills available (too many to list individually). "
+        "Use tool_search or glob_search on the skill directories to find one by keyword."
+        f"{_FOOTER}"
+    )
 
 
 def _discover_skill_roots(workspace: Path) -> list[Path]:

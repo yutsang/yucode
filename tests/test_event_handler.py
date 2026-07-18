@@ -243,7 +243,7 @@ class TestWarningEvents:
 
     def test_auto_compaction_prints_to_stdout(self, capsys):
         h, _ = _make_handler()
-        _feed(h, {"type": "auto_compaction", "removed": 12, "cumulative_input_tokens": 50000})
+        _feed(h, {"type": "auto_compaction", "removed": 12, "trigger_input_tokens": 50000})
         out = capsys.readouterr().out
         assert "12" in out
         assert "50,000" in out

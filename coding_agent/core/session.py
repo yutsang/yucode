@@ -3,14 +3,62 @@ from __future__ import annotations
 import json
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
+
+if TYPE_CHECKING:
+    from ..config.settings import RuntimeOptions
 
 _log = logging.getLogger("yucode.session")
 
 Role = Literal["system", "user", "assistant", "tool"]
 SESSION_VERSION = 1
+
+# Placeholder for a tool result cleared because it's old enough to be
+# unlikely to matter anymore (parity with grok-build's HARD_CLEAR_PLACEHOLDER).
+_HARD_CLEAR_PLACEHOLDER = "[Tool result omitted — too old]"
+# Separator inserted between head and tail in soft-trimmed tool results.
+_SOFT_TRIM_SEPARATOR = "\n\n[...trimmed...]\n\n"
+
+
+def _prune_tool_results(messages: list[Message], runtime: RuntimeOptions) -> list[Message]:
+    """Shrink old tool results by turn age, without mutating *messages*.
+
+    Walking backward from the end, `turn_from_end` counts how many `user`
+    messages have been passed — 0 for tool results after the last user
+    message (the in-flight turn), 1 for results between the 2nd-to-last and
+    last user message, and so on. Tool results within `prune_keep_last_turns`
+    are left untouched; results at or beyond `prune_hard_clear_turns` are
+    replaced outright; results in between are soft-trimmed (head + tail)
+    only if they exceed the threshold.
+
+    Returns a new list — messages that aren't changed are the same objects,
+    changed ones are shallow copies, so the caller's stored history (and any
+    other reference to the original `Message` objects) is never touched.
+    """
+    result = list(messages)
+    turn_from_end = 0
+    for i in range(len(result) - 1, -1, -1):
+        msg = result[i]
+        if msg.role == "user":
+            turn_from_end += 1
+            continue
+        if msg.role != "tool":
+            continue
+        if turn_from_end < runtime.prune_keep_last_turns:
+            continue
+        content = msg.content or ""
+        if turn_from_end >= runtime.prune_hard_clear_turns:
+            if content != _HARD_CLEAR_PLACEHOLDER:
+                result[i] = replace(msg, content=_HARD_CLEAR_PLACEHOLDER)
+            continue
+        keep = runtime.prune_soft_trim_head + runtime.prune_soft_trim_tail
+        if len(content) > runtime.prune_soft_trim_threshold and len(content) > keep:
+            head = content[: runtime.prune_soft_trim_head]
+            tail = content[-runtime.prune_soft_trim_tail :] if runtime.prune_soft_trim_tail else ""
+            result[i] = replace(msg, content=f"{head}{_SOFT_TRIM_SEPARATOR}{tail}")
+    return result
 
 
 @dataclass
@@ -198,9 +246,27 @@ class Session:
     def add_message(self, message: Message) -> None:
         self.messages.append(message)
 
-    def provider_messages(self, system_prompt: str) -> list[dict[str, Any]]:
+    def provider_messages(
+        self,
+        system_prompt: str,
+        *,
+        pruning: RuntimeOptions | None = None,
+    ) -> list[dict[str, Any]]:
+        """Assemble the message list sent to the provider.
+
+        When *pruning* is given and enabled, tool results are shrunk by turn
+        age (see `_prune_tool_results`) IF estimated context usage already
+        exceeds half of `compact_token_threshold` — this is a request-time-only
+        transformation; `self.messages` (the on-disk session history) is never
+        mutated, so nothing here is a real loss.
+        """
+        messages = self.messages
+        if pruning is not None and pruning.prune_tool_results:
+            from ..memory.compact import estimate_session_tokens
+            if estimate_session_tokens(self.messages) > pruning.compact_token_threshold // 2:
+                messages = _prune_tool_results(self.messages, pruning)
         return [{"role": "system", "content": system_prompt}] + [
-            message.to_provider_message() for message in self.messages
+            message.to_provider_message() for message in messages
         ]
 
     # ---- persistence -------------------------------------------------------

@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import logging
+import subprocess
+import time
 from collections.abc import Callable
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -18,6 +20,21 @@ from ..security.permissions import PermissionMode
 _log = logging.getLogger("yucode.tools")
 
 ToolHandler = Callable[[dict[str, Any]], str]
+
+
+@dataclass
+class BackgroundTask:
+    """A bash command running (or that ran) detached from the tool-call that started it.
+
+    Tracked so the runtime can poll for completion after each tool call and
+    surface a system-reminder (see runtime.py::_check_completed_background_tasks)
+    instead of the model having to guess when — or whether — to check back in."""
+    task_id: str
+    command: str
+    popen: subprocess.Popen
+    output_path: Path
+    started_at: float = field(default_factory=time.monotonic)
+    reported: bool = False
 
 
 class RiskLevel(str, Enum):
@@ -243,21 +260,50 @@ def _run_lsp(args: dict[str, Any]) -> str:
     ), indent=2)
 
 
+_ASK_USER_TIMEOUT_SECONDS = 1800  # 30 minutes
+
+
 def _run_ask_user(args: dict[str, Any]) -> str:
     question = str(args.get("question", args.get("text", "")))
     options = args.get("options", [])
     if not question:
         return json.dumps({"error": "No question provided"})
-    try:
-        print(f"\n  Agent question: {question}")
-        if options:
-            for i, opt in enumerate(options):
-                label = opt if isinstance(opt, str) else opt.get("label", str(opt))
-                print(f"    {i + 1}. {label}")
-        answer = input("  Your answer: ").strip()
-        return json.dumps({"answer": answer, "question": question})
-    except (EOFError, KeyboardInterrupt):
-        return json.dumps({"answer": "", "question": question, "cancelled": True})
+    print(f"\n  Agent question: {question}")
+    if options:
+        for i, opt in enumerate(options):
+            label = opt if isinstance(opt, str) else opt.get("label", str(opt))
+            print(f"    {i + 1}. {label}")
+
+    # A bare input() blocks forever if stdin is never answered (piped/non-TTY,
+    # headless run, or the user just walks away) — a real hang risk for
+    # scripted/CI use. Read it on a daemon thread and bound the wait; on
+    # timeout the thread is abandoned (matches agent_tool.py's subagent
+    # timeout pattern — there's no way to force-interrupt a blocking input()).
+    import threading
+    result: list[str] = []
+    cancelled: list[bool] = []
+
+    def _read_answer() -> None:
+        try:
+            result.append(input("  Your answer: ").strip())
+        except (EOFError, KeyboardInterrupt):
+            cancelled.append(True)
+
+    thread = threading.Thread(target=_read_answer, daemon=True)
+    thread.start()
+    thread.join(timeout=_ASK_USER_TIMEOUT_SECONDS)
+
+    if thread.is_alive():
+        return json.dumps({
+            "answer": "", "question": question,
+            "cancelled": True, "reason": "timeout",
+        })
+    if cancelled:
+        return json.dumps({
+            "answer": "", "question": question,
+            "cancelled": True, "reason": "interrupted",
+        })
+    return json.dumps({"answer": result[0], "question": question})
 
 
 def _run_remote_trigger(args: dict[str, Any]) -> str:
@@ -342,6 +388,7 @@ class ToolRegistry:
         self.mcp_manager = mcp_manager
         self._builtin_names: set[str] = set()
         self._tools: dict[str, ToolDefinition] = {}
+        self.background_tasks: dict[str, BackgroundTask] = {}
 
         for tool in self._builtin_tools():
             self._tools[tool.spec.name] = tool
@@ -476,11 +523,13 @@ class ToolRegistry:
         from .misc import misc_tools
         from .notebook import notebook_tools
         from .office import office_tools
+        from .patch import patch_tools
         from .shell import shell_tools
         from .web import web_tools
 
         tools: list[ToolDefinition] = []
         tools.extend(filesystem_tools(self))
+        tools.extend(patch_tools(self))
         tools.extend(shell_tools(self))
         tools.extend(web_tools(self))
         tools.extend(notebook_tools(self))
@@ -558,6 +607,15 @@ class ToolRegistry:
                     f"Path `{resolved}` escapes the workspace (canonical: {canonical})"
                 )
         return resolved
+
+    def register_background_task(
+        self, task_id: str, command: str, popen: subprocess.Popen, output_path: Path,
+    ) -> None:
+        """Track a detached bash process so the runtime can poll it for
+        completion after each tool call (see tools/shell.py)."""
+        self.background_tasks[task_id] = BackgroundTask(
+            task_id=task_id, command=command, popen=popen, output_path=output_path,
+        )
 
 
 def _normalize_tool_name(name: str) -> str:

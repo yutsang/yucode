@@ -58,6 +58,25 @@ runtime:
   shell_timeout_seconds: 30
   include_git_context: true
   config_dump_in_prompt: true
+  # Shrink old tool results in the request sent to the provider once context
+  # usage passes half of compact_token_threshold (session history on disk is
+  # untouched).
+  prune_tool_results: true
+  prune_keep_last_turns: 3
+  prune_soft_trim_threshold: 4000
+  prune_soft_trim_head: 1500
+  prune_soft_trim_tail: 1500
+  prune_hard_clear_turns: 10
+  # Convert a foreground bash command that hits its timeout into a
+  # background task instead of killing it outright.
+  auto_background_on_timeout: false
+  todo_nudge_enabled: true
+  todo_nudge_turns_since_write: 3
+  todo_nudge_min_gap_turns: 5
+  todo_gate_enabled: false
+  todo_gate_max_fires_per_prompt: 2
+  agents_md_discovery_enabled: true
+  skill_discovery_enabled: true
 tools:
   allowed: []
   disabled: []

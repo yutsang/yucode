@@ -274,6 +274,82 @@ def _write_file(registry: ToolRegistry, args: dict[str, Any]) -> str:
     return f"Wrote {rel} ({num_lines} lines, {actual_size:,} bytes)"
 
 
+# Unicode "look-alike" characters that commonly enter old_string via
+# copy-paste from Word/PDF/web content (this agent's Office tooling makes
+# that path especially common) but differ at the byte level from their
+# ASCII counterparts, silently breaking an otherwise-correct edit_file call.
+_CONFUSABLE_MAP: dict[str, str] = {
+    "‘": "'", "’": "'", "ʼ": "'",  # smart single quotes
+    "“": '"', "”": '"',                  # smart double quotes
+    "–": "-", "—": "-",                  # en dash, em dash
+    "…": "...",                                 # ellipsis
+    " ": " ",                                   # non-breaking space
+}
+
+
+def _normalize_confusables(text: str) -> str:
+    for confusable, ascii_equiv in _CONFUSABLE_MAP.items():
+        text = text.replace(confusable, ascii_equiv)
+    return text
+
+
+def _build_nearest_match_hint(file_text: str, old_string: str) -> str:
+    """A short 'Nearest match: line N: ...' hint for a failed edit_file match.
+
+    Finds the first file line containing the longest whitespace-separated
+    token from old_string's first line — usually enough to point the model
+    at the right area to re-read. Returns "" if nothing found."""
+    first_line = old_string.splitlines()[0] if old_string else ""
+    tokens = first_line.split()
+    if not tokens:
+        return ""
+    keyword = max(tokens, key=len)
+    if not keyword:
+        return ""
+    for i, line in enumerate(file_text.splitlines(), start=1):
+        if keyword in line:
+            snippet = line.strip()
+            if len(snippet) > 200:
+                snippet = snippet[:200] + "…"
+            return f"\n\nNearest match: line {i}: {snippet}"
+    return ""
+
+
+def _build_confusable_hint(file_text: str, old_string: str) -> str:
+    """A targeted diagnostic when old_string fails to match exactly but
+    WOULD match after normalizing Unicode look-alikes (smart quotes,
+    em/en-dashes, ellipsis, NBSP). Returns "" when nothing confusable is
+    involved, so this never adds noise to an unrelated failed match."""
+    if not any(c in file_text for c in _CONFUSABLE_MAP):
+        return ""
+    norm_file = _normalize_confusables(file_text)
+    norm_old = _normalize_confusables(old_string)
+    if norm_old not in norm_file:
+        return ""
+    # Normalization never touches newlines, so line boundaries in norm_file
+    # line up exactly with file_text's — this line number is exact, not approximate.
+    match_start = norm_file.find(norm_old)
+    match_line = norm_file[:match_start].count("\n") + 1
+    affected = [
+        i for i, (orig_line, norm_line) in enumerate(
+            zip(file_text.splitlines(), norm_file.splitlines(), strict=True), start=1,
+        )
+        if orig_line != norm_line
+    ]
+    nearby = [n for n in affected if abs(n - match_line) <= 3] or affected[:5]
+    if not nearby:
+        return ""
+    lines_str = ", ".join(str(n) for n in nearby[:8])
+    return (
+        "\n\nThe file contains Unicode typography characters (smart quotes, "
+        f"em/en-dashes, or an ellipsis) on line(s) {lines_str} that look "
+        "identical to ASCII but differ at the byte level — this is likely "
+        "why the match failed. Re-read the file and copy old_string "
+        "directly from its output, or anchor old_string on shorter "
+        "ASCII-only context near that line."
+    )
+
+
 def _edit_file(registry: ToolRegistry, args: dict[str, Any]) -> str:
     path = registry._resolve_path(str(args["path"]))
     old = str(args["old_string"])
@@ -288,7 +364,8 @@ def _edit_file(registry: ToolRegistry, args: dict[str, Any]) -> str:
     text = path.read_text(encoding="utf-8")
     occurrences = text.count(old)
     if occurrences == 0:
-        raise ValueError(f"`{old}` not found in {path}")
+        hint = _build_confusable_hint(text, old) + _build_nearest_match_hint(text, old)
+        raise ValueError(f"`{old}` not found in {path}{hint}")
     if not replace_all and occurrences > 1:
         raise ValueError(
             f"`old_string` matches {occurrences} places in {path}. "

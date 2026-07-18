@@ -751,8 +751,8 @@ class _InteractiveEventHandler:
         elif etype == "auto_compaction":
             self._progress.stop()
             removed = event.get("removed", 0)
-            tokens = event.get("cumulative_input_tokens", 0)
-            print(render_info(f"Auto-compacted {removed} messages ({tokens:,} cumulative input tokens)"))
+            tokens = event.get("trigger_input_tokens", 0)
+            print(render_info(f"Auto-compacted {removed} messages ({tokens:,} input tokens)"))
         elif etype == "usage":
             pass
         elif etype == "completed":
@@ -838,8 +838,8 @@ def _cli_event_callback(event: dict[str, Any]) -> None:
     elif etype == "auto_compaction":
         progress.stop()
         removed = event.get("removed", 0)
-        tokens = event.get("cumulative_input_tokens", 0)
-        print(render_info(f"Auto-compacted {removed} messages ({tokens:,} cumulative input tokens)"))
+        tokens = event.get("trigger_input_tokens", 0)
+        print(render_info(f"Auto-compacted {removed} messages ({tokens:,} input tokens)"))
     elif etype == "assistant_delta":
         # Stream the model's intermediate text so users can see reasoning, not
         # just tool-call labels. Stops the spinner so the text isn't clobbered.

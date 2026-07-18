@@ -7,7 +7,9 @@ import re
 import time
 import urllib.parse
 import urllib.request
+import uuid
 from html import unescape
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
@@ -23,6 +25,14 @@ _FETCH_TIMEOUT = 30
 _BRAVE_API_URL = "https://api.search.brave.com/res/v1/web/search"
 
 _log = logging.getLogger("yucode.tools.web")
+
+
+def _web_fetch_artifact_path(registry: ToolRegistry) -> Path:
+    """Return a fresh path for a full-page web_fetch artifact under workspace state."""
+    from ..config.settings import state_dir
+    out_dir = state_dir(registry.workspace_root) / "web_fetch"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir / f"{uuid.uuid4().hex[:12]}.md"
 
 
 def web_tools(registry: ToolRegistry) -> list[ToolDefinition]:
@@ -46,7 +56,7 @@ def web_tools(registry: ToolRegistry) -> list[ToolDefinition]:
                 "read-only",
                 RiskLevel.HIGH,
             ),
-            lambda args: _web_fetch(args),
+            lambda args: _web_fetch(registry, args),
         ),
         ToolDefinition(
             ToolSpec(
@@ -84,7 +94,7 @@ def _build_redirect_limited_opener() -> urllib.request.OpenerDirector:
     return urllib.request.build_opener(_LimitedRedirectHandler)
 
 
-def _web_fetch(args: dict[str, Any]) -> str:
+def _web_fetch(registry: ToolRegistry, args: dict[str, Any]) -> str:
     raw_url = str(args["url"])
     prompt = str(args.get("prompt", ""))
     url = _normalize_fetch_url(raw_url)
@@ -113,6 +123,20 @@ def _web_fetch(args: dict[str, Any]) -> str:
     cleaned = _clean_html(body) if is_html else body.strip()
     summary = _summarize_web_fetch(final_url, prompt, cleaned)
 
+    # The prompt-based extraction above (_summarize_web_fetch) caps its
+    # output at a few thousand chars — anything beyond that used to be
+    # silently gone. If it dropped content, persist the full cleaned page so
+    # it's still recoverable via read_file/grep instead of lost outright.
+    artifact_path: Path | None = None
+    if len(cleaned) > len(summary):
+        artifact_path = _web_fetch_artifact_path(registry)
+        artifact_path.write_text(cleaned, encoding="utf-8", errors="replace")
+        summary += (
+            f"\n\n[Full page content ({len(cleaned):,} chars) saved to: {artifact_path}. "
+            "Use read_file with offset/limit, or grep_search on that file, to find "
+            "specific details beyond this preview.]"
+        )
+
     result: dict[str, Any] = {
         "url": final_url,
         "status": status_code,
@@ -124,6 +148,8 @@ def _web_fetch(args: dict[str, Any]) -> str:
     if truncated:
         result["truncated"] = True
         result["max_bytes"] = _MAX_RESPONSE_SIZE
+    if artifact_path is not None:
+        result["artifact_file"] = str(artifact_path)
 
     return json.dumps(result, indent=2)
 

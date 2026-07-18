@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import hashlib
 import json
 import logging
@@ -19,6 +20,7 @@ from ..memory.compact import (
     CompactionResult,
     compact_session,
     estimate_session_tokens,
+    is_degenerate_summary,
     should_compact,
 )
 from ..memory.prompting import PromptAssembler, discover_project_context
@@ -78,6 +80,63 @@ def _parse_auto_compact_threshold() -> int:
 
 def _content_stable_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def _shrink_json_strings(node: Any, max_leaf_chars: int) -> bool:
+    """Recursively shorten over-long string leaves in *node* (dict/list), in place.
+
+    Returns True if anything was shortened. Handles nested shapes (a list of
+    dicts, like read_files' batch result; a dict with a list field, like
+    list_directory's entries) so the JSON-safety fix in _truncate_tool_output
+    isn't limited to a flat {"stdout": ..., "stderr": ...}-style dict."""
+    shrunk = False
+    if isinstance(node, dict):
+        pairs: Any = node.items()
+    elif isinstance(node, list):
+        pairs = enumerate(node)
+    else:
+        return False
+    for key, value in pairs:
+        if isinstance(value, str) and len(value) > max_leaf_chars:
+            node[key] = value[:max_leaf_chars] + f"\n\n[truncated; {len(value):,} chars total]"
+            shrunk = True
+        elif isinstance(value, (dict, list)) and _shrink_json_strings(value, max_leaf_chars):
+            shrunk = True
+    return shrunk
+
+
+def _truncate_tool_output(output: str, max_bytes: int) -> str:
+    """Cap *output* at roughly *max_bytes*, keeping JSON structurally valid.
+
+    Naive byte-slicing a JSON-serialized string can land inside a string
+    value or before a closing brace, producing invalid JSON that silently
+    breaks any downstream json.loads() of the tool result (e.g. the bash
+    returncode parser in _record_tool_observation, or a tool's own disk-
+    pointer footer for large output). When *output* parses as JSON, its
+    largest string leaves (anywhere in the structure) are shortened instead,
+    so the result stays valid JSON. Falls back to the previous plain-text
+    head truncation for non-JSON tool output, or JSON with no leaf worth
+    shrinking (e.g. bloat from many small fields rather than a few large
+    ones — rare in practice)."""
+    try:
+        payload = json.loads(output)
+    except (json.JSONDecodeError, ValueError):
+        payload = None
+    if isinstance(payload, (dict, list)):
+        max_leaf_chars = max(max_bytes // 4, 500)
+        if _shrink_json_strings(payload, max_leaf_chars):
+            return json.dumps(payload, indent=2, ensure_ascii=False)
+
+    encoded = output.encode("utf-8", errors="replace")
+    truncated = encoded[:max_bytes].decode("utf-8", errors="replace")
+    last_nl = truncated.rfind("\n")
+    if last_nl > max_bytes // 2:
+        truncated = truncated[:last_nl]
+    return (
+        truncated
+        + f"\n\n[Output capped at {max_bytes // 1024}KB. "
+        "Use offset/limit, a narrower glob/grep pattern, or read specific sections.]"
+    )
 
 
 @dataclass
@@ -222,6 +281,84 @@ def _check_final_answer_grounding(
     return None
 
 
+def _prepare_transcript_for_summary(messages: list[dict]) -> str:
+    """Flatten the full conversation being compacted into transcript text
+    for the LLM summarizer.
+
+    Tool results are dropped (raw tool output doesn't help a summary — the
+    summary should capture what the agent learned and did, not re-paste
+    stdout/file contents) and each assistant tool call is flattened into a
+    short `[Called tools: ...]` annotation instead of full arguments. User
+    and assistant text is kept verbatim and untruncated, unlike the previous
+    30-message/400-char preview, so the summarizer sees the actual
+    conversation rather than a low-detail sample of it."""
+    lines: list[str] = []
+    for m in messages:
+        role = m.get("role", "?")
+        if role == "tool":
+            continue
+        content = str(m.get("content") or "")
+        tool_calls = m.get("tool_calls") or []
+        if tool_calls:
+            names = [tc.get("name", "?") for tc in tool_calls]
+            annotation = f"[Called tools: {', '.join(names)}]"
+            content = f"{content}\n{annotation}" if content else annotation
+        lines.append(f"[{role}]\n{content}")
+    return "\n\n".join(lines)
+
+
+# Structured summary prompt (adapted from grok-build's compaction prompt):
+# numbered sections outperform a single "be concise but complete" instruction
+# because they force the model to actually enumerate files/errors/pending
+# work rather than write one vague paragraph.
+_STRUCTURED_SUMMARY_PROMPT = """Your task is to create a detailed summary of the conversation above between a user and a coding agent, paying close attention to the user's explicit requests and all actions taken so far. This summary should be thorough enough that another coding agent could continue the work with no other context than this summary and the original user request.
+
+Your final summary must contain the following sections, in order:
+
+1. Primary Request and Intent: capture all of the user's explicit requests in detail, including any evolution or change of direction over the conversation.
+2. Key Technical Concepts: technologies, frameworks, patterns, and architectural decisions discussed.
+3. Files and Code Artifacts: every file read, created, or modified, with a summary of why it matters and any code snippets essential for continuation.
+4. Errors and Fixes: every error encountered (tool failures, test failures, wrong assumptions) and how it was diagnosed and fixed. Pay special attention to explicit user corrections ("do this differently", "no, ...", confirmations of an approach).
+5. Problem Solving: problems solved so far and any ongoing troubleshooting.
+6. Pending Work: what remains to be done, in priority order.
+7. All User Messages: list every user message verbatim (not tool results) in order — these carry the intent and feedback that must not be lost.
+
+Output the summary directly using the section headings above as plain text. Do not wrap the output in <summary> tags or any other markup — the caller adds that wrapper itself. Do not call any tools."""
+
+
+# Instruction-file names checked by the AGENTS.md dynamic-discovery reminder
+# (subset of memory/prompting.py::discover_instruction_files's list — path-only
+# check here, no content reading).
+_INSTRUCTION_FILENAMES = ("CLAUDE.md", "YUCODE.md", "AGENTS.md", "CLAW.md")
+
+# Skill-directory relative paths checked by the skill dynamic-discovery
+# reminder — matches memory/skills.py::_discover_skill_roots's workspace-
+# relative roots (the home-directory roots there aren't relevant to an
+# upward walk from a workspace-relative accessed path).
+_SKILL_DIR_NAMES = (".yucode/skills", ".claw/skills", ".codex/skills")
+
+# Tool -> its single path-valued argument, for the AGENTS.md discovery check.
+_PATH_ARG_TOOLS: dict[str, str] = {
+    "read_file": "path",
+    "write_file": "path",
+    "edit_file": "path",
+    "list_directory": "path",
+    "file_outline": "path",
+}
+
+
+def _extract_accessed_path(tool_name: str, raw_arguments: str) -> str | None:
+    key = _PATH_ARG_TOOLS.get(tool_name)
+    if key is None:
+        return None
+    try:
+        args = json.loads(raw_arguments or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return None
+    value = args.get(key)
+    return str(value) if value else None
+
+
 class AgentRuntime:
     def __init__(
         self,
@@ -286,6 +423,21 @@ class AgentRuntime:
 
         self._plugins_initialized = False
         self._cancel_event = threading.Event()
+
+        # Session-scoped reminder bookkeeping (persists across run_turn()
+        # calls within one interactive session — see _collect_post_tool_reminders).
+        self._turns_since_todo_write = 0
+        self._turns_since_todo_nudge = 1000  # eligible to nudge from the start
+        self._agents_md_checked: set[Path] = set()
+        self._skill_dirs_checked: set[Path] = set()
+        self._announced_skill_files: set[Path] = set()
+        # Files written/edited across the whole session (not just the current
+        # turn) — snapshotted into the compaction state reminder so "what did
+        # I touch" survives being summarized away.
+        self._session_edited_paths: set[str] = set()
+        # input_tokens from the most recent provider response — see
+        # _maybe_auto_compact, which gates on this instead of a lifetime sum.
+        self._last_response_input_tokens = 0
 
     def _ensure_plugins_initialized(self) -> None:
         if self._plugins_initialized:
@@ -410,6 +562,13 @@ class AgentRuntime:
             include_git_context=self.config.runtime.include_git_context,
             explicit_instruction_files=self.config.instruction_files,
         )
+        # Seed the AGENTS.md-discovery "already told the model about this
+        # file" set with what's already in the system prompt, so the
+        # discovery reminder only ever surfaces files NOT already in context.
+        self._agents_md_checked.update(f.path for f in project_context.instruction_files)
+        # Same idea for skills already listed in the system prompt's skill summary.
+        from ..memory.skills import list_skills as _list_skills_for_seeding
+        self._announced_skill_files.update(s.path for s in _list_skills_for_seeding(self.workspace_root))
         prior_message_count = len(self.session.messages)
         system_prompt = PromptAssembler(
             self.config,
@@ -461,6 +620,7 @@ class AgentRuntime:
         is_time_sensitive = _is_time_sensitive_prompt(prompt)
         observations = _ToolObservations()
         forced_retry_done = False
+        todo_gate_fires_this_turn = 0
 
         # Per-turn reasoning_effort: only touched if the provider config already
         # opts in via extra_body.reasoning_effort (e.g. Workbench/GPT-5.5) —
@@ -477,6 +637,10 @@ class AgentRuntime:
             summary.iterations = iteration
             if event_callback:
                 event_callback({"type": "iteration_started", "iteration": iteration})
+            # Reset (not increment) inline below if this iteration calls
+            # todo_write, so a call this same iteration still nets to 0.
+            self._turns_since_todo_write += 1
+            self._turns_since_todo_nudge += 1
 
             if budget_exhausted:
                 break
@@ -497,7 +661,7 @@ class AgentRuntime:
 
             try:
                 response = self.provider.complete(
-                    self.session.provider_messages(system_prompt),
+                    self.session.provider_messages(system_prompt, pruning=self.config.runtime),
                     self.tools.definitions_for_provider(),
                     stream_callback=event_callback,
                     cancel_event=self._cancel_event,
@@ -516,6 +680,7 @@ class AgentRuntime:
 
             self.session.usage.add(response.usage)
             self.usage_tracker.record(response.usage)
+            self._last_response_input_tokens = response.usage.input_tokens
 
             assistant_message = Message(
                 role="assistant",
@@ -545,6 +710,37 @@ class AgentRuntime:
                             event_callback({
                                 "type": "grounding_retry",
                                 "reason": violation.reason,
+                            })
+                        continue
+                # Todo turn-end gate (opt-in): don't let the model stop with
+                # pending/in_progress todos still open. Separate fire budget
+                # from the grounding supervisor above.
+                if (
+                    self.config.runtime.todo_gate_enabled
+                    and todo_gate_fires_this_turn < self.config.runtime.todo_gate_max_fires_per_prompt
+                ):
+                    open_todos = self._read_open_todos()
+                    if open_todos:
+                        todo_gate_fires_this_turn += 1
+                        listing = "\n".join(
+                            f"- [{t.get('status', 'pending')}] {t.get('content', '?')}"
+                            for t in open_todos[:10]
+                        )
+                        self.session.add_message(Message(
+                            role="user",
+                            content=(
+                                "[SYSTEM SUPERVISOR] You still have pending/in_progress todos:\n"
+                                f"{listing}\n"
+                                "Continue working on them, or call todo_write to mark them "
+                                "completed/cancelled if they're no longer relevant, before "
+                                "giving your final answer."
+                            ),
+                        ))
+                        if event_callback:
+                            event_callback({
+                                "type": "todo_gate_retry",
+                                "fires_this_turn": todo_gate_fires_this_turn,
+                                "open_todos": len(open_todos),
                             })
                         continue
                 summary.final_text = dedup_repetitive_response(response.text)
@@ -655,6 +851,10 @@ class AgentRuntime:
                     self._record_tool_observation(
                         observations, tool_call.name, tool_call.arguments, tool_result_content,
                     )
+                    self._session_edited_paths.update(observations.write_paths)
+                    self._session_edited_paths.update(observations.edit_paths)
+                    if tool_call.name == "todo_write":
+                        self._turns_since_todo_write = 0
                     # Track read-only streak (cache hits still count as reads)
                     try:
                         perm = self.tools.permission_for(tool_call.name)
@@ -674,6 +874,9 @@ class AgentRuntime:
                             "write files, run commands, or answer the user. "
                             "Avoid reading more unless strictly necessary.]"
                         )
+
+                for reminder in self._collect_post_tool_reminders(tool_call.name, tool_call.arguments):
+                    tool_result_content = f"{tool_result_content}\n\n{reminder}"
 
                 tool_message = Message(
                     role="tool",
@@ -743,28 +946,37 @@ class AgentRuntime:
         summary: TurnSummary,
         event_callback: EventCallback | None = None,
     ) -> None:
-        cumulative = self.usage_tracker.total_input_tokens
-        if cumulative < self._auto_compact_threshold:
+        # Gated on the MOST RECENT response's input tokens, not a lifetime
+        # cumulative sum. The cumulative sum only ever grows across a long
+        # interactive session — even after a compaction shrinks the actual
+        # context back down — so once it crossed the threshold once, this
+        # used to force-compact on every subsequent turn forever, regardless
+        # of the real current context size.
+        trigger_tokens = self._last_response_input_tokens
+        if trigger_tokens < self._auto_compact_threshold:
             return
         try:
-            force_config = CompactionConfig(
-                preserve_recent_messages=self._compaction_config.preserve_recent_messages,
+            archive_path = self._archive_before_compact()
+            force_config = dataclasses.replace(
+                self._compaction_config,
                 max_estimated_tokens=0,
+                transcript_path=str(archive_path) if archive_path is not None else None,
+                state_reminder=self._build_compaction_state_reminder(),
             )
             result = compact_session(self.session.messages, force_config)
             if result.removed_message_count > 0:
                 self.session.messages = result.compacted_messages
                 summary.auto_compaction_performed = True
                 _log.info(
-                    "Auto-compacted %d messages (cumulative input tokens %d >= threshold %d)",
-                    result.removed_message_count, cumulative, self._auto_compact_threshold,
+                    "Auto-compacted %d messages (last response: %d input tokens >= threshold %d)",
+                    result.removed_message_count, trigger_tokens, self._auto_compact_threshold,
                 )
                 if event_callback:
                     event_callback({
                         "type": "auto_compaction",
                         "removed": result.removed_message_count,
                         "threshold": self._auto_compact_threshold,
-                        "cumulative_input_tokens": cumulative,
+                        "trigger_input_tokens": trigger_tokens,
                     })
         except Exception as exc:
             _log.warning("Auto-compaction failed: %s", exc)
@@ -774,49 +986,54 @@ class AgentRuntime:
     # ------------------------------------------------------------------
 
     def _make_llm_compactor(self):  # type: ignore[return]
-        """Return a callable that uses the provider to summarise dropped messages."""
+        """Return a callable that uses the provider to summarise dropped messages.
+
+        Retries once (2 attempts total) on either a provider error or a
+        degenerate (near-empty) response before giving up; `_llm_summarize`
+        (memory/compact.py) falls back to the deterministic heuristic
+        summarizer when this returns an empty string."""
         provider = self.provider
 
         def _compactor(messages: list[dict]) -> str:
-            parts = []
-            for m in messages[:30]:
-                role = m.get("role", "?")
-                content = str(m.get("content") or "")
-                # Summarise long tool results inline rather than dumping them
-                if role == "tool" and len(content) > 300:
-                    content = content[:300] + "…"
-                parts.append(f"[{role}]: {content[:400]}")
-                for tc in m.get("tool_calls", []):
-                    parts.append(f"  tool_call {tc.get('name', '?')}({tc.get('arguments', '')[:120]})")
-            transcript = "\n".join(parts)
-            prompt = (
-                "Summarise the following conversation fragment for a coding agent. "
-                "Keep: user goals, files modified/read, decisions made, tool results that matter. "
-                "Drop: verbose reasoning and redundant tool calls. "
-                "Be concise but complete — the agent will continue work from this summary.\n\n"
-                + transcript
-            )
-            try:
-                response = provider.complete(
-                    [{"role": "user", "content": prompt}],
-                    tools=[],
+            transcript = _prepare_transcript_for_summary(messages)
+            prompt = f"{transcript}\n\n{_STRUCTURED_SUMMARY_PROMPT}"
+            text = ""
+            for attempt in range(1, 3):
+                try:
+                    response = provider.complete(
+                        [{"role": "user", "content": prompt}],
+                        tools=[],
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    _log.warning("LLM compactor failed (attempt %d/2): %s", attempt, exc)
+                    continue
+                text = response.text or ""
+                if not is_degenerate_summary(text):
+                    return text
+                _log.info(
+                    "LLM compactor produced a degenerate summary (%d chars, attempt %d/2); retrying",
+                    len(text), attempt,
                 )
-                return response.text
-            except Exception as exc:  # noqa: BLE001
-                _log.warning("LLM compactor failed, falling back to heuristic: %s", exc)
-                return ""
+            _log.warning("LLM compactor still failing after retry (%d chars); falling back to heuristic", len(text))
+            return ""
 
         return _compactor
 
     def compact(self, config: CompactionConfig | None = None) -> CompactionResult:
+        cfg = config or self._compaction_config
         msg_count = len(self.session.messages)
         est_tokens = self.estimated_tokens()
 
         self.hook_runner.run_pre_compact(msg_count, est_tokens)
 
-        self._archive_before_compact()
+        archive_path = self._archive_before_compact()
+        cfg = dataclasses.replace(
+            cfg,
+            transcript_path=str(archive_path) if archive_path is not None else cfg.transcript_path,
+            state_reminder=self._build_compaction_state_reminder(),
+        )
 
-        result = compact_session(self.session.messages, config)
+        result = compact_session(self.session.messages, cfg)
         if result.removed_message_count > 0:
             self.session.messages = result.compacted_messages
             self.hook_runner.run_post_compact(result.removed_message_count, len(result.summary))
@@ -826,26 +1043,65 @@ class AgentRuntime:
             )
         return result
 
-    def _archive_before_compact(self) -> None:
+    def _archive_before_compact(self) -> Path | None:
+        """Write the full pre-compaction conversation to disk and return its path.
+
+        Stores complete message content (not a truncated preview) so the
+        model can read it back via `compact.py`'s transcript-pointer feature
+        when the compaction summary drops detail it later needs."""
         try:
+            import uuid
+
             from ..config.settings import state_dir
             archives_dir = state_dir(self.workspace_root) / "archives"
             archives_dir.mkdir(parents=True, exist_ok=True)
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             sid = self.session.session_id if hasattr(self.session, "session_id") else "unknown"
-            archive_path = archives_dir / f"{sid}_{ts}.json"
+            archive_path = archives_dir / f"{sid}_{ts}_{uuid.uuid4().hex[:8]}.json"
             data = {
                 "session_id": sid,
                 "timestamp": ts,
                 "message_count": len(self.session.messages),
-                "messages": [
-                    {"role": m.role, "content": (m.content or "")[:500]}
-                    for m in self.session.messages
-                ],
+                "messages": [m.to_dict() for m in self.session.messages],
             }
             archive_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+            return archive_path
         except Exception as exc:
             _log.warning("Failed to archive session before compaction: %s", exc)
+            return None
+
+    def _build_compaction_state_reminder(self) -> str | None:
+        """Snapshot session-level state — edited files, open todos, running
+        background tasks — into a `<system-reminder>` block appended to the
+        compaction continuation (see CompactionConfig.state_reminder).
+
+        Compaction replaces most of the conversation with an LLM- or
+        heuristic-generated summary; concrete facts like "which files did I
+        touch" are easy for a summary to blur or drop, and a still-running
+        background task the model forgets about is a real cost (never
+        collected, never reported). Snapshotting them structurally here
+        means they survive regardless of summary quality. Returns None when
+        there's nothing to report, so callers can leave state_reminder unset."""
+        sections: list[str] = []
+        if self._session_edited_paths:
+            paths = sorted(self._session_edited_paths)[:30]
+            sections.append("Files edited this session:\n" + "\n".join(f"- {p}" for p in paths))
+        try:
+            open_todos = self._read_open_todos()
+        except Exception:  # noqa: BLE001 — never let a reminder block compaction itself
+            open_todos = []
+        if open_todos:
+            listing = "\n".join(
+                f"- [{t.get('status', 'pending')}] {t.get('content', '?')}" for t in open_todos[:15]
+            )
+            sections.append("Open todos:\n" + listing)
+        running = [t for t in self.tools.background_tasks.values() if t.popen.poll() is None]
+        if running:
+            listing = "\n".join(f'- "{t.task_id}": {t.command}' for t in running)
+            sections.append("Background tasks still running:\n" + listing)
+        if not sections:
+            return None
+        return "<system-reminder>\n" + "\n\n".join(sections) + "\n</system-reminder>"
 
     def estimated_tokens(self) -> int:
         return estimate_session_tokens(self.session.messages)
@@ -886,6 +1142,238 @@ class AgentRuntime:
         cp_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
         _log.info("Checkpoint saved to %s", cp_path)
         return cp_path
+
+    # ------------------------------------------------------------------
+    # Post-tool-call reminders — cross-cutting, session-scoped checks run
+    # after every tool call and appended to that call's tool result.
+    #
+    # Each check tracks its own "already reported" state (a `reported` flag,
+    # a seen-paths set, a turn counter) so a given fact — a completed
+    # background task, a todo nudge, a newly-found instruction file — is
+    # surfaced at most once rather than repeating on every subsequent call.
+    # This is the generalised form of the older single-purpose
+    # consecutive-readonly advisory (still inline in run_turn(), since it
+    # depends on per-turn loop-local counters rather than session state).
+    # ------------------------------------------------------------------
+
+    def _collect_post_tool_reminders(self, tool_name: str, raw_arguments: str) -> list[str]:
+        reminders: list[str] = []
+        bg = self._check_completed_background_tasks()
+        if bg:
+            reminders.append(bg)
+        nudge = self._check_todo_nudge()
+        if nudge:
+            reminders.append(nudge)
+        agents_md = self._check_agents_md_discovery(tool_name, raw_arguments)
+        if agents_md:
+            reminders.append(agents_md)
+        skill = self._check_skill_discovery(tool_name, raw_arguments)
+        if skill:
+            reminders.append(skill)
+        return reminders
+
+    def _check_completed_background_tasks(self) -> str:
+        """Poll tracked background bash tasks for completions since the last
+        check. Returns a `<system-reminder>` block for any newly-finished
+        task (each reported exactly once, tracked via BackgroundTask.reported
+        on the registry), or "" if nothing new to report.
+
+        Called after every tool call in run_turn() so the model learns about
+        a completion on its next turn instead of never checking back in —
+        previously `run_in_background=true` output went to DEVNULL and was
+        unrecoverable."""
+        import time as _time
+        lines: list[str] = []
+        for task in self.tools.background_tasks.values():
+            if task.reported:
+                continue
+            returncode = task.popen.poll()
+            if returncode is None:
+                continue
+            task.reported = True
+            elapsed = _time.monotonic() - task.started_at
+            try:
+                content = task.output_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                content = ""
+            preview = content[-2000:] if len(content) > 2000 else content
+            preview_note = f" (last 2,000 of {len(content):,} chars)" if len(content) > 2000 else ""
+            lines.append(
+                f'Background task "{task.task_id}" completed (exit code: {returncode}, '
+                f"ran {elapsed:.1f}s). Command: {task.command}\n"
+                f"Output{preview_note}:\n{preview}\n"
+                f"Full output at: {task.output_path}"
+            )
+        if not lines:
+            return ""
+        return "<system-reminder>\n" + "\n\n---\n\n".join(lines) + "\n</system-reminder>"
+
+    def _check_todo_nudge(self) -> str:
+        """Remind the model to use todo_write if it hasn't in a while.
+
+        Fires at most once per `todo_nudge_min_gap_turns` iterations, and
+        only once `todo_nudge_turns_since_write` iterations have passed
+        without a todo_write call — both counters are session-scoped (see
+        __init__), not reset per run_turn() call, matching how a real
+        interactive session's todo list is expected to span multiple turns."""
+        rt = self.config.runtime
+        if not rt.todo_nudge_enabled:
+            return ""
+        if self._turns_since_todo_write < rt.todo_nudge_turns_since_write:
+            return ""
+        if self._turns_since_todo_nudge < rt.todo_nudge_min_gap_turns:
+            return ""
+        self._turns_since_todo_nudge = 0
+        return (
+            "<system-reminder>\n"
+            f"You haven't called todo_write in {self._turns_since_todo_write} turns. "
+            "If this task has multiple steps, track them with todo_write so progress "
+            "isn't lost. Skip this if the task is simple enough not to need a todo list.\n"
+            "</system-reminder>"
+        )
+
+    def _read_open_todos(self) -> list[dict[str, Any]]:
+        """Return todo entries whose status is pending/in_progress, or [] if
+        there's no todo list yet or it can't be read. Used by the turn-end
+        gate (run_turn) to decide whether to force another iteration."""
+        from ..config.settings import state_dir
+        todos_path = state_dir(self.workspace_root) / "todos.json"
+        if not todos_path.exists():
+            return []
+        try:
+            data = json.loads(todos_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return []
+        if not isinstance(data, list):
+            return []
+        return [
+            t for t in data
+            if isinstance(t, dict) and str(t.get("status", "pending")).lower() in ("pending", "in_progress")
+        ]
+
+    def _discover_new_instruction_files(self, accessed_path: Path) -> list[Path]:
+        """Walk up from *accessed_path* (a file or directory) to
+        workspace_root, checking each level for instruction files not
+        already known this session. Newly-found files are marked seen (so
+        they're only ever returned once) and returned.
+
+        Bounded at workspace_root — a monorepo subpackage's own AGENTS.md is
+        exactly the case the initial cwd-rooted discovery in
+        memory/prompting.py misses (it only walks UP from cwd, so a
+        DESCENDANT directory's instruction file is never found until now)."""
+        try:
+            resolved = accessed_path.resolve()
+        except OSError:
+            return []
+        current = resolved.parent if resolved.is_file() else resolved
+        ws_root = self.workspace_root.resolve()
+        found: list[Path] = []
+        for _ in range(10):  # matches grok-build's MAX_WALK_DEPTH
+            for name in _INSTRUCTION_FILENAMES:
+                candidate = current / name
+                if candidate in self._agents_md_checked:
+                    continue
+                self._agents_md_checked.add(candidate)  # don't re-stat a miss either
+                if candidate.is_file():
+                    found.append(candidate)
+            if current == ws_root or ws_root not in current.parents:
+                break
+            current = current.parent
+        return found
+
+    def _check_agents_md_discovery(self, tool_name: str, raw_arguments: str) -> str:
+        if not self.config.runtime.agents_md_discovery_enabled:
+            return ""
+        accessed = _extract_accessed_path(tool_name, raw_arguments)
+        if accessed is None:
+            return ""
+        try:
+            target = self.tools._resolve_path(accessed)
+        except (OSError, ValueError):
+            return ""
+        found = self._discover_new_instruction_files(target)
+        if not found:
+            return ""
+        rel_paths: list[str] = []
+        for p in found:
+            try:
+                rel_paths.append(str(p.relative_to(self.workspace_root)))
+            except ValueError:
+                rel_paths.append(str(p))
+        listing = "\n".join(f"- {p}" for p in rel_paths)
+        return (
+            "<system-reminder>\n"
+            "Found project instruction file(s) not yet in context, near a path "
+            f"you just accessed:\n{listing}\n"
+            "Read it with read_file if it might contain rules relevant to this "
+            "area of the codebase.\n"
+            "</system-reminder>"
+        )
+
+    def _discover_new_skills_near_path(self, accessed_path: Path) -> list:  # -> list[SkillInfo]
+        """Walk up from *accessed_path* to workspace_root, checking each
+        level for skill directories (.yucode/skills, .claw/skills,
+        .codex/skills) not already known this session. Mirrors
+        _discover_new_instruction_files (same walk-and-memoize shape) but
+        for skill directories, returning SkillInfo entries instead of bare
+        paths so the reminder can include each skill's description."""
+        from ..memory.skills import SkillInfo, _parse_frontmatter
+        try:
+            resolved = accessed_path.resolve()
+        except OSError:
+            return []
+        current = resolved.parent if resolved.is_file() else resolved
+        ws_root = self.workspace_root.resolve()
+        found: list[SkillInfo] = []
+        for _ in range(10):  # matches grok-build's MAX_WALK_DEPTH
+            for dirname in _SKILL_DIR_NAMES:
+                skill_root = current / dirname
+                if skill_root in self._skill_dirs_checked:
+                    continue
+                self._skill_dirs_checked.add(skill_root)
+                if not skill_root.is_dir():
+                    continue
+                for child in sorted(skill_root.iterdir()):
+                    skill_file = child / "SKILL.md"
+                    if not skill_file.is_file() or skill_file in self._announced_skill_files:
+                        continue
+                    self._announced_skill_files.add(skill_file)
+                    meta = _parse_frontmatter(skill_file.read_text(encoding="utf-8"))
+                    found.append(SkillInfo(
+                        name=meta.get("name", child.name),
+                        description=str(meta.get("description", "")),
+                        path=skill_file,
+                    ))
+            if current == ws_root or ws_root not in current.parents:
+                break
+            current = current.parent
+        return found
+
+    def _check_skill_discovery(self, tool_name: str, raw_arguments: str) -> str:
+        if not self.config.runtime.skill_discovery_enabled:
+            return ""
+        accessed = _extract_accessed_path(tool_name, raw_arguments)
+        if accessed is None:
+            return ""
+        try:
+            target = self.tools._resolve_path(accessed)
+        except (OSError, ValueError):
+            return ""
+        found = self._discover_new_skills_near_path(target)
+        if not found:
+            return ""
+        listing = "\n".join(
+            f"- {s.name}: {s.description}" if s.description else f"- {s.name}"
+            for s in found
+        )
+        return (
+            "<system-reminder>\n"
+            "Found skill(s) not yet in context, near a path you just accessed:\n"
+            f"{listing}\n"
+            "Call load_skill with the skill name if it's relevant to the "
+            "current task.\n"
+            "</system-reminder>"
+        )
 
     # ------------------------------------------------------------------
     # Grounding observation recording
@@ -1054,16 +1542,7 @@ class AgentRuntime:
 
         # Cap output size to prevent a single tool call from filling the context window.
         if len(output.encode("utf-8", errors="replace")) > _MAX_TOOL_RESULT_BYTES:
-            truncated = output.encode("utf-8", errors="replace")[:_MAX_TOOL_RESULT_BYTES].decode("utf-8", errors="replace")
-            # Trim to last newline so we don't cut mid-line
-            last_nl = truncated.rfind("\n")
-            if last_nl > _MAX_TOOL_RESULT_BYTES // 2:
-                truncated = truncated[:last_nl]
-            output = (
-                truncated
-                + f"\n\n[Output capped at {_MAX_TOOL_RESULT_BYTES // 1024}KB. "
-                "Use offset/limit, a narrower glob/grep pattern, or read specific sections.]"
-            )
+            output = _truncate_tool_output(output, _MAX_TOOL_RESULT_BYTES)
 
         if is_error:
             return tool_error_response(output, error_code="tool_error", recoverable=True)
