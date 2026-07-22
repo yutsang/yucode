@@ -200,11 +200,21 @@ class HookRunner:
         if tool_output is not None:
             env["HOOK_TOOL_OUTPUT"] = tool_output
 
-        shell_cmd, shell_flag = ("cmd", "/C") if platform.system() == "Windows" else ("sh", "-lc")
+        if platform.system() == "Windows":
+            # String + shell=False, not ["cmd", "/C", command]: the list form
+            # goes through list2cmdline, which backslash-escapes any embedded
+            # double quotes — an escape convention cmd.exe does not understand.
+            # /S + one outer quote pair is cmd's documented deterministic
+            # parsing mode (strip first and last quote, take the rest
+            # literally). See core/shellexec.py for the full story.
+            comspec = os.environ.get("COMSPEC", "cmd.exe")
+            popen_args: Any = f'"{comspec}" /S /C "{command}"'
+        else:
+            popen_args = ["sh", "-lc", command]
 
         try:
             result = subprocess.run(
-                [shell_cmd, shell_flag, command],
+                popen_args,
                 input=payload.encode(),
                 capture_output=True,
                 timeout=30,

@@ -334,6 +334,61 @@ class TestMcpCallTimeout:
 
 
 # ---------------------------------------------------------------------------
+# Windows cmd.exe quote handling (shell_invocation)
+# ---------------------------------------------------------------------------
+
+class TestShellInvocation:
+    def test_posix_passes_command_through_with_shell_true(self, monkeypatch) -> None:
+        from coding_agent.core import shellexec
+        monkeypatch.setattr(shellexec.os, "name", "posix")
+        args, use_shell = shellexec.shell_invocation('echo "hello world"')
+        assert args == 'echo "hello world"'
+        assert use_shell is True
+
+    def test_windows_wraps_with_cmd_s_c_and_outer_quotes(self, monkeypatch) -> None:
+        """The multi-quote command that actually failed on the real Windows
+        box: cmd /C strips the first and last quote of a >2-quote command,
+        mangling '"exe" "arg"' into an unparseable line. /S + one outer
+        quote pair forces the deterministic strip-outer-quotes rule so the
+        interior arrives at cmd intact."""
+        from coding_agent.core import shellexec
+        monkeypatch.setattr(shellexec.os, "name", "nt")
+        monkeypatch.setattr(
+            shellexec.os, "environ",
+            {**shellexec.os.environ, "COMSPEC": r"C:\Windows\system32\cmd.exe"},
+        )
+        command = r'"C:\Program Files\python.exe" "C:\tmp\script.py"'
+        args, use_shell = shellexec.shell_invocation(command)
+        assert use_shell is False
+        assert args == rf'"C:\Windows\system32\cmd.exe" /S /C "{command}"'
+
+    def test_windows_defaults_comspec_when_unset(self, monkeypatch) -> None:
+        from coding_agent.core import shellexec
+        monkeypatch.setattr(shellexec.os, "name", "nt")
+        env = {k: v for k, v in shellexec.os.environ.items() if k != "COMSPEC"}
+        monkeypatch.setattr(shellexec.os, "environ", env)
+        args, _ = shellexec.shell_invocation("dir")
+        assert args == '"cmd.exe" /S /C "dir"'
+
+    def test_bash_tool_still_executes_quoted_paths_on_posix(self, tmp_path: Path) -> None:
+        """End-to-end through the real bash tool: a command quoting both the
+        interpreter path and a script path (the exact shape that broke on
+        Windows) must run and return its CJK stdout."""
+        from coding_agent.tools import ToolRegistry
+        config = AppConfig(
+            provider=ProviderConfig(base_url="http://x", api_key="k", model="m"),
+            runtime=RuntimeOptions(permission_mode="danger-full-access"),
+        )
+        registry = ToolRegistry(tmp_path, config)
+        script = tmp_path / "probe.py"
+        script.write_text("print('中文OK')\n", encoding="utf-8")
+        out = registry.execute("bash", {"command": f'"{sys.executable}" "{script}"'})
+        payload = json.loads(out)
+        assert payload["returncode"] == 0
+        assert "中文OK" in payload["stdout"]
+
+
+# ---------------------------------------------------------------------------
 # Notebook cell-index bound
 # ---------------------------------------------------------------------------
 

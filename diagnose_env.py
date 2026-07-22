@@ -299,11 +299,19 @@ def check_shell_tool(workspace: Path) -> None:
         registry = ToolRegistry(Path(tmp), config)
         script = Path(tmp) / "cjk_probe.py"
         script.write_text("print('中文子行程輸出OK')\n", encoding="utf-8")
-        out = registry.execute("bash", {"command": f'"{sys.executable}" "{script}"'})
+        command = f'"{sys.executable}" "{script}"'
+        out = registry.execute("bash", {"command": command})
         payload = json.loads(out)
         stdout = payload.get("stdout", "")
-        assert "中文子行程輸出OK" in stdout, f"CJK lost/garbled in: {stdout[:120]!r}"
-        _record("PASS", "shell_tool_cjk_subprocess", "spawned subprocess, CJK stdout intact")
+        # On failure, surface EVERYTHING needed to diagnose remotely — the
+        # first Windows run of this check failed with an empty stdout and no
+        # visible cause because only stdout was asserted on.
+        assert "中文子行程輸出OK" in stdout, (
+            f"CJK missing. command={command!r} rc={payload.get('returncode')!r} "
+            f"stdout={stdout[:120]!r} stderr={payload.get('stderr', '')[:300]!r}"
+        )
+        _record("PASS", "shell_tool_cjk_subprocess",
+                "spawned quoted-path subprocess via platform shell, CJK stdout intact")
 
 
 @check("mcp_timeout_behavior")

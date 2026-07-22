@@ -7,6 +7,7 @@ import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from ..core.shellexec import shell_invocation
 from ..security.safety import check_bash_safety
 from ..security.sandbox import SandboxConfig, build_linux_sandbox_command, resolve_sandbox_status
 from . import RiskLevel, ToolDefinition, ToolSpec
@@ -81,9 +82,10 @@ def _run_foreground_with_auto_background(
     timed-out process's in-progress output is already being captured when
     it gets handed off to background tracking)."""
     output_path = _bash_output_path(registry)
+    popen_args, use_shell = shell_invocation(command)
     with open(output_path, "w", encoding="utf-8", errors="replace") as log_file:
         proc = subprocess.Popen(
-            command, cwd=cwd, shell=True,
+            popen_args, cwd=cwd, shell=use_shell,
             stdout=log_file, stderr=subprocess.STDOUT,
             start_new_session=True,
         )
@@ -167,8 +169,9 @@ def _bash(registry: ToolRegistry, args: dict[str, Any]) -> str:
                     start_new_session=True,
                 )
             else:
+                popen_args, use_shell = shell_invocation(command)
                 proc = subprocess.Popen(
-                    command, cwd=cwd, shell=True,
+                    popen_args, cwd=cwd, shell=use_shell,
                     stdout=log_file, stderr=subprocess.STDOUT,
                     start_new_session=True,
                 )
@@ -212,10 +215,11 @@ def _bash(registry: ToolRegistry, args: dict[str, Any]) -> str:
             timeout=timeout, check=False, env={**os.environ, **env},
         )
     else:
+        popen_args, use_shell = shell_invocation(command)
         result = subprocess.run(
-            command, cwd=cwd, capture_output=True, text=True,
+            popen_args, cwd=cwd, capture_output=True, text=True,
             encoding="utf-8", errors="replace",
-            shell=True, timeout=timeout, check=False,
+            shell=use_shell, timeout=timeout, check=False,
         )
 
     stdout = result.stdout

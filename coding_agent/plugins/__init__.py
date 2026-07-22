@@ -191,12 +191,14 @@ class PluginRegistry:
         return self._plugins.get(name)
 
     def _run_lifecycle_command(self, name: str, command: str) -> None:
+        from ..core.shellexec import shell_invocation
         plugin_dir = self._plugin_dirs[name]
+        popen_args, use_shell = shell_invocation(command)
         # A hanging lifecycle hook must not wedge startup/shutdown forever.
         try:
             subprocess.run(
-                command,
-                shell=True,
+                popen_args,
+                shell=use_shell,
                 cwd=str(plugin_dir),
                 capture_output=True,
                 timeout=60,
