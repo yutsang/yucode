@@ -297,21 +297,38 @@ def check_shell_tool(workspace: Path) -> None:
             runtime=RuntimeOptions(permission_mode="danger-full-access", shell_timeout_seconds=60),
         )
         registry = ToolRegistry(Path(tmp), config)
+
+        # Probe 1: what encoding does a child python get on a PIPE through
+        # the bash tool? (The locale code page — cp1252 — unless the tool
+        # injects PYTHONIOENCODING; the console being UTF-8 is irrelevant
+        # to pipes.) This is reported even when the main check passes.
+        enc_cmd = f'"{sys.executable}" -c "import sys; print(sys.stdout.encoding)"'
+        enc_payload = json.loads(registry.execute("bash", {"command": enc_cmd}))
+        _record("INFO", "child_python_pipe_encoding",
+                f"{enc_payload.get('stdout', '').strip() or '(no output)'} "
+                f"(rc={enc_payload.get('returncode')})")
+
+        # Probe 2: quoted-path CJK end-to-end.
         script = Path(tmp) / "cjk_probe.py"
         script.write_text("print('中文子行程輸出OK')\n", encoding="utf-8")
         command = f'"{sys.executable}" "{script}"'
         out = registry.execute("bash", {"command": command})
         payload = json.loads(out)
         stdout = payload.get("stdout", "")
-        # On failure, surface EVERYTHING needed to diagnose remotely — the
-        # first Windows run of this check failed with an empty stdout and no
-        # visible cause because only stdout was asserted on.
-        assert "中文子行程輸出OK" in stdout, (
-            f"CJK missing. command={command!r} rc={payload.get('returncode')!r} "
-            f"stdout={stdout[:120]!r} stderr={payload.get('stderr', '')[:300]!r}"
-        )
-        _record("PASS", "shell_tool_cjk_subprocess",
-                "spawned quoted-path subprocess via platform shell, CJK stdout intact")
+        if "中文子行程輸出OK" in stdout:
+            _record("PASS", "shell_tool_cjk_subprocess",
+                    "spawned quoted-path subprocess via platform shell, CJK stdout intact")
+        else:
+            # Multi-line failure dump: the first Windows round-trip lost the
+            # stderr tail to console line clipping when it was inlined.
+            _record("FAIL", "shell_tool_cjk_subprocess",
+                    "details on the indented lines below")
+            print(f"    command: {command}")
+            print(f"    rc     : {payload.get('returncode')!r}")
+            print(f"    stdout : {stdout[:200]!r}")
+            stderr_text = str(payload.get("stderr", ""))
+            for line in (stderr_text.splitlines() or ["(empty)"])[:15]:
+                print(f"    stderr | {line}")
 
 
 @check("mcp_timeout_behavior")

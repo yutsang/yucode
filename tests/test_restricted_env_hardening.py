@@ -37,6 +37,15 @@ def _clean_breakers():
     providers_mod._reset_circuit_breakers()
 
 
+def _wait_until(predicate, *, timeout: float = 5.0, interval: float = 0.05) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return predicate()
+
+
 def _provider(**overrides) -> OpenAICompatibleProvider:
     config = ProviderConfig(
         base_url="http://127.0.0.1:9",  # port 9 (discard): connection refused instantly
@@ -386,6 +395,50 @@ class TestShellInvocation:
         payload = json.loads(out)
         assert payload["returncode"] == 0
         assert "中文OK" in payload["stdout"]
+
+    def test_bash_tool_forces_utf8_io_in_python_children(self, tmp_path: Path) -> None:
+        """A child python on a PIPE defaults its stdout to the locale code
+        page (cp1252 on Western-locale Windows) — printing CJK then crashes
+        the child with UnicodeEncodeError before any output reaches the
+        parent (observed on the real Windows box: rc=1, empty stdout). The
+        bash tool must inject PYTHONIOENCODING/PYTHONUTF8 so every python
+        child does UTF-8 I/O regardless of locale."""
+        from coding_agent.tools import ToolRegistry
+        config = AppConfig(
+            provider=ProviderConfig(base_url="http://x", api_key="k", model="m"),
+            runtime=RuntimeOptions(permission_mode="danger-full-access"),
+        )
+        registry = ToolRegistry(tmp_path, config)
+        probe = tmp_path / "env_probe.py"
+        probe.write_text(
+            "import os, sys\n"
+            "print(os.environ.get('PYTHONIOENCODING'), os.environ.get('PYTHONUTF8'), sys.stdout.encoding)\n",
+            encoding="utf-8",
+        )
+        out = registry.execute("bash", {"command": f'"{sys.executable}" "{probe}"'})
+        payload = json.loads(out)
+        assert payload["returncode"] == 0
+        fields = payload["stdout"].split()
+        assert fields[0] == "utf-8", f"PYTHONIOENCODING not injected: {payload['stdout']!r}"
+        assert fields[1] == "1", f"PYTHONUTF8 not injected: {payload['stdout']!r}"
+        assert fields[2].lower().replace("-", "") == "utf8", f"child pipe encoding: {payload['stdout']!r}"
+
+    def test_background_bash_also_gets_utf8_env(self, tmp_path: Path) -> None:
+        from coding_agent.tools import ToolRegistry
+        config = AppConfig(
+            provider=ProviderConfig(base_url="http://x", api_key="k", model="m"),
+            runtime=RuntimeOptions(permission_mode="danger-full-access"),
+        )
+        registry = ToolRegistry(tmp_path, config)
+        probe = tmp_path / "bg_probe.py"
+        probe.write_text("print('背景中文OK')\n", encoding="utf-8")
+        out = json.loads(registry.execute("bash", {
+            "command": f'"{sys.executable}" "{probe}"', "run_in_background": True,
+        }))
+        task = registry.background_tasks[out["task_id"]]
+        assert _wait_until(lambda: task.popen.poll() is not None)
+        content = Path(out["output_file"]).read_text(encoding="utf-8", errors="replace")
+        assert "背景中文OK" in content
 
 
 # ---------------------------------------------------------------------------

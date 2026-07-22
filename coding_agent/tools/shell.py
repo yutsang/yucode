@@ -72,6 +72,18 @@ def shell_tools(registry: ToolRegistry) -> list[ToolDefinition]:
     ]
 
 
+def _child_env() -> dict[str, str]:
+    """Environment for bash-tool child processes: force UTF-8 I/O in any
+    Python child. A child Python writing to a PIPE defaults to the locale
+    code page (cp1252 on a Western-locale Windows box, even when the
+    interactive console itself is UTF-8), so print()ing CJK crashes it with
+    UnicodeEncodeError before a single byte reaches the parent — observed
+    on a real Windows 11 box via diagnose_env.py (rc=1, empty stdout). On a
+    python-only locked-down machine, python IS the common child; non-python
+    children simply ignore these variables."""
+    return {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
+
+
 def _run_foreground_with_auto_background(
     registry: ToolRegistry, command: str, cwd: Path, timeout: int, verdict: Any,
 ) -> str:
@@ -85,7 +97,7 @@ def _run_foreground_with_auto_background(
     popen_args, use_shell = shell_invocation(command)
     with open(output_path, "w", encoding="utf-8", errors="replace") as log_file:
         proc = subprocess.Popen(
-            popen_args, cwd=cwd, shell=use_shell,
+            popen_args, cwd=cwd, shell=use_shell, env=_child_env(),
             stdout=log_file, stderr=subprocess.STDOUT,
             start_new_session=True,
         )
@@ -161,7 +173,7 @@ def _bash(registry: ToolRegistry, args: dict[str, Any]) -> str:
         # once the process exits.
         with open(output_path, "w", encoding="utf-8", errors="replace") as log_file:
             if sandbox_cmd:
-                bg_env = {**os.environ, **dict(sandbox_cmd.env)}
+                bg_env = {**_child_env(), **dict(sandbox_cmd.env)}
                 proc = subprocess.Popen(
                     [sandbox_cmd.program, *sandbox_cmd.args],
                     cwd=cwd, env=bg_env,
@@ -171,7 +183,7 @@ def _bash(registry: ToolRegistry, args: dict[str, Any]) -> str:
             else:
                 popen_args, use_shell = shell_invocation(command)
                 proc = subprocess.Popen(
-                    popen_args, cwd=cwd, shell=use_shell,
+                    popen_args, cwd=cwd, shell=use_shell, env=_child_env(),
                     stdout=log_file, stderr=subprocess.STDOUT,
                     start_new_session=True,
                 )
@@ -212,7 +224,7 @@ def _bash(registry: ToolRegistry, args: dict[str, Any]) -> str:
             [sandbox_cmd.program, *sandbox_cmd.args],
             cwd=cwd, capture_output=True, text=True,
             encoding="utf-8", errors="replace",
-            timeout=timeout, check=False, env={**os.environ, **env},
+            timeout=timeout, check=False, env={**_child_env(), **env},
         )
     else:
         popen_args, use_shell = shell_invocation(command)
@@ -220,6 +232,7 @@ def _bash(registry: ToolRegistry, args: dict[str, Any]) -> str:
             popen_args, cwd=cwd, capture_output=True, text=True,
             encoding="utf-8", errors="replace",
             shell=use_shell, timeout=timeout, check=False,
+            env=_child_env(),
         )
 
     stdout = result.stdout
