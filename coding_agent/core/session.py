@@ -272,6 +272,7 @@ class Session:
     # ---- persistence -------------------------------------------------------
 
     def save(self, path: Path) -> None:
+        from .atomic_io import atomic_write_text
         path.parent.mkdir(parents=True, exist_ok=True)
         data = {
             "version": self.version,
@@ -280,7 +281,10 @@ class Session:
             "usage": self.usage.to_dict(),
             "messages": [m.to_dict() for m in self.messages],
         }
-        path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        # Atomic so a kill mid-save can't truncate the session file — with
+        # auto_save_session on, this runs after every turn, and a corrupt
+        # file makes the whole session unresumable.
+        atomic_write_text(path, json.dumps(data, indent=2) + "\n")
 
     @classmethod
     def load(cls, path: Path) -> Session:

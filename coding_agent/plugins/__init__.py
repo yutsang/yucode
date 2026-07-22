@@ -12,12 +12,15 @@ Plugin locations:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+_log = logging.getLogger("yucode.plugins")
 
 
 @dataclass
@@ -187,27 +190,29 @@ class PluginRegistry:
     def get_manifest(self, name: str) -> PluginManifest | None:
         return self._plugins.get(name)
 
+    def _run_lifecycle_command(self, name: str, command: str) -> None:
+        plugin_dir = self._plugin_dirs[name]
+        # A hanging lifecycle hook must not wedge startup/shutdown forever.
+        try:
+            subprocess.run(
+                command,
+                shell=True,
+                cwd=str(plugin_dir),
+                capture_output=True,
+                timeout=60,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            _log.warning("Plugin `%s` lifecycle command failed: %s", name, exc)
+
     def init_plugins(self) -> None:
         for name, manifest in self._plugins.items():
             if manifest.lifecycle.init:
-                plugin_dir = self._plugin_dirs[name]
-                subprocess.run(
-                    manifest.lifecycle.init,
-                    shell=True,
-                    cwd=str(plugin_dir),
-                    capture_output=True,
-                )
+                self._run_lifecycle_command(name, manifest.lifecycle.init)
 
     def shutdown_plugins(self) -> None:
         for name, manifest in self._plugins.items():
             if manifest.lifecycle.shutdown:
-                plugin_dir = self._plugin_dirs[name]
-                subprocess.run(
-                    manifest.lifecycle.shutdown,
-                    shell=True,
-                    cwd=str(plugin_dir),
-                    capture_output=True,
-                )
+                self._run_lifecycle_command(name, manifest.lifecycle.shutdown)
 
 
 class PluginManager:
@@ -265,6 +270,7 @@ class PluginManager:
                 ["git", "clone", "--depth=1", repo_url, tmp],
                 check=True,
                 capture_output=True,
+                timeout=300,
             )
             manifest_path = Path(tmp) / self.MANIFEST_FILENAME
             if not manifest_path.is_file():

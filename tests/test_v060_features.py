@@ -368,7 +368,7 @@ class TestWebSearchFallback:
         monkeypatch.delenv("BRAVE_API_KEY", raising=False)
         calls: list[str] = []
 
-        def fake_ddg(q):
+        def fake_ddg(q, context=None):
             calls.append(q)
             return [{"title": "Found", "url": "https://x.com"}] if calls[-1] != "the latest news" else []
 

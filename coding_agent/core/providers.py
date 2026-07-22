@@ -27,6 +27,64 @@ _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 # Total wait across 5 attempts with base=1.5: 1.5 + 3 + 6 + 12 + 24 = ~46s
 # matches typical provider-gateway recovery windows.
 
+# Shared circuit breaker, keyed by gateway host. When a gateway is down at
+# the CONNECTION level (URLError: refused/unreachable/timeout — not HTTP
+# errors, which prove the gateway answered), every call still pays the full
+# retry ladder: up to 5 × request_timeout_seconds + ~46s backoff ≈ 8 minutes
+# on the default config. Concurrent coordinator workers and subagents each
+# pay that independently. After _BREAKER_FAILURE_THRESHOLD consecutive
+# connection-level call failures, subsequent calls to the same host fail
+# fast for _BREAKER_COOLDOWN_SECONDS, then one probe call is let through
+# (half-open): success closes the breaker, failure re-opens it.
+_BREAKER_FAILURE_THRESHOLD = 3
+_BREAKER_COOLDOWN_SECONDS = 30.0
+
+
+@dataclass
+class _CircuitState:
+    consecutive_failures: int = 0
+    opened_at: float | None = None
+
+
+_circuit_states: dict[str, _CircuitState] = {}
+_circuit_lock = threading.Lock()
+
+
+def _breaker_remaining_cooldown(host: str) -> float | None:
+    """Seconds of cooldown left if the breaker for *host* is open, else None.
+
+    Returning None when the cooldown has elapsed is what implements the
+    half-open probe: the caller proceeds with a real request, and the
+    outcome (success/failure) closes or re-opens the breaker."""
+    with _circuit_lock:
+        state = _circuit_states.get(host)
+        if state is None or state.opened_at is None:
+            return None
+        elapsed = time.monotonic() - state.opened_at
+        if elapsed >= _BREAKER_COOLDOWN_SECONDS:
+            return None
+        return _BREAKER_COOLDOWN_SECONDS - elapsed
+
+
+def _breaker_record_connection_failure(host: str) -> None:
+    with _circuit_lock:
+        state = _circuit_states.setdefault(host, _CircuitState())
+        state.consecutive_failures += 1
+        if state.consecutive_failures >= _BREAKER_FAILURE_THRESHOLD:
+            state.opened_at = time.monotonic()
+
+
+def _breaker_record_success(host: str) -> None:
+    with _circuit_lock:
+        if host in _circuit_states:
+            del _circuit_states[host]
+
+
+def _reset_circuit_breakers() -> None:
+    """Test hook: clear all breaker state."""
+    with _circuit_lock:
+        _circuit_states.clear()
+
 # Some gateways (e.g. Azure-fronted reasoning models) 400 on individual body
 # params they don't support. _MAX_SELF_HEAL_ROUNDS bounds how many distinct
 # params we'll drop/rename in response to consecutive 400s before giving up.
@@ -287,9 +345,39 @@ class OpenAICompatibleProvider:
         headers = self._headers(stream=stream)
         context = self._ssl_context()
 
+        host = urllib.parse.urlsplit(url).netloc or url
+
+        def _check_breaker() -> None:
+            remaining = _breaker_remaining_cooldown(host)
+            if remaining is not None:
+                raise ProviderError(
+                    f"Provider gateway {host} is marked unavailable after "
+                    f"{_BREAKER_FAILURE_THRESHOLD}+ consecutive connection failures — "
+                    f"failing fast instead of re-paying the full retry ladder. "
+                    f"Next probe allowed in {remaining:.0f}s.",
+                    recoverable=True,
+                )
+
+        def _backoff(seconds: float) -> None:
+            # A plain time.sleep here would ignore a user cancellation for the
+            # whole backoff window (up to 24s on the last retry) — wait on the
+            # cancel event instead so Esc/stop takes effect immediately.
+            if cancel_event is None:
+                time.sleep(seconds)
+            elif cancel_event.wait(seconds):
+                raise ProviderError("Cancelled by user", recoverable=True)
+
         last_error: Exception | None = None
         self_heal_rounds = 0
         for attempt in range(_MAX_RETRIES):
+            if cancel_event is not None and cancel_event.is_set():
+                raise ProviderError("Cancelled by user", recoverable=True)
+            # Checked per attempt, not just per call: failures are recorded
+            # per connection attempt below, so a dead gateway aborts this
+            # call's remaining retry ladder as soon as the threshold trips
+            # (and a half-open probe call stops after a single failed
+            # attempt re-opens the breaker).
+            _check_breaker()
             payload = json.dumps(body).encode("utf-8")
             request = urllib.request.Request(
                 url,
@@ -299,6 +387,7 @@ class OpenAICompatibleProvider:
             )
             try:
                 with urllib.request.urlopen(request, timeout=self.config.request_timeout_seconds, context=context) as response:
+                    _breaker_record_success(host)
                     if stream:
                         return self._parse_streaming_response(
                             response, stream_callback, cancel_event=cancel_event,
@@ -313,6 +402,9 @@ class OpenAICompatibleProvider:
                         ) from exc
                     return self._parse_response_payload(data, stream_callback)
             except urllib.error.HTTPError as exc:
+                # The gateway answered — connection-wise it's healthy, so the
+                # breaker resets even though the HTTP status is an error.
+                _breaker_record_success(host)
                 last_error = exc
                 if exc.code == 400:
                     detail = exc.read().decode("utf-8", errors="replace")
@@ -321,8 +413,7 @@ class OpenAICompatibleProvider:
                         continue
                     raise ProviderError(f"Provider request failed with {exc.code}: {detail}") from exc
                 if exc.code in _RETRYABLE_STATUS_CODES and attempt < _MAX_RETRIES - 1:
-                    wait = _RETRY_BACKOFF_BASE * (2 ** attempt)
-                    time.sleep(wait)
+                    _backoff(_RETRY_BACKOFF_BASE * (2 ** attempt))
                     continue
                 detail = exc.read().decode("utf-8", errors="replace")
                 raise ProviderError(f"Provider request failed with {exc.code}: {detail}") from exc
@@ -331,13 +422,18 @@ class OpenAICompatibleProvider:
                 if self._is_tls_verification_error(exc):
                     raise ProviderError(
                         "Provider TLS verification failed. "
-                        "If your provider uses an enterprise proxy or custom certificate, "
-                        "try setting `provider.verify_tls: false`.",
+                        "If your provider sits behind an enterprise proxy that re-signs "
+                        "TLS, point `provider.ca_bundle` at your company's CA certificate "
+                        "file (preferred), or as a last resort set "
+                        "`provider.verify_tls: false`.",
                         recoverable=False,
                     ) from exc
+                _breaker_record_connection_failure(host)
                 if attempt < _MAX_RETRIES - 1:
-                    wait = _RETRY_BACKOFF_BASE * (2 ** attempt)
-                    time.sleep(wait)
+                    # Abort before sleeping if this failure just tripped the
+                    # breaker — no point backing off into a fail-fast.
+                    _check_breaker()
+                    _backoff(_RETRY_BACKOFF_BASE * (2 ** attempt))
                     continue
                 raise ProviderError(f"Provider request failed: {exc.reason}") from exc
         raise RetriesExhaustedError(
@@ -375,9 +471,19 @@ class OpenAICompatibleProvider:
         return headers
 
     def _ssl_context(self) -> ssl.SSLContext | None:
-        if self.config.verify_tls:
-            return None
-        return ssl._create_unverified_context()  # noqa: S323
+        if not self.config.verify_tls:
+            return ssl._create_unverified_context()  # noqa: S323
+        if self.config.ca_bundle:
+            # Enterprise proxies that re-sign TLS need their CA trusted
+            # without disabling verification wholesale.
+            try:
+                return ssl.create_default_context(cafile=self.config.ca_bundle)
+            except (OSError, ssl.SSLError) as exc:
+                raise ProviderError(
+                    f"Could not load provider.ca_bundle ({self.config.ca_bundle!r}): {exc}",
+                    recoverable=False,
+                ) from exc
+        return None
 
     def _is_tls_verification_error(self, exc: urllib.error.URLError) -> bool:
         reason = getattr(exc, "reason", None)

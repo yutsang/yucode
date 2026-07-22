@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import ssl
 import time
 import urllib.parse
 import urllib.request
@@ -80,18 +81,40 @@ def web_tools(registry: ToolRegistry) -> list[ToolDefinition]:
                 "read-only",
                 RiskLevel.HIGH,
             ),
-            lambda args: _web_search(args),
+            lambda args: _web_search(args, registry=registry),
         ),
     ]
 
 
-def _build_redirect_limited_opener() -> urllib.request.OpenerDirector:
+def _https_context(registry: ToolRegistry | None) -> ssl.SSLContext | None:
+    """TLS context honoring provider.ca_bundle / verify_tls for web tools.
+
+    Corporate proxies that re-sign TLS break web_fetch/web_search with cert
+    errors exactly like they break provider calls — reuse the same settings
+    rather than making the web tools unusable on those machines."""
+    if registry is None:
+        return None
+    provider = registry.config.provider
+    if not provider.verify_tls:
+        return ssl._create_unverified_context()  # noqa: S323
+    if provider.ca_bundle:
+        try:
+            return ssl.create_default_context(cafile=provider.ca_bundle)
+        except (OSError, ssl.SSLError):
+            return None
+    return None
+
+
+def _build_redirect_limited_opener(context: ssl.SSLContext | None = None) -> urllib.request.OpenerDirector:
     """Build an opener that enforces _MAX_REDIRECTS."""
 
     class _LimitedRedirectHandler(urllib.request.HTTPRedirectHandler):
         max_redirections = _MAX_REDIRECTS
 
-    return urllib.request.build_opener(_LimitedRedirectHandler)
+    handlers: list[urllib.request.BaseHandler] = [_LimitedRedirectHandler]
+    if context is not None:
+        handlers.append(urllib.request.HTTPSHandler(context=context))
+    return urllib.request.build_opener(*handlers)
 
 
 def _web_fetch(registry: ToolRegistry, args: dict[str, Any]) -> str:
@@ -104,7 +127,7 @@ def _web_fetch(registry: ToolRegistry, args: dict[str, Any]) -> str:
         "User-Agent": "yucode-agent/0.1",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     })
-    opener = _build_redirect_limited_opener()
+    opener = _build_redirect_limited_opener(_https_context(registry))
     with opener.open(req, timeout=_FETCH_TIMEOUT) as response:
         body_bytes = response.read(_MAX_RESPONSE_SIZE + 1)
         final_url = response.url
@@ -154,7 +177,7 @@ def _web_fetch(registry: ToolRegistry, args: dict[str, Any]) -> str:
     return json.dumps(result, indent=2)
 
 
-def _web_search(args: dict[str, Any]) -> str:
+def _web_search(args: dict[str, Any], registry: ToolRegistry | None = None) -> str:
     """Web search with backend fallback chain.
 
     Order of preference:
@@ -172,19 +195,20 @@ def _web_search(args: dict[str, Any]) -> str:
 
     fallback_path: list[str] = []
     hits: list[dict[str, str]] = []
+    tls_context = _https_context(registry)
 
     # 1) Brave Search API first if configured
     brave_key = os.environ.get("BRAVE_API_KEY", "").strip()
     if brave_key:
         try:
-            hits = _brave_search(raw_query, brave_key)
+            hits = _brave_search(raw_query, brave_key, context=tls_context)
             fallback_path.append("brave")
         except Exception as exc:
             _log.warning("Brave Search failed (%s); falling back to DuckDuckGo", exc)
 
     # 2) DuckDuckGo HTML (primary if no Brave key, fallback otherwise)
     if not hits:
-        hits = _duckduckgo_search(raw_query)
+        hits = _duckduckgo_search(raw_query, context=tls_context)
         fallback_path.append("duckduckgo")
 
     # 3) Zero-hit retry with relaxed query
@@ -192,7 +216,7 @@ def _web_search(args: dict[str, Any]) -> str:
         relaxed = _relax_query(raw_query)
         if relaxed and relaxed != raw_query:
             _log.info("0 hits for `%s`; retrying with relaxed `%s`", raw_query, relaxed)
-            hits = _duckduckgo_search(relaxed)
+            hits = _duckduckgo_search(relaxed, context=tls_context)
             fallback_path.append("duckduckgo_relaxed")
 
     # Domain filters
@@ -221,7 +245,7 @@ def _web_search(args: dict[str, Any]) -> str:
     return json.dumps(result, indent=2)
 
 
-def _duckduckgo_search(query: str) -> list[dict[str, str]]:
+def _duckduckgo_search(query: str, context: ssl.SSLContext | None = None) -> list[dict[str, str]]:
     """Single-shot DDG HTML scrape. Returns [] on failure rather than raising."""
     if not query.strip():
         return []
@@ -231,7 +255,7 @@ def _duckduckgo_search(query: str) -> list[dict[str, str]]:
         "User-Agent": "yucode-agent/0.1",
         "Accept": "text/html",
     })
-    opener = _build_redirect_limited_opener()
+    opener = _build_redirect_limited_opener(context)
     try:
         with opener.open(req, timeout=_FETCH_TIMEOUT) as response:
             body = response.read(_MAX_RESPONSE_SIZE).decode("utf-8", errors="replace")
@@ -244,7 +268,7 @@ def _duckduckgo_search(query: str) -> list[dict[str, str]]:
     return hits
 
 
-def _brave_search(query: str, api_key: str) -> list[dict[str, str]]:
+def _brave_search(query: str, api_key: str, context: ssl.SSLContext | None = None) -> list[dict[str, str]]:
     """Brave Search API. Returns [{title, url}] or raises on HTTP error."""
     if not query.strip():
         return []
@@ -255,7 +279,7 @@ def _brave_search(query: str, api_key: str) -> list[dict[str, str]]:
         "Accept": "application/json",
         "X-Subscription-Token": api_key,
     })
-    with urllib.request.urlopen(req, timeout=_FETCH_TIMEOUT) as response:
+    with urllib.request.urlopen(req, timeout=_FETCH_TIMEOUT, context=context) as response:
         body = response.read(_MAX_RESPONSE_SIZE).decode("utf-8", errors="replace")
     data = json.loads(body)
     web = (data.get("web") or {}).get("results") or []

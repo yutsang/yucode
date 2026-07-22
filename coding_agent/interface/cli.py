@@ -2169,6 +2169,15 @@ class InteractivePermissionPrompter:
 # ---------------------------------------------------------------------------
 
 def main() -> int:
+    # On Windows, redirected stdout/stderr (logging a run to a file, piping)
+    # default to the locale codepage (cp936/cp1252) with errors=strict — any
+    # CJK character in model output then crashes the process mid-run with
+    # UnicodeEncodeError. The interactive console itself is safe (WriteConsoleW),
+    # so this only changes behavior where it would otherwise crash.
+    for _stream in (sys.stdout, sys.stderr):
+        if hasattr(_stream, "reconfigure"):
+            with suppress(Exception):
+                _stream.reconfigure(encoding="utf-8", errors="replace")
     parser = build_parser()
     args = parser.parse_args()
     return args.handler(args)

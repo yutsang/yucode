@@ -25,6 +25,11 @@ def _edit_notebook_cell(registry: ToolRegistry, args: dict[str, Any]) -> str:
     notebook = json.loads(path.read_text(encoding="utf-8"))
     cells = notebook.setdefault("cells", [])
     index = int(args["cell_index"])
+    if index < 0 or index > len(cells) + 100:
+        raise ValueError(
+            f"cell_index {index} is out of range: the notebook has {len(cells)} cells "
+            "(appending at most 100 new cells past the end is allowed)."
+        )
     while len(cells) <= index:
         cells.append({"cell_type": "code", "metadata": {}, "source": [], "outputs": [], "execution_count": None})
     source = str(args["new_source"])

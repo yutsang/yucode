@@ -207,13 +207,25 @@ def discover_instruction_files(cwd: Path, explicit_paths: list[str]) -> list[Con
 
 
 def _run_git(cwd: Path, args: list[str]) -> str | None:
-    result = subprocess.run(
-        ["git", "--no-optional-locks", *args],
-        cwd=cwd,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    # Locked-down machines (corporate Windows) often have no git at all, and
+    # a repo on a slow network drive can make git hang -- either would
+    # otherwise take down every prompt assembly. Missing/broken/slow git just
+    # means "no git context", never a crash. encoding is pinned because
+    # text=True alone decodes with the locale codepage (cp936/cp1252 on
+    # Windows), which crashes on Chinese diff content.
+    try:
+        result = subprocess.run(
+            ["git", "--no-optional-locks", *args],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
     if result.returncode != 0:
         return None
     output = result.stdout.strip()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib as _hashlib
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -95,6 +96,10 @@ class ProviderConfig:
     # authenticating with an `api-key` header instead of `Authorization: Bearer`.
     api_version: str = ""
     verify_tls: bool = True
+    # Path to a CA certificate file (PEM) to trust in addition to nothing
+    # else -- for enterprise proxies that re-sign TLS. Preferred over
+    # verify_tls: false, which disables verification entirely.
+    ca_bundle: str = ""
     stream: bool = True
     streaming_mode: StreamingMode = "hybrid"
     temperature: float = 0.0
@@ -270,6 +275,7 @@ class AppConfig:
                 "append_chat_path": self.provider.append_chat_path,
                 "api_version": self.provider.api_version,
                 "verify_tls": self.provider.verify_tls,
+                "ca_bundle": self.provider.ca_bundle,
                 "stream": self.provider.stream,
                 "streaming_mode": self.provider.streaming_mode,
                 "temperature": self.provider.temperature,
@@ -469,9 +475,21 @@ def discover_config_paths(workspace: Path | None = None) -> list[Path]:
 
 def load_app_config(explicit_path: str | None = None, workspace: Path | None = None) -> AppConfig:
     path = resolve_config_path(explicit_path)
-    ensure_default_config(path)
     try:
-        raw = load_yaml(path.read_text(encoding="utf-8"))
+        ensure_default_config(path)
+        config_text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        # A read-only or offline HOME (corporate roaming profile on a network
+        # share) must not make startup impossible — run on bundled defaults
+        # and say so, instead of crashing before the CLI can even print help.
+        logging.getLogger("yucode.config").warning(
+            "Could not create/read config at %s (%s); continuing with built-in defaults. "
+            "Set YUCODE_API_KEY etc. via environment variables, or pass --config with a "
+            "writable path.", path, exc,
+        )
+        config_text = _default_config_text()
+    try:
+        raw = load_yaml(config_text)
     except YamlError as exc:
         raise ConfigError(f"Invalid YAML in {path}: {exc}") from exc
     raw_dict = _expect_dict(raw, "config")
@@ -544,6 +562,7 @@ def app_config_from_dict(raw: dict[str, Any]) -> AppConfig:
         append_chat_path=bool(provider_raw.get("append_chat_path", True)),
         api_version=str(provider_raw.get("api_version", "")),
         verify_tls=_coerce_bool(provider_raw.get("verify_tls", True), "provider.verify_tls"),
+        ca_bundle=str(provider_raw.get("ca_bundle", "")),
         stream=bool(provider_raw.get("stream", True)),
         streaming_mode=_coerce_streaming_mode(provider_raw.get("streaming_mode", "")),
         temperature=float(provider_raw.get("temperature", 0.0)),

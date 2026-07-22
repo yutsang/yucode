@@ -18,7 +18,10 @@ provider:
   api_version: "2024-12-01-preview"   # builds .../deployments/{model}/chat/completions?api-version=...
   model: "gpt-5-5-2026-04-24-gs-sdc"  # GPT-5.5. Alternate: gpt-5-4-2026-03-05-gs-sdc (GPT-5.4)
   api_key: "FILL-ME"                  # subscription key; sent as the `api-key` header
-  verify_tls: false                   # corporate TLS interception — required, not optional
+  verify_tls: false                   # corporate TLS interception — see ca_bundle for the safer option
+  # ca_bundle: "C:/certs/corp-ca.pem" # preferred over verify_tls: false — export the corporate root
+  #                                   # CA (certmgr.msc → Trusted Root → export as Base-64 .cer) and
+  #                                   # point here; TLS verification then works instead of being off.
   streaming_mode: no_stream           # revisit after running the WI-4 streaming probe on-site
   request_timeout_seconds: 300        # reasoning models routinely exceed the 90s default
   omit_params:

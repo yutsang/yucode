@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import queue
 import subprocess
 import threading
 from contextlib import suppress
@@ -14,6 +15,13 @@ from ..config import McpServerConfig
 from ..core.errors import McpError
 
 _log = logging.getLogger("yucode.mcp")
+
+# Wall-clock cap on one MCP request/response round trip (including the
+# initialize handshake). Without this, a server process that spawns but never
+# answers — common on locked-down machines where AV/network policy silently
+# blocks the server's own outbound access — wedges the agent forever inside a
+# blocking pipe read while holding the client lock.
+_MCP_CALL_TIMEOUT_SECONDS = 30.0
 
 
 class McpConnectionStatus(str, Enum):
@@ -167,11 +175,15 @@ class StdioMcpClient:
                 return
             self.status = McpConnectionStatus.CONNECTING
             try:
+                # stderr goes to DEVNULL, not PIPE: nothing ever drained the
+                # pipe, so a chatty server filled the OS pipe buffer and then
+                # blocked on its own stderr writes — deadlocking both sides
+                # even when stdout would eventually have answered.
                 self._process = subprocess.Popen(
                     [self.config.command, *self.config.args],
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
                     env={**os.environ, **self.config.env},
                 )
                 self._call(
@@ -208,10 +220,22 @@ class StdioMcpClient:
         try:
             self._process.stdin.write(message)
             self._process.stdin.flush()
-            response = _read_lsp_message(self._process.stdout)
+            response = _read_lsp_message_with_timeout(
+                self._process.stdout, _MCP_CALL_TIMEOUT_SECONDS, self.config.name,
+            )
         except Exception as exc:
             self.status = McpConnectionStatus.ERROR
             self.error_message = str(exc)
+            # Never reuse this pipe: after a timeout, an abandoned reader
+            # thread is still attached to it and would consume (and discard)
+            # the next response. Killing the process closes the pipe, which
+            # both unblocks that reader and forces the next call through the
+            # full respawn/handshake path.
+            if self._process is not None:
+                with suppress(Exception):
+                    self._process.kill()
+                self._process = None
+            self._initialized = False
             raise McpError(
                 f"Communication with MCP server `{self.config.name}` failed: {exc}",
                 server_name=self.config.name,
@@ -362,3 +386,32 @@ def _read_lsp_message(stream: Any) -> dict[str, Any]:
         raise RuntimeError("MCP response missing Content-Length header")
     body = stream.read(length)
     return json.loads(body.decode("utf-8"))
+
+
+def _read_lsp_message_with_timeout(stream: Any, timeout: float, server_name: str) -> dict[str, Any]:
+    """Run the blocking pipe read in a daemon thread so an unresponsive MCP
+    server can't wedge the caller forever (same pattern as the provider's
+    streaming stall watchdog). On timeout the abandoned reader thread stays
+    blocked on the pipe until the caller resets/kills the server process,
+    which closes the pipe and lets it exit."""
+    result_q: queue.Queue[tuple[str, Any]] = queue.Queue()
+
+    def _reader() -> None:
+        try:
+            result_q.put(("ok", _read_lsp_message(stream)))
+        except Exception as exc:  # noqa: BLE001
+            result_q.put(("err", exc))
+
+    threading.Thread(target=_reader, daemon=True).start()
+    try:
+        kind, value = result_q.get(timeout=timeout)
+    except queue.Empty:
+        raise McpError(
+            f"MCP server `{server_name}` did not respond within {timeout:.0f}s "
+            "— treating it as unavailable. The server process may be blocked "
+            "by network policy or waiting on something it can't reach.",
+            server_name=server_name,
+        ) from None
+    if kind == "err":
+        raise value
+    return value

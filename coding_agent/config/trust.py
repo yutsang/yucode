@@ -47,20 +47,25 @@ def is_trusted(workspace: Path, *, store_path: Path | None = None) -> bool:
     return str(workspace.resolve()) in _load_trusted(store_path)
 
 
+def _save_trusted(store: Path, trusted: set[str]) -> None:
+    from ..core.atomic_io import atomic_write_text
+    store.parent.mkdir(parents=True, exist_ok=True)
+    # Atomic: a truncated trust store silently un-trusts everything.
+    atomic_write_text(store, json.dumps(sorted(trusted), indent=2))
+
+
 def trust_workspace(workspace: Path, *, store_path: Path | None = None) -> None:
     store = store_path or _TRUST_STORE_PATH
     trusted = _load_trusted(store)
     trusted.add(str(workspace.resolve()))
-    store.parent.mkdir(parents=True, exist_ok=True)
-    store.write_text(json.dumps(sorted(trusted), indent=2), encoding="utf-8")
+    _save_trusted(store, trusted)
 
 
 def untrust_workspace(workspace: Path, *, store_path: Path | None = None) -> None:
     store = store_path or _TRUST_STORE_PATH
     trusted = _load_trusted(store)
     trusted.discard(str(workspace.resolve()))
-    store.parent.mkdir(parents=True, exist_ok=True)
-    store.write_text(json.dumps(sorted(trusted), indent=2), encoding="utf-8")
+    _save_trusted(store, trusted)
 
 
 def list_trusted_workspaces(*, store_path: Path | None = None) -> list[str]:

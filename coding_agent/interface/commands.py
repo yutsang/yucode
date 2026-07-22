@@ -141,33 +141,45 @@ def _read_ref(path: Path) -> str:
 # Slash command helpers (used by cli.py interactive mode)
 # ---------------------------------------------------------------------------
 
+def _run_git_command(args: list[str], workspace: Path, *, timeout: int = 30) -> subprocess.CompletedProcess[str] | None:
+    """Run a git command; None means git is unavailable (not installed on
+    this machine, or hung past the timeout on a network-mounted repo)."""
+    try:
+        return subprocess.run(
+            ["git", *args],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            cwd=str(workspace), timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+_GIT_UNAVAILABLE = "(git is not available on this machine)"
+
+
 def run_git_diff(workspace: Path) -> str:
-    result = subprocess.run(
-        ["git", "diff"],
-        capture_output=True, text=True, cwd=str(workspace),
-    )
+    result = _run_git_command(["diff"], workspace)
+    if result is None:
+        return _GIT_UNAVAILABLE
     return result.stdout.strip() or "(no changes)"
 
 
 def run_git_branch(workspace: Path) -> str:
-    result = subprocess.run(
-        ["git", "branch", "-v"],
-        capture_output=True, text=True, cwd=str(workspace),
-    )
+    result = _run_git_command(["branch", "-v"], workspace)
+    if result is None:
+        return _GIT_UNAVAILABLE
     return result.stdout.strip()
 
 
 def run_git_commit(workspace: Path, message: str) -> str:
     if not message:
         return "Usage: /commit <message>"
-    result = subprocess.run(
-        ["git", "add", "-A"],
-        capture_output=True, text=True, cwd=str(workspace),
-    )
-    result = subprocess.run(
-        ["git", "commit", "-m", message],
-        capture_output=True, text=True, cwd=str(workspace),
-    )
+    add_result = _run_git_command(["add", "-A"], workspace)
+    if add_result is None:
+        return _GIT_UNAVAILABLE
+    result = _run_git_command(["commit", "-m", message], workspace, timeout=60)
+    if result is None:
+        return _GIT_UNAVAILABLE
     return (result.stdout + result.stderr).strip()
 
 
@@ -182,10 +194,9 @@ def list_instruction_files(workspace: Path) -> list[Path]:
 
 
 def run_git_log(workspace: Path, count: int = 10) -> str:
-    result = subprocess.run(
-        ["git", "log", "--oneline", f"-{count}", "--decorate"],
-        capture_output=True, text=True, cwd=str(workspace),
-    )
+    result = _run_git_command(["log", "--oneline", f"-{count}", "--decorate"], workspace)
+    if result is None:
+        return _GIT_UNAVAILABLE
     return result.stdout.strip() or "(no commits)"
 
 

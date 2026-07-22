@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import contextlib
 import json
+import os
 import re
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
@@ -618,9 +619,36 @@ def _rg(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str] | None:
     try:
         return subprocess.run(
             ["rg", *args], cwd=cwd, capture_output=True, text=True, check=False,
+            timeout=60,
         )
     except FileNotFoundError:
         return None
+    except subprocess.TimeoutExpired:
+        # A stalled network mount can hang rg indefinitely; treat it like
+        # "rg unavailable" so the bounded pure-Python walk takes over.
+        return None
+
+
+def _iter_source_files(search_path: Path):
+    """Lazily yield non-artifact files under *search_path*.
+
+    Replaces `sorted(path.rglob("*"))`, which materialized and sorted the
+    ENTIRE tree — descending into node_modules/.venv/.git — before any
+    filtering or result cap could apply. On a big workspace (or a
+    network-mapped drive) that fallback path took minutes and looked hung,
+    and it's exactly the path used on machines without ripgrep. os.walk with
+    in-place dirnames pruning never enters artifact directories at all, and
+    per-directory sorting keeps output deterministic while staying lazy."""
+    for dirpath, dirnames, filenames in os.walk(search_path):
+        dirnames[:] = sorted(
+            d for d in dirnames
+            if d not in _ARTIFACT_DIRS and not d.endswith(".egg-info")
+        )
+        for name in sorted(filenames):
+            filepath = Path(dirpath) / name
+            if _is_artifact_path(str(filepath)):
+                continue
+            yield filepath
 
 
 def _py_grep_lines(
@@ -639,11 +667,9 @@ def _py_grep_lines(
         regex = re.compile(re.escape(pattern), re.IGNORECASE)
     results: list[str] = []
     seen_files: set[str] = set()
-    for filepath in sorted(search_path.rglob("*")):
+    for filepath in _iter_source_files(search_path):
         if len(results) >= max_lines:
             break
-        if not filepath.is_file() or _is_artifact_path(str(filepath)):
-            continue
         if glob_filter and not filepath.match(glob_filter):
             continue
         try:
@@ -672,13 +698,17 @@ def _py_grep_lines(
     return results
 
 
+_PY_LIST_FILES_CAP = 20_000
+
+
 def _py_list_files(search_path: Path) -> list[str]:
     """Pure-Python file listing used when rg is not available (replaces rg --files)."""
-    return [
-        str(fp)
-        for fp in sorted(search_path.rglob("*"))
-        if fp.is_file() and not _is_artifact_path(str(fp))
-    ]
+    results: list[str] = []
+    for fp in _iter_source_files(search_path):
+        results.append(str(fp))
+        if len(results) >= _PY_LIST_FILES_CAP:
+            break
+    return results
 
 
 def _grep_search(registry: ToolRegistry, args: dict[str, Any]) -> str:

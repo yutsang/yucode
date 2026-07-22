@@ -81,7 +81,12 @@ def _todo_write(registry: ToolRegistry, args: dict[str, Any]) -> str:
     merge = bool(args.get("merge", True))
     existing: list[dict[str, Any]] = []
     if merge and todos_path.exists():
-        existing = json.loads(todos_path.read_text(encoding="utf-8"))
+        try:
+            existing = json.loads(todos_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            # A corrupt/unreadable todos file shouldn't make todo_write
+            # impossible forever — start over from the incoming list.
+            existing = []
     if merge:
         index = {item["id"]: item for item in existing if isinstance(item, dict) and "id" in item}
         for item in incoming:
@@ -89,7 +94,8 @@ def _todo_write(registry: ToolRegistry, args: dict[str, Any]) -> str:
         payload = list(index.values())
     else:
         payload = incoming
-    todos_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    from ..core.atomic_io import atomic_write_text
+    atomic_write_text(todos_path, json.dumps(payload, indent=2) + "\n")
     return f"Updated {todos_path}"
 
 

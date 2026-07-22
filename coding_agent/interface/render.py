@@ -552,9 +552,10 @@ def _git_branch(workspace: Path) -> str:
         result = subprocess.run(
             ["git", "rev-parse", "--abbrev-ref", "HEAD"],
             capture_output=True, text=True, cwd=str(workspace), check=False,
+            timeout=5,
         )
         return result.stdout.strip() if result.returncode == 0 else ""
-    except FileNotFoundError:
+    except (OSError, subprocess.SubprocessError):
         return ""
 
 
