@@ -442,6 +442,27 @@ class TestShellInvocation:
 
 
 # ---------------------------------------------------------------------------
+# Behavioral diagnostic harness (diagnose_agent.py) — mock-mode regression
+# ---------------------------------------------------------------------------
+
+class TestDiagnoseAgentHarness:
+    def test_mock_mode_all_scenarios_pass(self) -> None:
+        """The behavioral harness's own plumbing: synthetic workspaces build,
+        the mock provider's scripted tool calls execute for real, ground-truth
+        judges see the effects, and the digest renders — all without network.
+        Guards the harness against regressions in runtime/tool APIs it uses."""
+        repo_root = Path(__file__).resolve().parent.parent
+        result = subprocess.run(
+            [sys.executable, str(repo_root / "diagnose_agent.py"), "--mock"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=120, cwd=str(repo_root),
+        )
+        assert result.returncode == 0, f"mock run failed:\n{result.stdout[-2000:]}\n{result.stderr[-2000:]}"
+        assert "verdicts passed across 5 scenarios" in result.stdout
+        assert "[FAIL]" not in result.stdout
+
+
+# ---------------------------------------------------------------------------
 # Notebook cell-index bound
 # ---------------------------------------------------------------------------
 

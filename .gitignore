@@ -8,6 +8,9 @@ credentials.json
 Claude Code Coding Agent*.md
 .yucode/
 
+# Diagnostic output (per-machine, never committed)
+diagnose_agent_trace.json
+
 # Python
 __pycache__/
 *.pyc
