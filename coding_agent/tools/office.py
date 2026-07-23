@@ -445,12 +445,16 @@ def office_tools(registry: ToolRegistry) -> list[ToolDefinition]:
         ToolDefinition(
             ToolSpec(
                 "read_pdf_text",
-                "Extract text from a PDF file. Returns page-by-page text.",
+                "Extract text from a PDF file. Returns page-by-page text. Pass layout=true to "
+                "preserve the printed column positions with whitespace (pdftotext -layout "
+                "equivalent) — use that mode when reading financial statements or any page "
+                "where column alignment matters.",
                 {
                     "type": "object",
                     "properties": {
                         "path": {"type": "string", "description": "Path to .pdf file."},
                         "max_pages": {"type": "integer", "description": "Max pages to read (default 50)."},
+                        "layout": {"type": "boolean", "description": "Preserve printed column layout with whitespace (default false)."},
                     },
                     "required": ["path"],
                 },
@@ -458,6 +462,56 @@ def office_tools(registry: ToolRegistry) -> list[ToolDefinition]:
                 RiskLevel.LOW,
             ),
             lambda args: _read_pdf_text(registry, args),
+        ),
+        ToolDefinition(
+            ToolSpec(
+                "extract_pdf_words",
+                "All words on one PDF page with their x/y coordinates and x-centres. Low-level "
+                "building block for coordinate-based table extraction when "
+                "extract_pdf_period_table's automatic banding isn't enough (unusual layouts, "
+                "matrix tables with text column headers).",
+                {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Path to .pdf file."},
+                        "page": {"type": "integer", "description": "1-based page number."},
+                    },
+                    "required": ["path", "page"],
+                },
+                "read-only",
+                RiskLevel.LOW,
+            ),
+            lambda args: _extract_pdf_words(registry, args),
+        ),
+        ToolDefinition(
+            ToolSpec(
+                "extract_pdf_period_table",
+                "Column-safe extraction of a period-columned financial table from one PDF page. "
+                "Detects the period headers (e.g. 2025 / 2024) by x-centre, builds a horizontal "
+                "band per column, groups words into visual rows by y, and assigns each value to "
+                "the period whose band its x-centre falls in — NEVER by token/reading order. "
+                "Printed dashes count as 0 only inside a band; bracketed figures come back as "
+                "real negatives; wrapped label lines are stitched onto their valued row; "
+                "right-hand translated labels (bilingual statements) are kept separately and "
+                "never counted as values. Use this for EVERY bilingual side-by-side note table. "
+                "Returns found=false (with a reason) instead of guessing when the page has no "
+                "text layer or no period header — flag those pages, do not invent columns.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Path to .pdf file."},
+                        "page": {"type": "integer", "description": "1-based page number."},
+                        "periods": {
+                            "type": "array", "items": {"type": "string"},
+                            "description": "Expected period headers as printed (e.g. [\"2025\", \"2024\"]). Omit to auto-detect year-like headers.",
+                        },
+                    },
+                    "required": ["path", "page"],
+                },
+                "read-only",
+                RiskLevel.LOW,
+            ),
+            lambda args: _extract_pdf_period_table(registry, args),
         ),
     ]
 
@@ -1142,11 +1196,34 @@ def _read_pdf_text(registry: ToolRegistry, args: dict[str, Any]) -> str:
     pdfplumber = _require("pdfplumber", "pdfplumber>=0.10", "pdf")
     path = registry._resolve_path(str(args["path"]))
     max_pages = int(args.get("max_pages", 50))
+    # layout=True approximates `pdftotext -layout`: whitespace preserves the
+    # printed column positions, which financial-statement extraction needs
+    # (and locked-down machines can't run the pdftotext executable).
+    layout = bool(args.get("layout", False))
     pages = []
     with pdfplumber.open(str(path)) as pdf:
         for i, page in enumerate(pdf.pages):
             if i >= max_pages:
                 break
-            text = page.extract_text() or ""
+            text = page.extract_text(layout=layout) or ""
             pages.append({"page": i + 1, "text": text})
     return json.dumps({"pages": pages, "total_pages": len(pages)})
+
+
+def _extract_pdf_words(registry: ToolRegistry, args: dict[str, Any]) -> str:
+    _require("pdfplumber", "pdfplumber>=0.10", "pdf")
+    from . import pdf_tables
+    path = registry._resolve_path(str(args["path"]))
+    words = pdf_tables.extract_page_words(str(path), int(args["page"]))
+    return json.dumps({"page": int(args["page"]), "words": words, "count": len(words)})
+
+
+def _extract_pdf_period_table(registry: ToolRegistry, args: dict[str, Any]) -> str:
+    _require("pdfplumber", "pdfplumber>=0.10", "pdf")
+    from . import pdf_tables
+    path = registry._resolve_path(str(args["path"]))
+    periods = args.get("periods")
+    if periods is not None:
+        periods = [str(p) for p in periods]
+    result = pdf_tables.extract_period_table(str(path), int(args["page"]), periods)
+    return json.dumps(result, ensure_ascii=False)
