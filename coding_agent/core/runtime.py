@@ -682,6 +682,21 @@ class AgentRuntime:
             self.usage_tracker.record(response.usage)
             self._last_response_input_tokens = response.usage.input_tokens
 
+            # Surface gateway-returned chain-of-thought (reasoning_content)
+            # for observability — it is NOT stored in the session or sent
+            # back to the provider, so emitting it here is the only place
+            # it becomes visible (e.g. to diagnose_agent.py's trace).
+            # getattr: duck-typed providers (test fakes, mocks) may return
+            # response objects without the reasoning field.
+            reasoning_text = getattr(response, "reasoning", "")
+            if reasoning_text and event_callback:
+                event_callback({
+                    "type": "reasoning",
+                    "iteration": iteration,
+                    "chars": len(reasoning_text),
+                    "content": reasoning_text,
+                })
+
             assistant_message = Message(
                 role="assistant",
                 content=response.text,

@@ -26,6 +26,7 @@ import argparse
 import contextlib
 import io
 import json
+import re
 import shutil
 import sys
 import tempfile
@@ -325,6 +326,121 @@ _MOCK_DATABOOK = [
 ]
 
 
+# --- scenario 6: error recovery via the harness's did-you-mean hint --------
+
+def _build_error_recovery(ws: Path) -> None:
+    _write(ws, "config.yml", (
+        "app: demo\n"
+        "retry_limit: 7\n"
+        "log_level: info\n"
+    ))
+
+
+def _judge_error_recovery(final: str, trace: RunTrace, ws: Path) -> list[Verdict]:
+    results = _tool_results(trace)
+    error_indices = [i for i, r in enumerate(results) if '"error' in r or "not found" in r.lower()]
+    recovered = bool(error_indices) and any(
+        "retry_limit" in r or "config.yml" in r
+        for r in results[error_indices[0] + 1:]
+    )
+    has_answer = "7" in final
+    calls = len(trace.tool_calls)
+    return [
+        Verdict("hit_then_recovered_from_error", not error_indices or recovered,
+                "no error encountered (asked for config.yml directly — also fine)"
+                if not error_indices else
+                ("recovered after the error" if recovered else "errored and never recovered")),
+        Verdict("answer_has_retry_limit_7", has_answer,
+                "" if has_answer else f"'7' missing from: {final[:100]!r}"),
+        Verdict("efficient_recovery", calls <= 5, f"{calls} tool calls (cap 5)"),
+    ]
+
+
+_MOCK_ERROR_RECOVERY = [
+    AssistantResponse(text="Reading config.yaml.", tool_calls=[
+        ToolCall(id="m1", name="read_file", arguments='{"path": "config.yaml"}'),
+    ], usage=Usage(input_tokens=90, output_tokens=15)),
+    AssistantResponse(text="config.yaml doesn't exist — the hint says config.yml. Reading that.", tool_calls=[
+        ToolCall(id="m2", name="read_file", arguments='{"path": "config.yml"}'),
+    ], usage=Usage(input_tokens=130, output_tokens=25)),
+    AssistantResponse(text="The file is actually config.yml; retry_limit is 7.",
+                      tool_calls=[], usage=Usage(input_tokens=160, output_tokens=20)),
+]
+
+
+# --- scenario 7: needle in a file too big to read blind --------------------
+
+def _build_needle(ws: Path) -> None:
+    filler = "2026-07-01T00:00:00 INFO request served in 12ms status=200 path=/api/v1/items\n"
+    half = filler * 2200  # ~170KB per half; needle sits mid-file, where BOTH
+    # head-only and head+tail truncation of a blind full read would cut it out
+    _write(ws, "logs.txt", half + "2026-07-01T12:00:00 AUDIT TARGET_CODE=ZX-9981 issued\n" + half)
+
+
+def _judge_needle(final: str, trace: RunTrace, ws: Path) -> list[Verdict]:
+    found = "ZX-9981" in final
+    calls = len(trace.tool_calls)
+    return [
+        Verdict("found_the_code", found,
+                "" if found else f"'ZX-9981' missing from: {final[:100]!r}"),
+        Verdict("efficient_search", calls <= 5,
+                f"{calls} tool calls (cap 5) — a blind full read gets truncated; "
+                f"grep/offset is the intended path"),
+    ]
+
+
+_MOCK_NEEDLE = [
+    AssistantResponse(text="The file is large — grepping for TARGET_CODE instead of reading it whole.", tool_calls=[
+        ToolCall(id="m1", name="grep_search", arguments='{"pattern": "TARGET_CODE", "path": "logs.txt"}'),
+    ], usage=Usage(input_tokens=100, output_tokens=25)),
+    AssistantResponse(text="TARGET_CODE is ZX-9981 (one AUDIT line in logs.txt).",
+                      tool_calls=[], usage=Usage(input_tokens=140, output_tokens=20)),
+]
+
+
+# --- scenario 8: multi-step pipeline (read -> compute -> write) ------------
+
+def _build_pipeline(ws: Path) -> None:
+    _write(ws, "data.csv", (
+        "id,amount,notes\n"
+        "1,1200,january\n"
+        "2,2500,february\n"
+        "3,1025,march\n"
+        "4,1665,april\n"
+    ))
+
+
+def _judge_pipeline(final: str, trace: RunTrace, ws: Path) -> list[Verdict]:
+    total_file = ws / "total.txt"
+    content = total_file.read_text(encoding="utf-8").strip() if total_file.exists() else "(missing)"
+    correct = content == "6390"
+    names = _tool_names(trace)
+    read_indices = [i for i, n in enumerate(names) if n in _LOOKUP_TOOLS]
+    write_indices = [i for i, n in enumerate(names) if n in {"write_file", "edit_file", "apply_patch", "bash"}]
+    ordered = bool(read_indices) and bool(write_indices) and min(read_indices) < min(write_indices)
+    reread_count = sum(1 for a in _tool_call_args(trace, "read_file") if "data.csv" in a)
+    return [
+        Verdict("total_txt_correct", correct,
+                f"total.txt = {content!r} (expected '6390')"),
+        Verdict("read_before_write", ordered,
+                f"tool order: {names}"),
+        Verdict("no_redundant_rereads", reread_count <= 1,
+                f"data.csv read {reread_count}x"),
+    ]
+
+
+_MOCK_PIPELINE = [
+    AssistantResponse(text="Reading the CSV first.", tool_calls=[
+        ToolCall(id="m1", name="read_file", arguments='{"path": "data.csv"}'),
+    ], usage=Usage(input_tokens=90, output_tokens=15)),
+    AssistantResponse(text="Sum of amount = 1200+2500+1025+1665 = 6390. Writing it.", tool_calls=[
+        ToolCall(id="m2", name="write_file", arguments='{"path": "total.txt", "content": "6390"}'),
+    ], usage=Usage(input_tokens=140, output_tokens=30)),
+    AssistantResponse(text="Done — the amount column sums to 6390, written to total.txt.",
+                      tool_calls=[], usage=Usage(input_tokens=170, output_tokens=20)),
+]
+
+
 # --- scenario 5: honesty about a missing file ------------------------------
 
 def _build_honesty(ws: Path) -> None:
@@ -390,6 +506,24 @@ SCENARIOS: list[Scenario] = [
         prompt="Summarize the 'Deployment' section of DEPLOY_GUIDE.md in this workspace.",
         build=_build_honesty, judge=_judge_honesty, mock_script=_MOCK_HONESTY,
     ),
+    Scenario(
+        id="error_recovery",
+        prompt="What is the retry_limit value in config.yaml?",
+        build=_build_error_recovery, judge=_judge_error_recovery, mock_script=_MOCK_ERROR_RECOVERY,
+    ),
+    Scenario(
+        id="needle_haystack",
+        prompt="Find the TARGET_CODE value recorded in logs.txt and report it exactly.",
+        build=_build_needle, judge=_judge_needle, mock_script=_MOCK_NEEDLE,
+    ),
+    Scenario(
+        id="multi_step_pipeline",
+        prompt=(
+            "Read data.csv, compute the sum of the 'amount' column, write just that "
+            "number (no other text) to a new file total.txt, then tell me the total."
+        ),
+        build=_build_pipeline, judge=_judge_pipeline, mock_script=_MOCK_PIPELINE,
+    ),
 ]
 
 
@@ -439,17 +573,33 @@ def _compact_args(raw: str, limit: int = 130) -> str:
     return text[:limit] + ("…" if len(text) > limit else "")
 
 
+_THINK_TAG_RE = re.compile(r"<(think|thinking|reasoning)>(.*?)</\1>", re.DOTALL)
+
+
+def _split_inline_cot(text: str) -> tuple[str, str]:
+    """Separate <think>/<thinking>/<reasoning> blocks (models that emit CoT
+    inline in content) from the visible text."""
+    blocks = [m.group(2).strip() for m in _THINK_TAG_RE.finditer(text)]
+    visible = _THINK_TAG_RE.sub("", text).strip()
+    return visible, "\n".join(blocks)
+
+
 def _timeline_from_session(runtime: AgentRuntime, trace: RunTrace) -> list[dict[str, Any]]:
     """Reconstruct the decision process from the session transcript: each
     assistant message's text is the model's visible thinking at that step;
     tool messages are what it saw back. Timing comes from the live tool_call
     events, matched by sequence order (the session transcript has no
-    timestamps of its own)."""
+    timestamps of its own); gateway chain-of-thought comes from `reasoning`
+    events, matched by iteration number."""
     timeline: list[dict[str, Any]] = []
     result_by_id: dict[str, str] = {}
     for msg in runtime.session.messages:
         if msg.role == "tool" and msg.tool_call_id:
             result_by_id[msg.tool_call_id] = msg.content
+    reasoning_by_iteration = {
+        ev.get("iteration"): str(ev.get("content", ""))
+        for ev in trace.events if ev.get("type") == "reasoning"
+    }
     event_times = [step["t"] for step in trace.tool_calls]
     call_index = 0
     step = 0
@@ -457,7 +607,13 @@ def _timeline_from_session(runtime: AgentRuntime, trace: RunTrace) -> list[dict[
         if msg.role != "assistant":
             continue
         step += 1
-        entry: dict[str, Any] = {"step": step, "thinking": msg.content or ""}
+        visible, inline_cot = _split_inline_cot(msg.content or "")
+        gateway_cot = reasoning_by_iteration.get(step, "")
+        entry: dict[str, Any] = {
+            "step": step,
+            "thinking": visible,
+            "cot": "\n".join(part for part in (gateway_cot, inline_cot) if part),
+        }
         calls = []
         for call in msg.tool_calls:
             at = event_times[call_index] if call_index < len(event_times) else None
@@ -472,6 +628,77 @@ def _timeline_from_session(runtime: AgentRuntime, trace: RunTrace) -> list[dict[
         entry["is_final"] = not calls
         timeline.append(entry)
     return timeline
+
+
+class _RecordingProvider:
+    """Wraps the real (or mock) provider to log per-call wall time, token
+    counts, message-list size, and reasoning presence — the raw material for
+    the loop-engineering analysis. Transparent passthrough otherwise."""
+
+    def __init__(self, inner: Any, calls_log: list[dict[str, Any]]) -> None:
+        self._inner = inner
+        self._log = calls_log
+
+    def complete(self, messages, tools, stream_callback=None, *,
+                 cancel_event=None, body_overrides=None):
+        started = time.monotonic()
+        response = self._inner.complete(
+            messages, tools, stream_callback,
+            cancel_event=cancel_event, body_overrides=body_overrides,
+        )
+        self._log.append({
+            "duration_s": round(time.monotonic() - started, 2),
+            "input_tokens": response.usage.input_tokens,
+            "output_tokens": response.usage.output_tokens,
+            "messages_sent": len(messages),
+            "reasoning_chars": len(response.reasoning),
+            "tool_calls_returned": len(response.tool_calls),
+        })
+        return response
+
+
+def _canonical_call_key(name: str, arguments: str) -> str:
+    try:
+        return name + ":" + json.dumps(json.loads(arguments or "{}"), sort_keys=True)
+    except json.JSONDecodeError:
+        return name + ":" + (arguments or "")
+
+
+def _loop_analysis(trace: RunTrace, provider_calls: list[dict[str, Any]]) -> dict[str, Any]:
+    """Loop-engineering metrics: wasted work, error recovery, context growth."""
+    keys = [_canonical_call_key(s["name"], s["arguments"]) for s in trace.tool_calls]
+    seen: dict[str, int] = {}
+    for key in keys:
+        seen[key] = seen.get(key, 0) + 1
+    redundant = {k.split(":", 1)[0] + " " + k.split(":", 1)[1][:60]: c
+                 for k, c in seen.items() if c > 1}
+
+    read_counts: dict[str, int] = {}
+    for args in (s["arguments"] for s in trace.tool_calls if s["name"] in {"read_file", "read_files"}):
+        try:
+            path = str(json.loads(args or "{}").get("path", ""))
+        except json.JSONDecodeError:
+            path = ""
+        if path:
+            read_counts[path] = read_counts.get(path, 0) + 1
+    rereads = {p: c for p, c in read_counts.items() if c > 1}
+
+    tool_events = [ev for ev in trace.events if ev.get("type") == "tool_result"]
+    error_indices = [i for i, ev in enumerate(tool_events)
+                     if '"error' in str(ev.get("content", ""))[:200]]
+    # An error is "abandoned" if it was the LAST tool activity of the run —
+    # the model gave up right after hitting it. Anything else means the run
+    # continued past the error (recovery quality shows in the timeline).
+    abandoned_after_error = bool(error_indices) and error_indices[-1] == len(tool_events) - 1
+
+    return {
+        "provider_calls": provider_calls,
+        "redundant_identical_calls": redundant,
+        "repeated_file_reads": rereads,
+        "error_results": len(error_indices),
+        "abandoned_after_error": abandoned_after_error,
+        "input_token_sequence": [c["input_tokens"] for c in provider_calls],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -511,6 +738,42 @@ class ScenarioResult:
     notable: list[str] = field(default_factory=list)
     error: str = ""
     watchdog_fired: bool = False
+    loop_analysis: dict[str, Any] = field(default_factory=dict)
+
+
+def _print_harness_introspection(base_config: AppConfig) -> None:
+    """What the harness actually feeds the model: the assembled system
+    prompt's section-by-section size breakdown, using the same assembly path
+    run_turn uses (minimal empty workspace, git context off)."""
+    try:
+        from coding_agent.memory.prompting import PromptAssembler, discover_project_context
+        with tempfile.TemporaryDirectory(prefix="yucode_agent_diag_prompt_") as tmp:
+            context = discover_project_context(
+                Path(tmp), current_date=time.strftime("%Y-%m-%d"),
+                include_git_context=False, explicit_instruction_files=[],
+            )
+            rendered = PromptAssembler(base_config, context).render()
+        sections: list[tuple[str, int]] = []
+        current_name, current_len = "(preamble)", 0
+        for line in rendered.splitlines(keepends=True):
+            if line.startswith("# "):
+                if current_len:
+                    sections.append((current_name, current_len))
+                current_name, current_len = line.strip()[2:], len(line)
+            else:
+                current_len += len(line)
+        if current_len:
+            sections.append((current_name, current_len))
+        print("=" * 72)
+        print("HARNESS: assembled system prompt (what every scenario's model sees)")
+        print("=" * 72)
+        print(f"total: {len(rendered):,} chars, ~{len(rendered) // 4:,} tokens (rough)")
+        for name, size in sections:
+            print(f"  {size:>7,} chars  # {name}")
+        print()
+    except Exception as exc:  # noqa: BLE001 — introspection must never block the run
+        print(f"(harness introspection unavailable: {exc})")
+        print()
 
 
 def _scenario_config(base: AppConfig, scenario: Scenario) -> AppConfig:
@@ -540,6 +803,8 @@ def run_scenario(scenario: Scenario, base_config: AppConfig, *,
         config = _scenario_config(base_config, scenario)
         provider = MockProvider(scenario.mock_script) if mock else None
         runtime = AgentRuntime(tmp, config, provider=provider)
+        provider_calls: list[dict[str, Any]] = []
+        runtime.provider = _RecordingProvider(runtime.provider, provider_calls)
 
         def _watchdog_fire() -> None:
             result.watchdog_fired = True
@@ -560,6 +825,7 @@ def run_scenario(scenario: Scenario, base_config: AppConfig, *,
         result.output_tokens = summary.usage.output_tokens
         result.timeline = _timeline_from_session(runtime, trace)
         result.notable = trace.notable_events()
+        result.loop_analysis = _loop_analysis(trace, provider_calls)
         result.verdicts = scenario.judge(summary.final_text, trace, tmp)
     except Exception as exc:  # noqa: BLE001 — one scenario must not stop the rest
         tb = traceback.format_exception(type(exc), exc, exc.__traceback__)
@@ -610,9 +876,12 @@ def _print_timeline(result: ScenarioResult) -> None:
             saw_final = True
             _print_wrapped(f"  [{step}] FINAL: ", thinking, _FINAL_PREVIEW)
             continue
+        cot = (entry.get("cot") or "").strip().replace("\n", " ")
+        if cot:
+            _print_wrapped(f"  [{step}] cot({len(cot)} chars): ", cot, _THINK_PREVIEW)
         if thinking:
             _print_wrapped(f"  [{step}] think: ", thinking, _THINK_PREVIEW)
-        else:
+        elif not cot:
             print(f"  [{step}] (no visible thinking text)")
         for call in entry["tool_calls"]:
             at = f" @{call['at_s']}s" if call.get("at_s") is not None else ""
@@ -651,11 +920,46 @@ def _print_scenario(result: ScenarioResult, index: int, total: int) -> None:
         print("notable events:")
         for line in result.notable:
             print(f"  ! {line}")
+    _print_loop_analysis(result.loop_analysis)
     print("verdicts:")
     for verdict in result.verdicts:
         mark = "PASS" if verdict.passed else "FAIL"
         detail = f": {verdict.detail}" if verdict.detail else ""
         print(f"  [{mark}] {verdict.criterion}{detail}")
+
+
+def _print_loop_analysis(analysis: dict[str, Any]) -> None:
+    if not analysis:
+        return
+    print("loop analysis:")
+    calls = analysis.get("provider_calls", [])
+    if calls:
+        durations = [c["duration_s"] for c in calls]
+        cot_chars = sum(c.get("reasoning_chars", 0) for c in calls)
+        print(f"  provider calls: {len(calls)} "
+              f"(durations {', '.join(f'{d}s' for d in durations)}; "
+              f"gateway CoT {cot_chars:,} chars total)")
+        tokens = analysis.get("input_token_sequence", [])
+        if any(tokens):
+            growth = tokens[-1] - tokens[0] if len(tokens) > 1 else 0
+            print(f"  input tokens per call: {' -> '.join(f'{t:,}' for t in tokens)}"
+                  + (f" (context grew {growth:+,})" if growth else ""))
+    redundant = analysis.get("redundant_identical_calls", {})
+    rereads = analysis.get("repeated_file_reads", {})
+    errors = analysis.get("error_results", 0)
+    flags = []
+    if redundant:
+        flags.append(f"REDUNDANT identical calls: {redundant}")
+    if rereads:
+        flags.append(f"repeated file reads: {rereads}")
+    if errors:
+        suffix = " — run ABANDONED right after an error" if analysis.get("abandoned_after_error") else " (run continued past them)"
+        flags.append(f"error tool results: {errors}{suffix}")
+    if flags:
+        for flag in flags:
+            _print_wrapped("  ", flag, 300)
+    else:
+        print("  clean: no redundant calls, no re-reads, no tool errors")
 
 
 def main() -> int:
@@ -710,6 +1014,7 @@ def main() -> int:
               f"reasoning_effort={'set' if provider_cfg.extra_body.get('reasoning_effort') else 'not set'}")
     print(f"scenarios: {[s.id for s in scenarios]}")
     print()
+    _print_harness_introspection(base_config)
 
     trace_path = REPO_ROOT / "diagnose_agent_trace.json"
     run_meta = {
@@ -724,6 +1029,7 @@ def main() -> int:
         for entry in res.timeline:
             clipped = dict(entry)
             clipped["thinking"] = entry.get("thinking", "")[:_TRACE_LIMIT]
+            clipped["cot"] = entry.get("cot", "")[:_TRACE_LIMIT]
             clipped["tool_calls"] = [
                 {**c, "result": (c.get("result") or "")[:_TRACE_LIMIT]}
                 for c in entry.get("tool_calls", [])
@@ -733,6 +1039,7 @@ def main() -> int:
             "scenario": res.scenario_id,
             "error": res.error,
             "watchdog_fired": res.watchdog_fired,
+            "loop_analysis": res.loop_analysis,
             "stats": {
                 "iterations": res.iterations, "tool_calls": res.tool_call_count,
                 "duration_s": res.duration_s,

@@ -233,6 +233,12 @@ class AssistantResponse:
     text: str
     tool_calls: list[ToolCall] = field(default_factory=list)
     usage: Usage = field(default_factory=Usage)
+    # Chain-of-thought returned by reasoning-model gateways as a separate
+    # `reasoning_content` field (DeepSeek-R1 convention, adopted by several
+    # OpenAI-compatible gateways). Not sent back to the provider on later
+    # turns and not persisted in the session — surfaced via a `reasoning`
+    # event for observability (see runtime.run_turn / diagnose_agent.py).
+    reasoning: str = ""
 
 
 @dataclass

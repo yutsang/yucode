@@ -527,6 +527,7 @@ class OpenAICompatibleProvider:
         choice = choices[0] if choices else {}
         message = choice.get("message", {})
         text = _extract_content_text(message.get("content"))
+        reasoning = str(message.get("reasoning_content") or message.get("reasoning") or "")
         tool_calls = _tool_calls_from_payload(message.get("tool_calls", []))
         usage = _extract_usage(payload.get("usage", {}))
 
@@ -545,7 +546,7 @@ class OpenAICompatibleProvider:
 
         if stream_callback and text:
             stream_callback({"type": "assistant_delta", "delta": text})
-        return AssistantResponse(text=text, tool_calls=tool_calls, usage=usage)
+        return AssistantResponse(text=text, tool_calls=tool_calls, usage=usage, reasoning=reasoning)
 
     def _parse_streaming_response(
         self,
@@ -555,6 +556,7 @@ class OpenAICompatibleProvider:
         cancel_event: threading.Event | None = None,
     ) -> AssistantResponse:
         text_parts: list[str] = []
+        reasoning_parts: list[str] = []
         tool_call_accumulator: dict[int, dict[str, str]] = {}
         usage = Usage()
         chunk_count = 0
@@ -646,6 +648,9 @@ class OpenAICompatibleProvider:
             if choices:
                 choice = choices[0]
                 delta = choice.get("delta", {})
+                reasoning_delta = delta.get("reasoning_content") or delta.get("reasoning")
+                if isinstance(reasoning_delta, str) and reasoning_delta:
+                    reasoning_parts.append(reasoning_delta)
                 content = _extract_content_text(delta.get("content"))
                 if content:
                     text_parts.append(content)
@@ -705,7 +710,8 @@ class OpenAICompatibleProvider:
                 "Run `yucode doctor --workspace .` to check your configuration.",
                 category="provider_streaming_empty_response",
             )
-        return AssistantResponse(text=final_text, tool_calls=tool_calls, usage=usage)
+        return AssistantResponse(text=final_text, tool_calls=tool_calls, usage=usage,
+                                 reasoning="".join(reasoning_parts))
 
 
 def _tool_calls_from_payload(raw_tool_calls: list[dict[str, Any]]) -> list[ToolCall]:

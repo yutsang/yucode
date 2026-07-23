@@ -458,8 +458,10 @@ class TestDiagnoseAgentHarness:
             timeout=120, cwd=str(repo_root),
         )
         assert result.returncode == 0, f"mock run failed:\n{result.stdout[-2000:]}\n{result.stderr[-2000:]}"
-        assert "verdicts passed across 5 scenarios" in result.stdout
+        assert "verdicts passed across 8 scenarios" in result.stdout
         assert "[FAIL]" not in result.stdout
+        assert "loop analysis:" in result.stdout
+        assert "assembled system prompt" in result.stdout
 
 
 # ---------------------------------------------------------------------------
