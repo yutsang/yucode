@@ -522,7 +522,7 @@ def main() -> int:
             if status == "FAIL":
                 print(f"  - {name}: {detail}")
     print()
-    print(">>> 請把以上完整輸出（從第一行開始）貼回給 Claude 分析 <<<")
+    print(">>> Copy the FULL output above (from the first line) for analysis <<<")
     return 1 if counts["FAIL"] else 0
 
 

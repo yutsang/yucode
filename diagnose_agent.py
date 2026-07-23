@@ -1124,7 +1124,7 @@ def main() -> int:
               f"{res.iterations}it/{res.tool_call_count}calls/{res.duration_s}s")
     print(trace_note)
     print()
-    print(">>> 請把以上完整輸出貼回給 Claude；需要更深入時再附上 trace JSON 檔 <<<")
+    print(">>> Copy the FULL output above for analysis; attach the trace JSON for deeper review <<<")
     return 1 if (errored or passed < total_verdicts) else 0
 
 
