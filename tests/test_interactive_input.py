@@ -1,7 +1,6 @@
 """Tests for the prompt_toolkit-based interactive input session."""
 from __future__ import annotations
 
-import os
 from collections import deque
 from pathlib import Path
 
@@ -10,7 +9,7 @@ from prompt_toolkit.buffer import Buffer, CompletionState
 from prompt_toolkit.document import Document
 from prompt_toolkit.keys import Keys
 
-from coding_agent.interface.cli import _AT_HIDDEN, _SLASH_COMMANDS, _make_pt_session, _read_prompt_line
+from coding_agent.interface.cli import _AT_HIDDEN, _make_pt_session, _read_prompt_line
 
 
 @pytest.fixture()
@@ -291,3 +290,75 @@ class TestEnterKeyPasteHandling:
         handler(_FakeEnterEvent(buf, deque(["queued"])))
         assert buf.complete_state is None
         assert submitted == []
+
+
+# ---------------------------------------------------------------------------
+# Windows Ctrl+V clipboard paste binding
+# ---------------------------------------------------------------------------
+
+class TestWindowsCtrlVPaste:
+    """prompt_toolkit switches the Windows console to raw mode, which turns
+    OFF conhost's own Ctrl+V paste handling — the keystroke arrives as a bare
+    c-v keypress and, unbound, did NOTHING (the real 'can't paste at all in
+    the REPL' symptom on the user's box). A c-v binding reading the system
+    clipboard via ctypes fixes it; POSIX terminals handle paste themselves,
+    so the binding is Windows-only."""
+
+    def test_binding_registered_on_windows(self, tmp_path: Path, monkeypatch) -> None:
+        from coding_agent.interface import cli as cli_mod
+        monkeypatch.setattr(cli_mod, "_IS_WINDOWS", True)
+        session = cli_mod._make_pt_session(tmp_path)
+        assert session is not None
+        assert any(
+            "c-v" in str(getattr(b, "keys", "")) for b in session.key_bindings.bindings
+        ), "c-v binding missing on Windows"
+
+    def test_binding_absent_on_posix(self, tmp_path: Path, monkeypatch) -> None:
+        from coding_agent.interface import cli as cli_mod
+        monkeypatch.setattr(cli_mod, "_IS_WINDOWS", False)
+        session = cli_mod._make_pt_session(tmp_path)
+        assert session is not None
+        assert not any(
+            "c-v" in str(getattr(b, "keys", "")) for b in session.key_bindings.bindings
+        )
+
+    def test_normalize_pasted_text_converts_crlf(self) -> None:
+        from coding_agent.interface.cli import _normalize_pasted_text
+        assert _normalize_pasted_text("a\r\nb\rc\nd") == "a\nb\nc\nd"
+
+    def test_paste_handler_inserts_clipboard_into_real_buffer(self, tmp_path: Path, monkeypatch) -> None:
+        from coding_agent.interface import cli as cli_mod
+        monkeypatch.setattr(cli_mod, "_IS_WINDOWS", True)
+        monkeypatch.setattr(cli_mod, "_read_windows_clipboard", lambda: "line1\r\nline2 中文")
+        session = cli_mod._make_pt_session(tmp_path)
+        binding = next(
+            b for b in session.key_bindings.bindings if "c-v" in str(getattr(b, "keys", ""))
+        )
+        buf = Buffer(document=Document(""), multiline=True)
+
+        class _FakePasteEvent:
+            current_buffer = buf
+
+        binding.handler(_FakePasteEvent())
+        assert buf.text == "line1\nline2 中文"
+
+    def test_paste_handler_noop_on_empty_clipboard(self, tmp_path: Path, monkeypatch) -> None:
+        from coding_agent.interface import cli as cli_mod
+        monkeypatch.setattr(cli_mod, "_IS_WINDOWS", True)
+        monkeypatch.setattr(cli_mod, "_read_windows_clipboard", lambda: "")
+        session = cli_mod._make_pt_session(tmp_path)
+        binding = next(
+            b for b in session.key_bindings.bindings if "c-v" in str(getattr(b, "keys", ""))
+        )
+        buf = Buffer(document=Document("keep"), multiline=True)
+
+        class _FakePasteEvent:
+            current_buffer = buf
+
+        binding.handler(_FakePasteEvent())
+        assert buf.text == "keep"
+
+    def test_read_windows_clipboard_returns_empty_off_windows(self) -> None:
+        from coding_agent.interface.cli import _read_windows_clipboard
+        # ctypes.windll doesn't exist on POSIX — the guard must swallow it.
+        assert _read_windows_clipboard() == ""

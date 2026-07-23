@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import os
 import sys
 import time
 from contextlib import suppress
@@ -1058,6 +1059,45 @@ _SLASH_COMMANDS = [
 _AT_HIDDEN = frozenset({"__pycache__", ".git", ".DS_Store", ".mypy_cache", ".ruff_cache", ".pytest_cache"})
 
 
+# Module constant (not an inline os.name check) so tests can flip it without
+# monkeypatching the global os module — patching os.name to "nt" on POSIX
+# breaks pathlib itself (Path() would try to build WindowsPath).
+_IS_WINDOWS = os.name == "nt"
+
+
+def _normalize_pasted_text(text: str) -> str:
+    """Clipboard text arrives with \\r\\n on Windows; buffers want \\n."""
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _read_windows_clipboard() -> str:
+    """Read CF_UNICODETEXT from the Windows clipboard via ctypes — stdlib
+    only, no pyperclip/pywin32 (locked-down boxes can't install them).
+    Returns "" on any failure; pasting nothing beats crashing the REPL."""
+    import ctypes
+    CF_UNICODETEXT = 13
+    try:
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        if not user32.OpenClipboard(None):
+            return ""
+        try:
+            handle = user32.GetClipboardData(CF_UNICODETEXT)
+            if not handle:
+                return ""
+            pointer = kernel32.GlobalLock(handle)
+            if not pointer:
+                return ""
+            try:
+                return ctypes.wstring_at(pointer)
+            finally:
+                kernel32.GlobalUnlock(handle)
+        finally:
+            user32.CloseClipboard()
+    except Exception:  # noqa: BLE001 — clipboard access must never kill the REPL
+        return ""
+
+
 def _make_pt_session(workspace: Path) -> Any:
     """Build the interactive PromptSession, or None if prompt_toolkit isn't installed.
 
@@ -1156,6 +1196,20 @@ def _make_pt_session(workspace: Path) -> Any:
     @kb.add("escape", "enter")
     def _alt_enter_newline(event):
         event.current_buffer.insert_text("\n")
+
+    if _IS_WINDOWS:
+        # In raw console mode (which prompt_toolkit switches the Windows
+        # console into), conhost's own Ctrl+V paste handling is OFF — the
+        # keystroke arrives here as a bare c-v keypress and, unbound, does
+        # NOTHING. That's why paste "just stops working" the moment the
+        # REPL opens even though it works fine at the cmd prompt. Windows
+        # Terminal intercepts Ctrl+V itself, so this binding only fires
+        # where it's needed (classic conhost) and is harmless elsewhere.
+        @kb.add("c-v")
+        def _windows_clipboard_paste(event):
+            text = _read_windows_clipboard()
+            if text:
+                event.current_buffer.insert_text(_normalize_pasted_text(text))
 
     @kb.add("c-c")
     def _ctrl_c(event):

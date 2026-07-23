@@ -376,8 +376,34 @@ def check_prompt_toolkit() -> None:
         detail += "; Win32 console input reader importable"
     _record("PASS", "prompt_toolkit_windows_input", detail)
     _record("INFO", "paste_fix_manual_test",
-            "MANUAL: run the REPL, paste a multi-line text — it must arrive as ONE "
-            "prompt (newlines inserted), not submit on the first line")
+            "MANUAL: run the REPL, paste with Ctrl+V AND with right-click — a "
+            "multi-line paste must arrive as ONE prompt (newlines inserted), "
+            "not submit on the first line, and Ctrl+V must not be a no-op")
+
+
+@check("repl_ctrl_v_paste_binding")
+def check_ctrl_v_binding(workspace: Path) -> None:
+    """The REPL's Ctrl+V clipboard binding: registered on Windows, and the
+    ctypes clipboard read actually works on this machine."""
+    from coding_agent.interface.cli import _make_pt_session, _read_windows_clipboard
+    session = _make_pt_session(workspace)
+    if session is None:
+        _record("SKIP", "repl_ctrl_v_paste_binding", "prompt_toolkit not installed")
+        return
+    has_cv = any(
+        "c-v" in str(getattr(binding, "keys", "")) for binding in session.key_bindings.bindings
+    )
+    if os.name != "nt":
+        _record("SKIP", "repl_ctrl_v_paste_binding",
+                f"not Windows (binding present: {has_cv} — expected False on POSIX)")
+        return
+    if not has_cv:
+        _record("FAIL", "repl_ctrl_v_paste_binding", "c-v binding NOT registered on Windows")
+        return
+    clip = _read_windows_clipboard()
+    _record("PASS", "repl_ctrl_v_paste_binding",
+            f"c-v bound; clipboard read returned {len(clip)} chars "
+            f"({'non-empty' if clip else 'empty or unreadable — copy some text first to fully test'})")
 
 
 # ---------------------------------------------------------------------------
@@ -470,6 +496,7 @@ def main() -> int:
     check_shell_tool(workspace)
     check_mcp_timeout()
     check_prompt_toolkit()
+    check_ctrl_v_binding(workspace)
 
     print()
     print("=" * 72)
