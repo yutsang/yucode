@@ -1,0 +1,15 @@
+name: Release
+
+# Disarmed. The Python release pipeline this replaced triggered on every `v*`
+# tag and ran pip/pytest/build; on this tree that fails, and a `v1.0.0` tag
+# pushed before WP24 writes the real release job must not run it. Manual
+# trigger only, and it does nothing but say so.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  not-yet:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "No release pipeline until WP24 (docs/REWRITE_PLAN.md §5)."

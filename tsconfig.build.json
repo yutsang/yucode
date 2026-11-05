@@ -1,0 +1,15 @@
+{
+  // The emitting half. tsconfig.json type-checks src and tests together and
+  // emits nothing; this narrows to src so `rootDir` can be src, which is what
+  // puts the entry point at dist/cli/main.js — the path both launchers hard-
+  // code and the one docs/REWRITE_PLAN.md §3.2 specifies.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "rootDir": "src",
+    "outDir": "dist",
+    "declaration": false,
+    "sourceMap": true
+  },
+  "include": ["src/**/*.ts"]
+}

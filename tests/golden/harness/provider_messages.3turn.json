@@ -1,0 +1,123 @@
+{
+  "note": "Session.provider_messages(system_prompt, pruning=None). The stored session.system_prompt is deliberately ignored; the argument wins (session.py:285-287). call_2's arguments are malformed on purpose and must project as '{}'.",
+  "session_version": 1,
+  "model": "deepseek-chat",
+  "messages_in": [
+    {
+      "role": "user",
+      "content": "List the Python files here."
+    },
+    {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+        {
+          "id": "call_1",
+          "name": "glob_search",
+          "arguments": "{\"pattern\": \"**/*.py\"}"
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "src/app.py\nsrc/util.py",
+      "tool_call_id": "call_1"
+    },
+    {
+      "role": "assistant",
+      "content": "Two files: src/app.py and src/util.py."
+    },
+    {
+      "role": "user",
+      "content": "Read the first one."
+    },
+    {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+        {
+          "id": "call_2",
+          "name": "read_file",
+          "arguments": "{\"path\": \"src/app.p"
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "{\"error\": \"Invalid JSON in arguments\"}",
+      "tool_call_id": "call_2"
+    },
+    {
+      "role": "assistant",
+      "content": "Retrying with a valid path."
+    },
+    {
+      "role": "user",
+      "content": "Summarise what it does."
+    }
+  ],
+  "provider_messages": [
+    {
+      "role": "system",
+      "content": "SYSTEM PROMPT PLACEHOLDER"
+    },
+    {
+      "role": "user",
+      "content": "List the Python files here."
+    },
+    {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+        {
+          "id": "call_1",
+          "type": "function",
+          "function": {
+            "name": "glob_search",
+            "arguments": "{\"pattern\": \"**/*.py\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "src/app.py\nsrc/util.py",
+      "tool_call_id": "call_1"
+    },
+    {
+      "role": "assistant",
+      "content": "Two files: src/app.py and src/util.py."
+    },
+    {
+      "role": "user",
+      "content": "Read the first one."
+    },
+    {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+        {
+          "id": "call_2",
+          "type": "function",
+          "function": {
+            "name": "read_file",
+            "arguments": "{}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "{\"error\": \"Invalid JSON in arguments\"}",
+      "tool_call_id": "call_2"
+    },
+    {
+      "role": "assistant",
+      "content": "Retrying with a valid path."
+    },
+    {
+      "role": "user",
+      "content": "Summarise what it does."
+    }
+  ]
+}

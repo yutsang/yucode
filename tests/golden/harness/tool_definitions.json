@@ -1,0 +1,1240 @@
+{
+  "note": "Order is registration order, which is the order the provider sees. definitions_for_provider() does not sort (tools/__init__.py:484).",
+  "count": 50,
+  "extended_tools_enabled": false,
+  "tools": [
+    {
+      "name": "read_file",
+      "permission": "read-only",
+      "risk_level": "RiskLevel.LOW",
+      "description": "Read a text file from the workspace.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "offset": {
+            "type": "integer"
+          },
+          "limit": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    },
+    {
+      "name": "write_file",
+      "permission": "workspace-write",
+      "risk_level": "RiskLevel.MEDIUM",
+      "description": "Write (or overwrite) a text file in the workspace. Use a workspace-relative path (e.g. 'wiki/note.md'). The 'content' parameter must be the full file text — never null or empty unless you intend a blank file.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "content": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "content"
+        ]
+      }
+    },
+    {
+      "name": "edit_file",
+      "permission": "workspace-write",
+      "risk_level": "RiskLevel.MEDIUM",
+      "description": "Replace text in a workspace file.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "old_string": {
+            "type": "string"
+          },
+          "new_string": {
+            "type": "string"
+          },
+          "replace_all": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "path",
+          "old_string",
+          "new_string"
+        ]
+      }
+    },
+    {
+      "name": "glob_search",
+      "permission": "read-only",
+      "risk_level": "RiskLevel.LOW",
+      "description": "Search files by glob within the workspace.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "pattern": {
+            "type": "string"
+          },
+          "target_directory": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "pattern"
+        ]
+      }
+    },
+    {
+      "name": "grep_search",
+      "permission": "read-only",
+      "risk_level": "RiskLevel.LOW",
+      "description": "Search file contents with ripgrep.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "pattern": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "glob": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "pattern"
+        ]
+      }
+    },
+    {
+      "name": "list_directory",
+      "permission": "read-only",
+      "risk_level": "RiskLevel.LOW",
+      "description": "List files and subdirectories in a workspace directory. Returns each entry's name, type (file/dir), and size for files.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Directory path relative to workspace root. Defaults to workspace root."
+          }
+        },
+        "required": []
+      }
+    },
+    {
+      "name": "read_files",
+      "permission": "read-only",
+      "risk_level": "RiskLevel.LOW",
+      "description": "Read multiple text files in one call. Returns a JSON array; each entry is either {path, content, total_lines} on success or {path, error} on failure. Up to 10 paths per call. Use this instead of N sequential read_file calls when you need to compare or correlate content across files.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "paths": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Workspace-relative or absolute paths to read."
+          },
+          "offset": {
+            "type": "integer",
+            "description": "Optional 1-based start line, applied to each file."
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Optional max lines per file."
+          }
+        },
+        "required": [
+          "paths"
+        ]
+      }
+    },
+    {
+      "name": "file_outline",
+      "permission": "read-only",
+      "risk_level": "RiskLevel.LOW",
+      "description": "Return a structural outline of a Python file (classes, methods, functions, top-level imports) with line numbers. Much cheaper than read_file when you only need to locate a symbol. Non-Python files return an error suggesting read_file.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    },
+    {
+      "name": "apply_patch",
+      "permission": "workspace-write",
+      "risk_level": "RiskLevel.MEDIUM",
+      "description": "Apply a multi-file patch in one call: create, delete, move/rename, and edit any number of files atomically (if any operation fails, nothing is written).\n\nFormat:\n*** Begin Patch\n*** Add File: <path>\n+line1\n+line2\n*** Update File: <path>\n*** Move to: <new path>          (optional — renames while editing)\n@@ <optional context, e.g. a function name>\n <unchanged context line, space-prefixed>\n-<line to remove>\n+<line to add>\n*** End of File                  (optional — anchors the hunk at end of file)\n*** Delete File: <path>\n*** End Patch\n\nHunks must match the file's CURRENT content exactly (context + removed lines, contiguous). Prefer this over edit_file when a change spans multiple files or needs to create/delete/rename in the same operation; use edit_file for a single in-place string replacement.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "patch": {
+            "type": "string",
+            "description": "The full patch text, from *** Begin Patch to *** End Patch."
+          }
+        },
+        "required": [
+          "patch"
+        ]
+      }
+    },
+    {
+      "name": "bash",
+      "permission": "danger-full-access",
+      "risk_level": "RiskLevel.HIGH",
+      "description": "Execute a shell command in the workspace.\n- Each call gets a fresh shell: no cd, no exported variable, and no activated virtualenv survives to the next call. Use working_directory instead of `cd`, and combine dependent steps in one command.\n- On Windows commands run through cmd.exe, not bash. Prefer portable invocations (`python -m ...`) over shell-specific syntax.\n- A refusal from the safety patterns is policy, not a transient error. Do not retry the same intent with different phrasing; either work another way or tell the user why you stopped.\n- Output beyond the cap is truncated head+tail, and the full text is written to a file whose path is in the result. Read that file rather than re-running the command.\n- Set run_in_background=true for long-running processes (servers, watchers); a foreground command that exceeds its timeout is moved to the background rather than killed, and reported back when it finishes.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "command": {
+            "type": "string",
+            "description": "Shell command to execute."
+          },
+          "timeout": {
+            "type": "integer",
+            "description": "Timeout in seconds (default from config)."
+          },
+          "working_directory": {
+            "type": "string",
+            "description": "Working directory (default: workspace root)."
+          },
+          "run_in_background": {
+            "type": "boolean",
+            "description": "Run in background, return immediately with PID."
+          },
+          "description": {
+            "type": "string",
+            "description": "Brief description of what this command does."
+          }
+        },
+        "required": [
+          "command"
+        ]
+      }
+    },
+    {
+      "name": "web_fetch",
+      "permission": "read-only",
+      "risk_level": "RiskLevel.HIGH",
+      "description": "Fetch a URL and return its cleaned text content. Use this AFTER web_search to read the most promising result pages. Pass a 'prompt' describing what you need so the output is focused. Works on HTML pages, APIs, and plain text. Returns: url, status, content_type, bytes, duration_ms, result (cleaned text, wrapped in an <untrusted-content> delimiter).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "Full URL to fetch."
+          },
+          "prompt": {
+            "type": "string",
+            "description": "What you are looking for on this page. Helps extract relevant content."
+          }
+        },
+        "required": [
+          "url"
+        ]
+      }
+    },
+    {
+      "name": "web_search",
+      "permission": "read-only",
+      "risk_level": "RiskLevel.HIGH",
+      "description": "Search the web. Uses Brave Search API if BRAVE_API_KEY is set, else DuckDuckGo HTML; auto-retries with a relaxed query on zero hits. Returns {results: [{title, url}], _meta: {backends_tried}}. IMPORTANT: After searching, pick the 1-3 most relevant URLs and use web_fetch to read their content. Do NOT keep searching endlessly — fetch the best results to extract the actual data. If the first search doesn't find what you need, try ONE more refined query, then fetch the best hits.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Search query. Be specific with names, dates, amounts."
+          },
+          "allowed_domains": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Only include results from these domains."
+          },
+          "blocked_domains": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Exclude results from these domains."
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    },
+    {
+      "name": "edit_notebook_cell",
+      "permission": "workspace-write",
+      "risk_level": "RiskLevel.MEDIUM",
+      "description": "Edit or create a notebook cell by index.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "cell_index": {
+            "type": "integer"
+          },
+          "new_source": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "cell_index",
+          "new_source"
+        ]
+      }
+    },
+    {
+      "name": "agent",
+      "permission": "workspace-write",
+      "risk_level": "RiskLevel.HIGH",
+      "description": "Launch a sub-agent with a scoped task. Optionally specify a role (research/work/validate) for automatic tool scoping, or provide explicit allowed_tools. By default this blocks until the sub-agent finishes (or times out after 5 minutes). Pass run_in_background=true for a long task to get a task_id back immediately instead of blocking — its result is delivered as a system-reminder on a later tool call, same as a background bash command.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "prompt": {
+            "type": "string",
+            "description": "The task for the sub-agent."
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "research",
+              "work",
+              "validate"
+            ],
+            "description": "Worker role — auto-selects appropriate tools."
+          },
+          "allowed_tools": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Explicit tool whitelist (overrides role)."
+          },
+          "run_in_background": {
+            "type": "boolean",
+            "description": "Return immediately with a task_id instead of blocking (default false)."
+          }
+        },
+        "required": [
+          "prompt"
+        ]
+      }
+    },
+    {
+      "name": "todo_write",
+      "permission": "workspace-write",
+      "risk_level": "RiskLevel.MEDIUM",
+      "description": "Write or update the local todo list.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "todos": {
+            "type": "array"
+          },
+          "merge": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "todos"
+        ]
+      }
+    },
+    {
+      "name": "mcp_list_resources",
+      "permission": "read-only",
+      "risk_level": "RiskLevel.LOW",
+      "description": "List resources from a configured MCP server.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "server": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "server"
+        ]
+      }
+    },
+    {
+      "name": "mcp_read_resource",
+      "permission": "read-only",
+      "risk_level": "RiskLevel.LOW",
+      "description": "Read a resource from a configured MCP server.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "server": {
+            "type": "string"
+          },
+          "uri": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "server",
+          "uri"
+        ]
+      }
+    },
+    {
+      "name": "load_skill",
+      "permission": "read-only",
+      "risk_level": "RiskLevel.LOW",
+      "description": "Load a skill by name. Returns the full SKILL.md body.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ]
+      }
+    },
+    {
+      "name": "sleep",
+      "permission": "read-only",
+      "risk_level": "RiskLevel.LOW",
+      "description": "Pause execution for the given number of milliseconds.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "milliseconds": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "milliseconds"
+        ]
+      }
+    },
+    {
+      "name": "config_read",
+      "permission": "read-only",
+      "risk_level": "RiskLevel.LOW",
+      "description": "Read the current agent configuration.",
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "structured_output",
+      "permission": "read-only",
+      "risk_level": "RiskLevel.LOW",
+      "description": "Return a structured JSON result.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "data": {}
+        },
+        "required": [
+          "data"
+        ]
+      }
+    },
+    {
+      "name": "config_write",
+      "permission": "workspace-write",
+      "risk_level": "RiskLevel.MEDIUM",
+      "description": "Update a runtime configuration value.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string",
+            "description": "Dot-separated config key (e.g. 'runtime.max_iterations')."
+          },
+          "value": {
+            "type": "string",
+            "description": "New value."
+          }
+        },
+        "required": [
+          "key",
+          "value"
+        ]
+      }
+    },
+    {
+      "name": "read_excel_sheet",
+      "permission": "read-only",
+      "risk_level": "RiskLevel.LOW",
+      "description": "Read an Excel (.xlsx) sheet as headers + rows. Returns JSON with 'headers' and 'rows'.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Path to .xlsx file."
+          },
+          "sheet": {
+            "type": "string",
+            "description": "Sheet name (default: active sheet)."
+          },
+          "max_rows": {
+            "type": "integer",
+            "description": "Max data rows to return (default 500)."
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    },
+    {
+      "name": "list_excel_sheets",
+      "permission": "read-only",
+      "risk_level": "RiskLevel.LOW",
+      "description": "List visible sheet names in an Excel (.xlsx) file. Hidden sheets are excluded.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Path to .xlsx file."
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    },
+    {
+      "name": "inspect_excel_sheets",
+      "permission": "read-only",
+      "risk_level": "RiskLevel.LOW",
+      "description": "Scan all visible sheets in an Excel file. Returns each sheet's name, estimated row count, column headers, and sample rows. Call this before read_excel_sheet when you need to identify which sheet contains the data the user is looking for.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Path to .xlsx file."
+          },
+          "sample_rows": {
+            "type": "integer",
+            "description": "Data rows to sample per sheet (default 3)."
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    },
+    {
+      "name": "write_excel_cell",
+      "permission": "workspace-write",
+      "risk_level": "RiskLevel.MEDIUM",
+      "description": "Write a value to a cell in an Excel (.xlsx) file.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "sheet": {
+            "type": "string",
+            "description": "Sheet name (default: active)."
+          },
+          "cell": {
+            "type": "string",
+            "description": "Cell reference like A1, B2."
+          },
+          "value": {
+            "type": "string",
+            "description": "Value to write."
+          }
+        },
+        "required": [
+          "path",
+          "cell",
+          "value"
+        ]
+      }
+    },
+    {
+      "name": "excel_to_json",
+      "permission": "read-only",
+      "risk_level": "RiskLevel.LOW",
+      "description": "Convert an Excel sheet to a list of JSON records (using first row as headers).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "sheet": {
+            "type": "string"
+          },
+          "max_rows": {
+            "type": "integer",
+            "description": "Max rows (default 500)."
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    },
+    {
+      "name": "read_word_text",
+      "permission": "read-only",
+      "risk_level": "RiskLevel.LOW",
+      "description": "Read the full text of a Word (.docx) file.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Path to .docx file."
+          },
+          "max_chars": {
+            "type": "integer",
+            "description": "Max characters (default 50000)."
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    },
+    {
+      "name": "read_word_paragraphs",
+      "permission": "read-only",
+      "risk_level": "RiskLevel.LOW",
+      "description": "Read paragraphs from a Word (.docx) file with style info.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "max_paragraphs": {
+            "type": "integer",
+            "description": "Max paragraphs (default 1000)."
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    },
+    {
+      "name": "write_word",
+      "permission": "workspace-write",
+      "risk_level": "RiskLevel.MEDIUM",
+      "description": "Create a new Word (.docx) file with paragraphs.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "paragraphs": {
+            "type": "array",
+            "description": "List of paragraphs. Each can be a string or {text, style}.",
+            "items": {}
+          }
+        },
+        "required": [
+          "path",
+          "paragraphs"
+        ]
+      }
+    },
+    {
+      "name": "append_word",
+      "permission": "workspace-write",
+      "risk_level": "RiskLevel.MEDIUM",
+      "description": "Append a paragraph to an existing Word (.docx) file.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          },
+          "style": {
+            "type": "string",
+            "description": "Paragraph style (default Normal)."
+          }
+        },
+        "required": [
+          "path",
+          "text"
+        ]
+      }
+    },
+    {
+      "name": "read_pptx",
+      "permission": "read-only",
+      "risk_level": "RiskLevel.LOW",
+      "description": "Read text content from a PowerPoint (.pptx) file. Returns slide-by-slide text.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Path to .pptx file."
+          },
+          "max_slides": {
+            "type": "integer",
+            "description": "Max slides to read (default 100)."
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    },
+    {
+      "name": "write_pptx",
+      "permission": "workspace-write",
+      "risk_level": "RiskLevel.MEDIUM",
+      "description": "Create a new PowerPoint (.pptx) file with slides. Each slide has a title and body.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "slides": {
+            "type": "array",
+            "description": "List of slides. Each is {title, body} or {title, bullets: [...]}, plus optional 'notes' for the speaker notes and 'layout' for the slide-layout index (0 is the title slide in a stock template; default 1).",
+            "items": {}
+          }
+        },
+        "required": [
+          "path",
+          "slides"
+        ]
+      }
+    },
+    {
+      "name": "write_pptx_from_template",
+      "permission": "workspace-write",
+      "risk_level": "RiskLevel.MEDIUM",
+      "description": "Create a PowerPoint (.pptx) from an existing template. Replaces placeholders in the template and adds slides with data.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "template_path": {
+            "type": "string",
+            "description": "Path to template .pptx file."
+          },
+          "output_path": {
+            "type": "string",
+            "description": "Output .pptx file path."
+          },
+          "slides": {
+            "type": "array",
+            "description": "List of slides: each {title, body, bullets: [...], notes: str}.",
+            "items": {}
+          }
+        },
+        "required": [
+          "template_path",
+          "output_path",
+          "slides"
+        ]
+      }
+    },
+    {
+      "name": "inspect_pptx_shapes",
+      "permission": "read-only",
+      "risk_level": "RiskLevel.LOW",
+      "description": "Inspect a PowerPoint (.pptx) file's actual shape structure, per slide: each shape's name, type, position, and (for tables) row/column count with a cell preview, or (for text frames) a text preview. Call this before fill_pptx_shape_text/fill_pptx_table on a template whose shape names you don't already know — house-style templates typically name their content placeholders (e.g. a shape called 'textMainBullets' or 'Table Placeholder').",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Path to .pptx file."
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    },
+    {
+      "name": "fill_pptx_shape_text",
+      "permission": "workspace-write",
+      "risk_level": "RiskLevel.MEDIUM",
+      "description": "Write text into a specific named shape (text box or placeholder) on a specific slide of a .pptx file. Matches shape name case-insensitively. Use inspect_pptx_shapes first to find the right slide_index/shape_name. Pass the same path as output_path to keep progressively filling the same in-progress file. Applies the same fixed formatting estimate_pptx_text_capacity assumes (9pt Arial/Microsoft YaHei, single spacing, 3pt paragraph gap) so the two tools never disagree, and sets the shape's autofit accordingly: noAutofit when the text fits (exact size, no surprise PowerPoint shrink), or a bounded shrink-to-fit when it doesn't (visible, not silently clipped).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Path to .pptx file to read."
+          },
+          "output_path": {
+            "type": "string",
+            "description": "Path to save the result to."
+          },
+          "slide_index": {
+            "type": "integer",
+            "description": "0-based slide index."
+          },
+          "shape_name": {
+            "type": "string",
+            "description": "Target shape's name (case-insensitive)."
+          },
+          "paragraphs": {
+            "type": "array",
+            "description": "List of paragraph strings; each becomes one paragraph/bullet.",
+            "items": {
+              "type": "string"
+            }
+          },
+          "is_chinese": {
+            "type": "boolean",
+            "description": "Optional override for font selection; auto-detected (>30% CJK characters) if omitted."
+          }
+        },
+        "required": [
+          "path",
+          "output_path",
+          "slide_index",
+          "shape_name",
+          "paragraphs"
+        ]
+      }
+    },
+    {
+      "name": "fill_pptx_table",
+      "permission": "workspace-write",
+      "risk_level": "RiskLevel.MEDIUM",
+      "description": "Write row data into a named table (or table placeholder) shape on a specific slide of a .pptx file. The target shape is always replaced with a freshly built table sized exactly to the given data, at the same position — this never silently crops data to an existing table's size. Optionally pass style_id to set a table style GUID. Matches shape name case-insensitively. Use inspect_pptx_shapes first to find slide_index/shape_name.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Path to .pptx file to read."
+          },
+          "output_path": {
+            "type": "string",
+            "description": "Path to save the result to."
+          },
+          "slide_index": {
+            "type": "integer",
+            "description": "0-based slide index."
+          },
+          "shape_name": {
+            "type": "string",
+            "description": "Target shape's name (case-insensitive)."
+          },
+          "rows": {
+            "type": "array",
+            "description": "Row data: list of rows, each a list of cell strings.",
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "style_id": {
+            "type": "string",
+            "description": "Optional table style GUID (e.g. '{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}') to apply."
+          }
+        },
+        "required": [
+          "path",
+          "output_path",
+          "slide_index",
+          "shape_name",
+          "rows"
+        ]
+      }
+    },
+    {
+      "name": "estimate_pptx_text_capacity",
+      "permission": "read-only",
+      "risk_level": "RiskLevel.LOW",
+      "description": "Estimate whether commentary text fits a named shape's slot on a .pptx slide, using real font-glyph measurement (not a rough chars-per-inch guess). Pass the SAME paragraphs list you're about to write with fill_pptx_shape_text. Returns fill_ratio and remaining_lines_estimate -- use these to decide whether to add more genuinely-supported detail (a slot at fill_ratio 0.2-0.3 has room to spare) or trim (fill_ratio > 1.0 means it overflows). Call inspect_pptx_shapes first to find slide_index/shape_name.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Path to .pptx file."
+          },
+          "slide_index": {
+            "type": "integer",
+            "description": "0-based slide index."
+          },
+          "shape_name": {
+            "type": "string",
+            "description": "Target shape's name (case-insensitive)."
+          },
+          "paragraphs": {
+            "type": "array",
+            "description": "Candidate paragraph strings, same shape as fill_pptx_shape_text's `paragraphs`.",
+            "items": {
+              "type": "string"
+            }
+          },
+          "is_chinese": {
+            "type": "boolean",
+            "description": "Optional override; auto-detected (>30% CJK characters) if omitted."
+          }
+        },
+        "required": [
+          "path",
+          "slide_index",
+          "shape_name",
+          "paragraphs"
+        ]
+      }
+    },
+    {
+      "name": "locate_databook_stage_columns",
+      "permission": "read-only",
+      "risk_level": "RiskLevel.LOW",
+      "description": "Scan a financial databook sheet's header rows for reporting 'basis/stage' labels (Indicative adjusted, Mgt acc, Audited, Audit adjustment, Indicative adjustment -- including common Traditional/Simplified Chinese and typo variants) and return exactly which column each canonical stage occupies, with its associated period date. Call this BEFORE reading account figures from a databook, instead of visually picking which of many similarly-dated column groups is the required one (e.g. 'use only the Indicative adjusted columns') -- real databooks routinely place 10-30+ date columns side by side across 2-5 basis groups with only a text label distinguishing them, no cell merging or other structural hint. Returns found=false if the sheet doesn't have a recognizable multi-basis header.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Path to .xlsx file."
+          },
+          "sheet": {
+            "type": "string",
+            "description": "Sheet name (default: active sheet)."
+          },
+          "max_scan_rows": {
+            "type": "integer",
+            "description": "Max rows to scan for the basis/header row (default 20)."
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    },
+    {
+      "name": "read_excel_preview",
+      "permission": "read-only",
+      "risk_level": "RiskLevel.LOW",
+      "description": "Read an Excel file with schema inference. Returns headers, types, and a preview of the data.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Path to .xlsx file."
+          },
+          "sheet": {
+            "type": "string",
+            "description": "Sheet name (default: active sheet)."
+          },
+          "max_rows": {
+            "type": "integer",
+            "description": "Max preview rows (default 20)."
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    },
+    {
+      "name": "image_read",
+      "permission": "read-only",
+      "risk_level": "RiskLevel.LOW",
+      "description": "Inspect an image (.png/.jpg/.jpeg/.webp/.gif/.bmp/.tiff) and return metadata (path, mime_type, width, height, mode, size_bytes). Pass include_base64=true to also get a base64 data URL — useful when the provider supports multimodal/vision input. Default omits base64 to keep the response cheap.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Path to image file."
+          },
+          "include_base64": {
+            "type": "boolean",
+            "description": "If true, include a base64 data URL in the response."
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    },
+    {
+      "name": "read_pdf_text",
+      "permission": "read-only",
+      "risk_level": "RiskLevel.LOW",
+      "description": "Extract text from a PDF file. Returns page-by-page text. Pass layout=true to preserve the printed column positions with whitespace (pdftotext -layout equivalent) — use that mode when reading financial statements or any page where column alignment matters.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Path to .pdf file."
+          },
+          "max_pages": {
+            "type": "integer",
+            "description": "Max pages to read (default 50)."
+          },
+          "layout": {
+            "type": "boolean",
+            "description": "Preserve printed column layout with whitespace (default false)."
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    },
+    {
+      "name": "extract_pdf_words",
+      "permission": "read-only",
+      "risk_level": "RiskLevel.LOW",
+      "description": "All words on one PDF page with their x/y coordinates and x-centres. Low-level building block for coordinate-based table extraction when extract_pdf_period_table's automatic banding isn't enough (unusual layouts, matrix tables with text column headers).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Path to .pdf file."
+          },
+          "page": {
+            "type": "integer",
+            "description": "1-based page number."
+          }
+        },
+        "required": [
+          "path",
+          "page"
+        ]
+      }
+    },
+    {
+      "name": "extract_pdf_period_table",
+      "permission": "read-only",
+      "risk_level": "RiskLevel.LOW",
+      "description": "Column-safe extraction of a period-columned financial table from one PDF page. Detects the period headers (e.g. 2025 / 2024) by x-centre, builds a horizontal band per column, groups words into visual rows by y, and assigns each value to the period whose band its x-centre falls in — NEVER by token/reading order. Printed dashes count as 0 only inside a band; bracketed figures come back as real negatives; wrapped label lines are stitched onto their valued row; right-hand translated labels (bilingual statements) are kept separately and never counted as values. Use this for EVERY bilingual side-by-side note table. Returns found=false (with a reason) instead of guessing when the page has no text layer or no period header — flag those pages, do not invent columns.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Path to .pdf file."
+          },
+          "page": {
+            "type": "integer",
+            "description": "1-based page number."
+          },
+          "periods": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Expected period headers as printed (e.g. [\"2025\", \"2024\"]). Omit to auto-detect year-like headers."
+          }
+        },
+        "required": [
+          "path",
+          "page"
+        ]
+      }
+    },
+    {
+      "name": "memory_save",
+      "permission": "workspace-write",
+      "risk_level": "RiskLevel.LOW",
+      "description": "Persist a memory across sessions. Use for: user preferences, feedback corrections you should not repeat, project facts not derivable from code, references to external systems (Linear/Slack/Grafana). Do NOT save: code patterns derivable from the repo, ephemeral task state, anything already in CLAUDE.md/YUCODE.md/AGENTS.md.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Short kebab-case identifier (e.g. 'user-prefers-go-style-tests')."
+          },
+          "description": {
+            "type": "string",
+            "description": "One-line summary used to decide relevance in future sessions."
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "user",
+              "feedback",
+              "project",
+              "reference"
+            ],
+            "description": "user = role/preferences; feedback = corrections to keep; project = ongoing work facts; reference = pointers to external systems."
+          },
+          "content": {
+            "type": "string",
+            "description": "The memory body. For feedback/project, structure as: rule/fact line, then a **Why:** line, then a **How to apply:** line."
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "user",
+              "workspace"
+            ],
+            "description": "user = ~/.yucode/memory (cross-project, default); workspace = ./.yucode/memory (project-specific)."
+          }
+        },
+        "required": [
+          "name",
+          "description",
+          "type",
+          "content"
+        ]
+      }
+    },
+    {
+      "name": "memory_list",
+      "permission": "read-only",
+      "risk_level": "RiskLevel.LOW",
+      "description": "List saved memories with name, description, type, scope. Check this before saving a new memory to avoid duplicates.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "scope": {
+            "type": "string",
+            "enum": [
+              "user",
+              "workspace"
+            ],
+            "description": "Optional scope filter; omit to list both."
+          }
+        }
+      }
+    },
+    {
+      "name": "memory_read",
+      "permission": "read-only",
+      "risk_level": "RiskLevel.LOW",
+      "description": "Read the full body of a saved memory by name. The MEMORY.md index in the prompt only shows descriptions; call this to see the actual content.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "user",
+              "workspace"
+            ],
+            "description": "Optional; searches workspace first, then user."
+          }
+        },
+        "required": [
+          "name"
+        ]
+      }
+    },
+    {
+      "name": "memory_delete",
+      "permission": "workspace-write",
+      "risk_level": "RiskLevel.MEDIUM",
+      "description": "Delete a memory by name when it has turned out to be wrong, outdated, or no longer relevant.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "user",
+              "workspace"
+            ]
+          }
+        },
+        "required": [
+          "name"
+        ]
+      }
+    },
+    {
+      "name": "memory_search",
+      "permission": "read-only",
+      "risk_level": "RiskLevel.LOW",
+      "description": "Full-text search across memory bodies for a keyword. Returns matching entries with name, description, scope.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    },
+    {
+      "name": "AskUserQuestion",
+      "permission": "read-only",
+      "risk_level": "RiskLevel.LOW",
+      "description": "Ask the user a question and wait for their answer. Use this only when the answer would change what you do next and you cannot determine it yourself from the workspace. Returns `cancelled: true` when there is no interactive terminal -- decide for yourself and state the assumption.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "question": {
+            "type": "string",
+            "description": "The question to put to the user."
+          },
+          "options": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Optional list of suggested answers, shown numbered."
+          }
+        },
+        "required": [
+          "question"
+        ]
+      }
+    }
+  ]
+}

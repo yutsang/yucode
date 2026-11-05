@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Windows is the target, not a port. A failure there is the interesting
+      # one, so don't let ubuntu cancel it.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      # --ignore-scripts is also set in .npmrc; repeated here so the command
+      # in CI is the command in docs/REWRITE_PLAN.md §3.6, verbatim.
+      - run: npm ci --ignore-scripts
+
+      - name: No native binaries
+        run: npm run check:binaries
+
+      - name: Registry signatures
+        run: npm audit signatures
+
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build
+
+      - name: The launcher reaches the build
+        shell: bash
+        run: |
+          node dist/cli/main.js version
+          test "$(node dist/cli/main.js version)" = "$(node -p "require('./package.json').version")"

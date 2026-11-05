@@ -1,0 +1,115 @@
+{
+  "source": "_legacy_python/coding_agent/config/config.yml",
+  "resolved_intelligence_tier": "strong",
+  "control_dict": {
+    "provider": {
+      "name": "workbench",
+      "type": "openai_compatible",
+      "base_url": "https://api.workbench.example.internal/genai/azure/openai",
+      "api_key": "",
+      "model": "gpt-5-5-2026-04-24-gs-sdc",
+      "chat_path": "/chat/completions",
+      "append_chat_path": true,
+      "api_version": "2024-12-01-preview",
+      "verify_tls": false,
+      "ca_bundle": "",
+      "stream": true,
+      "streaming_mode": "no_stream",
+      "temperature": 0.0,
+      "max_tokens": 0,
+      "request_timeout_seconds": 300,
+      "intelligence_tier": "auto",
+      "reasoning_effort": "medium",
+      "extra_headers": {
+        "Ocp-Apim-Subscription-Key": "",
+        "x-tenant-charge-code": "",
+        "x-tenant-region-override": "westeurope"
+      },
+      "extra_body": {},
+      "omit_params": [
+        "temperature"
+      ]
+    },
+    "runtime": {
+      "permission_mode": "workspace-write",
+      "max_iterations": 32,
+      "max_worker_steps": 20,
+      "max_coordinator_retries": 3,
+      "orchestration_mode": "auto",
+      "parallel_workers": false,
+      "max_tool_calls": 80,
+      "dedup_tool_threshold": 3,
+      "auto_save_session": true,
+      "auto_resume_latest": true,
+      "compact_preserve_recent": 4,
+      "compact_token_threshold": 10000,
+      "compact_strategy": "heuristic",
+      "error_strategy": "resilient",
+      "shell_timeout_seconds": 30,
+      "shell_env_filter_secrets": true,
+      "shell_env_exclude_patterns": [],
+      "shell_env_allowlist": [],
+      "include_git_context": true,
+      "config_dump_in_prompt": true,
+      "prune_tool_results": true,
+      "prune_keep_last_turns": 3,
+      "prune_soft_trim_threshold": 4000,
+      "prune_soft_trim_head": 1500,
+      "prune_soft_trim_tail": 1500,
+      "prune_hard_clear_turns": 10,
+      "auto_background_on_timeout": false,
+      "todo_nudge_enabled": true,
+      "todo_nudge_turns_since_write": 3,
+      "todo_nudge_min_gap_turns": 5,
+      "todo_gate_enabled": false,
+      "todo_gate_max_fires_per_prompt": 2,
+      "agents_md_discovery_enabled": true,
+      "skill_discovery_enabled": true
+    },
+    "tools": {
+      "allowed": [],
+      "disabled": [],
+      "extended_tools_enabled": false
+    },
+    "mcp": {
+      "servers": []
+    },
+    "vscode": {
+      "auto_start_backend": true,
+      "python_command": "",
+      "startup_timeout_seconds": 15
+    },
+    "hooks": {
+      "pre_tool_use": [],
+      "post_tool_use": [],
+      "post_tool_use_failure": [],
+      "pre_compact": [],
+      "post_compact": []
+    },
+    "plugins": {
+      "enabled_plugins": [],
+      "extra_dirs": []
+    },
+    "sandbox": {
+      "enabled": null,
+      "namespace_restrictions": null,
+      "network_isolation": null,
+      "filesystem_mode": "workspace-only",
+      "allowed_mounts": []
+    },
+    "permission_rules": {
+      "allow": [],
+      "deny": [],
+      "ask": []
+    },
+    "logging": {
+      "level": "INFO",
+      "format": "text",
+      "file": ""
+    },
+    "audit": {
+      "enabled": true
+    },
+    "instruction_files": []
+  }
+}

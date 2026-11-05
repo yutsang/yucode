@@ -1,0 +1,44 @@
+{
+  "name": "yucode",
+  "version": "1.0.0-alpha.0",
+  "private": true,
+  "type": "module",
+  "description": "A coding-agent harness for a locked-down corporate Windows box.",
+  "license": "SEE LICENSE IN LICENSE",
+  "engines": {
+    "node": ">=24"
+  },
+  "//": [
+    "No \"bin\": nothing is ever installed globally or linked on the target",
+    "machine. yucode.cmd is the only launcher, and it is plain text so that",
+    "nothing unsigned is generated at install time.",
+    "typescript is pinned below 7 deliberately: 7.x is the native compiler and",
+    "lists twenty platform packages in dependencies as well as",
+    "optionalDependencies, so omit=optional does not exclude them and",
+    "check-no-binaries fails on a plain install. See docs/REWRITE_PLAN.md \u00a70.0",
+    "correction 30."
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test \"tests/**/*.test.ts\"",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "check:binaries": "node scripts/check-no-binaries.mjs",
+    "check:goldens": "python3 tools/golden/check_all.py",
+    "pretest": "npm run check:binaries"
+  },
+  "overrides": {
+    "prebuild-install": "npm:nop@1.0.0",
+    "node-gyp-build": "npm:nop@1.0.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@types/node": "24.13.4",
+    "eslint": "10.10.0",
+    "prettier": "3.9.6",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.70.0"
+  }
+}

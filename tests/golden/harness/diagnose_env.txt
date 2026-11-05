@@ -1,0 +1,67 @@
+yucode environment diagnostic
+started: <captured 2026-09-12>
+
+========================================================================
+SECTION 1: ENVIRONMENT
+========================================================================
+[INFO] python: 3.10.14 at <HOME>/miniforge3/bin/python3
+[INFO] platform: macOS-26.6.2-arm64-arm-64bit
+[INFO] stdout_encoding_original: utf-8
+[INFO] locale_preferred_encoding: UTF-8
+[INFO] filesystem_encoding: utf-8
+[INFO] home: <HOME>
+[INFO] workspace: <HOME>/Desktop/Github/yucode
+[INFO] repo_root: <HOME>/Desktop/Github/yucode
+[INFO] git_commit: 40fb5d4
+[INFO] binary_git: /opt/homebrew/bin/git
+[INFO] binary_rg: NOT FOUND
+[INFO] binary_fc-match: /opt/homebrew/bin/fc-match
+[INFO] env_HTTP_PROXY: not set
+[INFO] env_HTTPS_PROXY: not set
+[INFO] env_NO_PROXY: not set
+[INFO] env_http_proxy: not set
+[INFO] env_https_proxy: not set
+[INFO] env_SSL_CERT_FILE: not set
+[INFO] env_REQUESTS_CA_BUNDLE: not set
+[INFO] env_YUCODE_API_KEY: not set
+[INFO] dep_prompt_toolkit: 3.0.42
+[INFO] dep_openpyxl: 3.1.2
+[INFO] dep_python-pptx: 1.0.2
+[INFO] dep_Pillow: 10.4.0
+[INFO] dep_pdfplumber: 0.11.9
+[INFO] dep_python-docx: 1.1.0
+
+========================================================================
+SECTION 2: FILESYSTEM & ENCODING
+========================================================================
+[PASS] home_state_dir_writable: <HOME>/Desktop/Github/yucode/.yucode
+[PASS] atomic_write_on_state_dir: write + replace-over-existing OK
+[PASS] session_save_load_roundtrip: CJK content survived save/load
+[PASS] console_cjk_output: original console encoding utf-8 handles CJK
+[SKIP] long_path_support: not Windows
+
+========================================================================
+SECTION 3: YUCODE FUNCTIONAL CHECKS
+========================================================================
+[PASS] config_load: provider=deepseek model=deepseek-chat permission=workspace-write verify_tls=True ca_bundle=not set api_key=set
+[PASS] git_context_resilience: git status OK in 0.0s (3 lines)
+[PASS] tls_context_build: system default verification
+[PASS] circuit_breaker_unit: opens after threshold, resets on success
+[PASS] pure_python_file_walk: list 143 files in 0.0s; grep 20 hits in 0.0s (20 found)
+[INFO] child_python_pipe_encoding: utf-8 (rc=0)
+[PASS] shell_tool_cjk_subprocess: spawned quoted-path subprocess via platform shell, CJK stdout intact
+[PASS] mcp_timeout_behavior: timed out cleanly in 3.0s
+[PASS] prompt_toolkit_windows_input: prompt_toolkit 3.0.42
+[INFO] paste_fix_manual_test: MANUAL: run the REPL, paste with Ctrl+V AND with right-click — a multi-line paste must arrive as ONE prompt (newlines inserted), not submit on the first line, and Ctrl+V must not be a no-op
+Warning: Input is not a terminal (fd=0).
+[SKIP] repl_ctrl_v_paste_binding: not Windows (binding present: False — expected False on POSIX)
+
+========================================================================
+SECTION 4: NETWORK (opt-in)
+========================================================================
+[SKIP] gateway_reachability: pass --network to probe (sends an unauthenticated POST to your gateway; use test_connection.py --azure for the full authenticated probe)
+
+========================================================================
+SUMMARY: 12 passed, 0 failed, 0 warnings, 3 skipped
+
+>>> Copy the FULL output above (from the first line) for analysis <<<
