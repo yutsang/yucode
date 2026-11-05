@@ -1,0 +1,43 @@
+# yucode provider config for the Workbench gateway (GPT-5.5 / GPT-5.4).
+#
+# Copy this file to:
+#   Windows:      %USERPROFILE%\.yucode\settings.yml
+#   Mac / Linux:  ~/.yucode/settings.yml
+#
+# Then fill in every value marked FILL-ME. Never commit this file with real
+# values — it is not tracked once filled in (keep it under your user home
+# directory, not inside a git-tracked project folder).
+#
+# Background / verified gateway facts / on-site checklist: see
+# WORKBENCH_PLAN.md at the repo root.
+
+provider:
+  name: workbench
+  type: openai_compatible
+  base_url: "https://api.workbench.example.internal/genai/azure/openai"
+  api_version: "2024-12-01-preview"   # builds .../deployments/{model}/chat/completions?api-version=...
+  model: "gpt-5-5-2026-04-24-gs-sdc"  # GPT-5.5. Alternate: gpt-5-4-2026-03-05-gs-sdc (GPT-5.4)
+  api_key: "FILL-ME"                  # subscription key; sent as the `api-key` header
+  verify_tls: false                   # corporate TLS interception — see ca_bundle for the safer option
+  # ca_bundle: "C:/certs/corp-ca.pem" # preferred over verify_tls: false — export the corporate root
+  #                                   # CA (certmgr.msc → Trusted Root → export as Base-64 .cer) and
+  #                                   # point here; TLS verification then works instead of being off.
+  streaming_mode: no_stream           # revisit after running the WI-4 streaming probe on-site
+  request_timeout_seconds: 300        # reasoning models routinely exceed the 90s default
+  omit_params:
+    - temperature                     # this model only allows temperature=1 (its default)
+  extra_headers:
+    Ocp-Apim-Subscription-Key: "FILL-ME"   # same value as api_key above
+    x-tenant-charge-code: "FILL-ME"          # e.g. "0000"
+    x-tenant-region-override: "westeurope"
+  extra_body:
+    reasoning_effort: "medium"        # "high" | "medium" | "low" — raise for harder tasks
+
+runtime:
+  orchestration_mode: auto           # multi-phase coordinator for complex/investigation prompts,
+                                      # single-agent otherwise. GPT-5.5 is strong-tier and doesn't
+                                      # need it as often, but validated multi-account work (e.g.
+                                      # the fdd-commentary skill) benefits from the work->validate
+                                      # retry loop -- worth the extra billable gateway calls.
+  max_coordinator_retries: 3          # validation-failure retry rounds; each one reruns the whole
+                                      # work phase, so keep this well below max_iterations

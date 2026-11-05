@@ -1,0 +1,784 @@
+"""Tool layer -- registry, specs, and built-in tool implementations."""
+
+from __future__ import annotations
+
+import json
+import logging
+import subprocess
+import sys
+import threading
+import time
+from collections.abc import Callable
+from contextlib import suppress
+from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import Path
+from typing import Any
+
+from ..config import AppConfig
+from ..plugins.mcp import McpManager
+from ..security.permissions import PermissionMode
+
+_log = logging.getLogger("yucode.tools")
+
+ToolHandler = Callable[[dict[str, Any]], str]
+
+
+@dataclass
+class BackgroundTask:
+    """A bash command running (or that ran) detached from the tool-call that started it.
+
+    Tracked so the runtime can poll for completion after each tool call and
+    surface a system-reminder (see runtime.py::_check_completed_background_tasks)
+    instead of the model having to guess when — or whether — to check back in."""
+    task_id: str
+    command: str
+    popen: subprocess.Popen
+    output_path: Path
+    started_at: float = field(default_factory=time.monotonic)
+    reported: bool = False
+
+
+@dataclass
+class SubagentTask:
+    """A subagent (spawned via the `agent` tool with run_in_background=true)
+    running detached from the tool-call that started it.
+
+    Mirrors BackgroundTask's role for bash commands (tracked so the runtime
+    can poll for completion after each tool call and surface a
+    system-reminder instead of the model blocking on it) but a subagent's
+    "output" is a full run_turn() result, not a stdout stream -- so it has
+    its own result_holder/error_holder instead of a Popen/output_path."""
+    task_id: str
+    prompt: str
+    thread: threading.Thread
+    result_holder: list[str] = field(default_factory=list)
+    error_holder: list[BaseException] = field(default_factory=list)
+    started_at: float = field(default_factory=time.monotonic)
+    reported: bool = False
+
+
+class RiskLevel(str, Enum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+
+@dataclass(frozen=True)
+class ToolSpec:
+    name: str
+    description: str
+    parameters: dict[str, Any]
+    permission: PermissionMode
+    risk_level: RiskLevel = RiskLevel.LOW
+
+
+@dataclass(frozen=True)
+class ToolDefinition:
+    spec: ToolSpec
+    handler: ToolHandler
+
+
+_TOOL_ALIASES: dict[str, str] = {
+    "read": "read_file",
+    "write": "write_file",
+    "edit": "edit_file",
+    "glob": "glob_search",
+    "grep": "grep_search",
+    "ls": "list_directory",
+}
+
+_STUB_PARAMS: dict[str, Any] = {"type": "object", "properties": {}}
+
+
+def _stub_handler(name: str) -> ToolHandler:
+    def handler(args: dict[str, Any]) -> str:
+        return json.dumps({"status": "pending", "tool": name, "message": f"Tool `{name}` acknowledged"})
+    return handler
+
+
+def _make_stub_tool(name: str, description: str, permission: PermissionMode, risk: RiskLevel = RiskLevel.MEDIUM) -> ToolDefinition:
+    return ToolDefinition(
+        spec=ToolSpec(name=name, description=description, parameters=_STUB_PARAMS, permission=permission, risk_level=risk),
+        handler=_stub_handler(name),
+    )
+
+
+def _registry_handler(
+    action: Callable[[dict[str, Any]], Any],
+    *,
+    catch: tuple[type[Exception], ...] = (KeyError,),
+) -> ToolHandler:
+    """Create a tool handler that calls *action*, serialises the result, and
+    catches expected exceptions as ``{"error": ...}`` responses."""
+    def handler(args: dict[str, Any]) -> str:
+        try:
+            result = action(args)
+            if result is None:
+                return json.dumps({"error": "Not found"})
+            if isinstance(result, str):
+                return result
+            if isinstance(result, list):
+                return json.dumps([r.to_dict() if hasattr(r, "to_dict") else r for r in result], indent=2)
+            if isinstance(result, dict):
+                return json.dumps(result, indent=2)
+            return json.dumps(result.to_dict(), indent=2)
+        except catch as exc:
+            return json.dumps({"error": str(exc)})
+    return handler
+
+
+def _run_task_create(args: dict[str, Any]) -> str:
+    from ..core.task_registry import global_task_registry
+    return json.dumps(global_task_registry().create(str(args.get("prompt", "")), str(args.get("description", ""))).to_dict(), indent=2)
+
+
+def _run_task_packet(args: dict[str, Any]) -> str:
+    from ..core.task_registry import global_task_registry
+    try:
+        task = global_task_registry().create_from_packet(args)
+        return json.dumps(task.to_dict(), indent=2)
+    except ValueError as exc:
+        return json.dumps({"error": str(exc)})
+
+
+def _run_task_get(args: dict[str, Any]) -> str:
+    from ..core.task_registry import global_task_registry
+    task = global_task_registry().get(str(args.get("task_id", "")))
+    if task is None:
+        return json.dumps({"error": "Task not found"})
+    return json.dumps(task.to_dict(), indent=2)
+
+
+def _run_task_list(args: dict[str, Any]) -> str:
+    from ..core.task_registry import TaskStatus, global_task_registry
+    status_str = args.get("status")
+    status_filter = TaskStatus(status_str) if status_str and status_str in TaskStatus.__members__.values() else None
+    tasks = global_task_registry().list(status_filter)
+    return json.dumps([t.to_dict() for t in tasks], indent=2)
+
+
+def _make_task_handler(method_name: str) -> ToolHandler:
+    """Create a handler that calls ``global_task_registry().<method_name>(task_id, ...)``."""
+    def handler(args: dict[str, Any]) -> str:
+        from ..core.task_registry import global_task_registry
+        try:
+            method = getattr(global_task_registry(), method_name)
+            if method_name == "update":
+                result = method(str(args.get("task_id", "")), str(args.get("message", "")))
+            elif method_name == "output":
+                output = method(str(args.get("task_id", "")))
+                return json.dumps({"task_id": args.get("task_id"), "output": output})
+            else:
+                result = method(str(args.get("task_id", "")))
+            return json.dumps(result.to_dict(), indent=2)
+        except (KeyError, ValueError) as exc:
+            return json.dumps({"error": str(exc)})
+    return handler
+
+_run_task_stop = _make_task_handler("stop")
+_run_task_update = _make_task_handler("update")
+_run_task_output = _make_task_handler("output")
+
+
+def _make_worker_handler(method_name: str, extra_args: list[str] | None = None) -> ToolHandler:
+    """Create a handler that calls ``global_worker_registry().<method_name>(worker_id, ...)``."""
+    def handler(args: dict[str, Any]) -> str:
+        from ..core.worker_registry import global_worker_registry
+        try:
+            method = getattr(global_worker_registry(), method_name)
+            call_args: list[Any] = [str(args.get("worker_id", ""))]
+            for key in (extra_args or []):
+                call_args.append(args.get(key))
+            result = method(*call_args)
+            if hasattr(result, "to_dict"):
+                return json.dumps(result.to_dict(), indent=2)
+            return json.dumps(result, indent=2)
+        except (KeyError, ValueError) as exc:
+            return json.dumps({"error": str(exc)})
+    return handler
+
+_run_worker_observe = _make_worker_handler("observe", ["screen_text"])
+_run_worker_resolve_trust = _make_worker_handler("resolve_trust")
+_run_worker_send_prompt = _make_worker_handler("send_prompt", ["prompt"])
+_run_worker_restart = _make_worker_handler("restart")
+_run_worker_terminate = _make_worker_handler("terminate")
+
+
+def _run_worker_create(args: dict[str, Any]) -> str:
+    from ..core.worker_registry import global_worker_registry
+    worker = global_worker_registry().create(
+        cwd=str(args.get("cwd", ".")),
+        trusted_roots=args.get("trusted_roots"),
+        auto_recover_prompt_misdelivery=bool(args.get("auto_recover", False)),
+    )
+    return json.dumps(worker.to_dict(), indent=2)
+
+
+def _run_worker_get(args: dict[str, Any]) -> str:
+    from ..core.worker_registry import global_worker_registry
+    worker = global_worker_registry().get(str(args.get("worker_id", "")))
+    if worker is None:
+        return json.dumps({"error": "Worker not found"})
+    return json.dumps(worker.to_dict(), indent=2)
+
+
+def _run_worker_await_ready(args: dict[str, Any]) -> str:
+    from ..core.worker_registry import global_worker_registry
+    try:
+        snap = global_worker_registry().await_ready(str(args.get("worker_id", "")))
+        return json.dumps({"worker_id": snap.worker_id, "status": snap.status.value, "ready": snap.ready, "blocked": snap.blocked, "replay_prompt_ready": snap.replay_prompt_ready, "last_error": snap.last_error})
+    except KeyError as exc:
+        return json.dumps({"error": str(exc)})
+
+
+def _run_team_create(args: dict[str, Any]) -> str:
+    from ..core.task_registry import global_task_registry
+    from ..core.team_cron_registry import global_team_registry
+    task_ids = args.get("task_ids", [])
+    team = global_team_registry().create(str(args.get("name", "")), task_ids)
+    task_reg = global_task_registry()
+    for tid in task_ids:
+        with suppress(KeyError):
+            task_reg.assign_team(tid, team.team_id)
+    return json.dumps(team.to_dict(), indent=2)
+
+
+def _run_team_delete(args: dict[str, Any]) -> str:
+    from ..core.team_cron_registry import global_team_registry
+    try:
+        return json.dumps(global_team_registry().delete(str(args.get("team_id", ""))).to_dict(), indent=2)
+    except KeyError as exc:
+        return json.dumps({"error": str(exc)})
+
+
+def _run_cron_create(args: dict[str, Any]) -> str:
+    from ..core.team_cron_registry import global_cron_registry
+    return json.dumps(global_cron_registry().create(str(args.get("schedule", "")), str(args.get("prompt", "")), str(args.get("description", ""))).to_dict(), indent=2)
+
+
+def _run_cron_delete(args: dict[str, Any]) -> str:
+    from ..core.team_cron_registry import global_cron_registry
+    try:
+        return json.dumps(global_cron_registry().delete(str(args.get("cron_id", ""))).to_dict(), indent=2)
+    except KeyError as exc:
+        return json.dumps({"error": str(exc)})
+
+
+def _run_cron_list(args: dict[str, Any]) -> str:
+    from ..core.team_cron_registry import global_cron_registry
+    return json.dumps([e.to_dict() for e in global_cron_registry().list(enabled_only=bool(args.get("enabled_only", False)))], indent=2)
+
+
+_ASK_USER_TIMEOUT_SECONDS = 1800  # 30 minutes
+
+
+def _stdin_is_interactive() -> bool:
+    """Whether there is a human at a terminal who could answer a prompt."""
+    stream = sys.stdin
+    try:
+        return stream is not None and stream.isatty()
+    except (AttributeError, ValueError):  # detached or closed stdin
+        return False
+
+
+def _run_ask_user(args: dict[str, Any]) -> str:
+    question = str(args.get("question", args.get("text", "")))
+    options = args.get("options", [])
+    if not question:
+        return json.dumps({"error": "No question provided"})
+    # Without a TTY nobody can answer, so the bounded wait below would just
+    # burn its full timeout (30 minutes) before returning the same "no
+    # answer" -- which stalls every headless/CI/subagent run. Fail fast and
+    # tell the model to decide for itself instead.
+    if not _stdin_is_interactive():
+        return json.dumps({
+            "error": "No interactive terminal (stdin is not a TTY): the user cannot be asked. "
+                     "Pick the most reasonable option yourself and state the assumption.",
+            "question": question,
+            "cancelled": True,
+            "reason": "non_interactive",
+        })
+    print(f"\n  Agent question: {question}")
+    if options:
+        for i, opt in enumerate(options):
+            label = opt if isinstance(opt, str) else opt.get("label", str(opt))
+            print(f"    {i + 1}. {label}")
+
+    # A bare input() blocks forever if stdin is never answered (piped/non-TTY,
+    # headless run, or the user just walks away) — a real hang risk for
+    # scripted/CI use. Read it on a daemon thread and bound the wait; on
+    # timeout the thread is abandoned (matches agent_tool.py's subagent
+    # timeout pattern — there's no way to force-interrupt a blocking input()).
+    import threading
+    result: list[str] = []
+    cancelled: list[bool] = []
+
+    def _read_answer() -> None:
+        try:
+            result.append(input("  Your answer: ").strip())
+        except (EOFError, KeyboardInterrupt):
+            cancelled.append(True)
+
+    thread = threading.Thread(target=_read_answer, daemon=True)
+    thread.start()
+    thread.join(timeout=_ASK_USER_TIMEOUT_SECONDS)
+
+    if thread.is_alive():
+        return json.dumps({
+            "answer": "", "question": question,
+            "cancelled": True, "reason": "timeout",
+        })
+    if cancelled:
+        return json.dumps({
+            "answer": "", "question": question,
+            "cancelled": True, "reason": "interrupted",
+        })
+    return json.dumps({"answer": result[0], "question": question})
+
+
+def _run_remote_trigger(args: dict[str, Any]) -> str:
+    import urllib.error
+    import urllib.request
+    url = str(args.get("url", ""))
+    method = str(args.get("method", "POST")).upper()
+    body = args.get("body")
+    headers = args.get("headers", {})
+    if not url:
+        return json.dumps({"error": "No URL provided"})
+    try:
+        data = json.dumps(body).encode("utf-8") if body else None
+        req = urllib.request.Request(url, data=data, method=method)
+        req.add_header("Content-Type", "application/json")
+        for k, v in headers.items():
+            req.add_header(str(k), str(v))
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            resp_body = resp.read().decode("utf-8", errors="replace")
+            return json.dumps({"status": resp.status, "body": resp_body[:10000]})
+    except Exception as exc:
+        return json.dumps({"error": str(exc)})
+
+
+def _make_registry_tool(name: str, description: str, permission: PermissionMode, handler: ToolHandler, risk: RiskLevel = RiskLevel.MEDIUM) -> ToolDefinition:
+    return ToolDefinition(
+        spec=ToolSpec(name=name, description=description, parameters=_STUB_PARAMS, permission=permission, risk_level=risk),
+        handler=handler,
+    )
+
+
+def _extended_tool_specs() -> list[ToolDefinition]:
+    """Tool specs ported from claw-code-main with real registry-backed handlers.
+
+    Opt-in via `tools.extended_tools_enabled` (default off) because none of
+    them can currently finish a job: the `_make_stub_tool` entries are pure
+    no-ops that answer "acknowledged" without doing anything (PowerShell being
+    the dangerous one -- on Windows it is exactly the name a model reaches
+    for), and the registry-backed ones write to task/worker/cron registries
+    that have no execution backend wired up yet. Kept registered-but-disabled
+    rather than deleted so they can be switched back on as the backends land.
+    """
+    return [
+        _make_stub_tool("SendUserMessage", "Send a message to the user", "read-only", RiskLevel.LOW),
+        _make_stub_tool("Config", "Read or update agent configuration", "workspace-write"),
+        _make_stub_tool("EnterPlanMode", "Switch to planning mode", "workspace-write"),
+        _make_stub_tool("ExitPlanMode", "Exit planning mode", "workspace-write"),
+        _make_stub_tool("StructuredOutput", "Return a structured JSON result", "read-only", RiskLevel.LOW),
+        _make_stub_tool("REPL", "Start an interactive REPL session", "danger-full-access", RiskLevel.HIGH),
+        _make_stub_tool("PowerShell", "Execute a PowerShell command", "danger-full-access", RiskLevel.HIGH),
+        _make_registry_tool("TaskCreate", "Create a new background task", "danger-full-access", _run_task_create),
+        _make_registry_tool("RunTaskPacket", "Run a structured task packet", "danger-full-access", _run_task_packet),
+        _make_registry_tool("TaskGet", "Get task status", "read-only", _run_task_get, RiskLevel.LOW),
+        _make_registry_tool("TaskList", "List all tasks", "read-only", _run_task_list, RiskLevel.LOW),
+        _make_registry_tool("TaskStop", "Stop a running task", "danger-full-access", _run_task_stop),
+        _make_registry_tool("TaskUpdate", "Update a task", "danger-full-access", _run_task_update),
+        _make_registry_tool("TaskOutput", "Get task output", "read-only", _run_task_output, RiskLevel.LOW),
+        _make_registry_tool("WorkerCreate", "Create a worker", "danger-full-access", _run_worker_create),
+        _make_registry_tool("WorkerGet", "Get worker status", "read-only", _run_worker_get, RiskLevel.LOW),
+        _make_registry_tool("WorkerObserve", "Observe worker activity", "read-only", _run_worker_observe, RiskLevel.LOW),
+        _make_registry_tool("WorkerResolveTrust", "Resolve worker trust prompt", "danger-full-access", _run_worker_resolve_trust),
+        _make_registry_tool("WorkerAwaitReady", "Wait for worker to be ready", "read-only", _run_worker_await_ready, RiskLevel.LOW),
+        _make_registry_tool("WorkerSendPrompt", "Send a prompt to a worker", "danger-full-access", _run_worker_send_prompt),
+        _make_registry_tool("WorkerRestart", "Restart a worker", "danger-full-access", _run_worker_restart),
+        _make_registry_tool("WorkerTerminate", "Terminate a worker", "danger-full-access", _run_worker_terminate),
+        _make_registry_tool("TeamCreate", "Create a team of workers", "danger-full-access", _run_team_create),
+        _make_registry_tool("TeamDelete", "Delete a team", "danger-full-access", _run_team_delete),
+        _make_registry_tool("CronCreate", "Create a cron job", "danger-full-access", _run_cron_create),
+        _make_registry_tool("CronDelete", "Delete a cron job", "danger-full-access", _run_cron_delete),
+        _make_registry_tool("CronList", "List cron jobs", "read-only", _run_cron_list, RiskLevel.LOW),
+        _make_stub_tool("ListMcpResources", "List resources from an MCP server", "read-only", RiskLevel.LOW),
+        _make_stub_tool("ReadMcpResource", "Read a resource from an MCP server", "read-only", RiskLevel.LOW),
+        _make_stub_tool("McpAuth", "Authenticate with an MCP server", "danger-full-access"),
+        _make_registry_tool("RemoteTrigger", "Trigger a remote action", "danger-full-access", _run_remote_trigger),
+        _make_stub_tool("MCP", "Call an MCP tool", "danger-full-access"),
+    ]
+
+
+class ToolRegistry:
+    def __init__(
+        self,
+        workspace_root: Path,
+        config: AppConfig,
+        mcp_manager: McpManager | None = None,
+        plugin_tools: list[Any] | None = None,
+    ) -> None:
+        self.workspace_root = workspace_root.resolve()
+        self.config = config
+        self.mcp_manager = mcp_manager
+        self._builtin_names: set[str] = set()
+        self._tools: dict[str, ToolDefinition] = {}
+        self.background_tasks: dict[str, BackgroundTask] = {}
+        self.subagent_tasks: dict[str, SubagentTask] = {}
+
+        for tool in self._builtin_tools():
+            self._tools[tool.spec.name] = tool
+            self._builtin_names.add(tool.spec.name)
+
+        if config.tools.extended_tools_enabled:
+            for tool in _extended_tool_specs():
+                if tool.spec.name not in self._tools:
+                    self._tools[tool.spec.name] = tool
+                    self._builtin_names.add(tool.spec.name)
+
+        if self.mcp_manager:
+            self._wire_mcp_lifecycle_tools()
+        if self.mcp_manager:
+            for spec in self.mcp_manager.tool_specs():
+                function = spec["function"]
+                name = function["name"]
+                if name in self._builtin_names:
+                    _log.warning("MCP tool `%s` collides with built-in; skipping", name)
+                    continue
+                self._tools[name] = ToolDefinition(
+                    spec=ToolSpec(
+                        name=name,
+                        description=function["description"],
+                        parameters=function["parameters"],
+                        permission="workspace-write",
+                        risk_level=RiskLevel.MEDIUM,
+                    ),
+                    handler=lambda args, tool_name=name: self._run_mcp_tool(tool_name, args),
+                )
+
+        plugin_names: set[str] = set()
+        if plugin_tools:
+            for pt in plugin_tools:
+                if pt.name in self._builtin_names:
+                    _log.warning("Plugin tool `%s` collides with built-in; skipping", pt.name)
+                    continue
+                if pt.name in plugin_names:
+                    _log.warning("Duplicate plugin tool `%s`; skipping", pt.name)
+                    continue
+                plugin_names.add(pt.name)
+                self._tools[pt.name] = ToolDefinition(
+                    spec=ToolSpec(
+                        name=pt.name,
+                        description=pt.description,
+                        parameters=pt.input_schema,
+                        permission=pt.permission,
+                        risk_level=RiskLevel.MEDIUM,
+                    ),
+                    handler=lambda args, tool=pt: tool.execute(args),
+                )
+        self._apply_filters()
+
+    def definitions_for_provider(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": tool.spec.name,
+                    "description": tool.spec.description,
+                    "parameters": tool.spec.parameters,
+                },
+            }
+            for tool in self._tools.values()
+        ]
+
+    def _build_name_index(self) -> None:
+        """Map stripped-lowercase name → canonical for camelCase/snake_case resolution.
+
+        e.g. "WebSearch" and "web_search" both normalize to "websearch" → "web_search".
+
+        Two registered names can normalize to the same key ("structured_output"
+        vs the ported "StructuredOutput"). First registration wins -- built-ins
+        are inserted before extended/MCP/plugin tools -- so a later tool cannot
+        silently hijack a built-in's calls, matching the "built-in wins, warn"
+        policy the MCP/plugin loops already use for exact-name collisions.
+        """
+        self._name_index: dict[str, str] = {}
+        for name in self._tools:
+            key = name.lower().replace("_", "")
+            winner = self._name_index.setdefault(key, name)
+            if winner != name:
+                _log.warning(
+                    "Tool `%s` normalizes to the same name as `%s`; `%s` keeps the alias",
+                    name, winner, winner,
+                )
+
+    def _resolve_name(self, tool_name: str) -> str:
+        """Return the canonical registered name, handling camelCase/snake_case variants."""
+        if tool_name in self._tools:
+            return tool_name
+        return self._name_index.get(tool_name.lower().replace("_", ""), tool_name)
+
+    def permission_for(self, tool_name: str) -> PermissionMode:
+        return self._tools[self._resolve_name(tool_name)].spec.permission
+
+    def risk_level_for(self, tool_name: str) -> RiskLevel:
+        return self._tools[self._resolve_name(tool_name)].spec.risk_level
+
+    def has_tool(self, tool_name: str) -> bool:
+        return self._resolve_name(tool_name) in self._tools
+
+    def execute(self, tool_name: str, arguments: dict[str, Any]) -> str:
+        name = self._resolve_name(tool_name)
+        if name not in self._tools:
+            raise KeyError(f"Unknown tool: {tool_name}")
+        return self._tools[name].handler(arguments)
+
+    def list_names(self) -> list[str]:
+        return sorted(self._tools)
+
+    def all_tool_names(self) -> set[str]:
+        """All registered tool names including MCP and plugins."""
+        return set(self._tools.keys())
+
+    def permission_specs(self) -> list[tuple[str, PermissionMode]]:
+        """Return (name, permission) pairs for all tools."""
+        return [(name, tool.spec.permission) for name, tool in self._tools.items()]
+
+    def _apply_filters(self) -> None:
+        if self.config.tools.allowed:
+            allowed = normalize_allowed_tools(
+                self.config.tools.allowed,
+                set(self._tools.keys()),
+            )
+            if allowed is not None:
+                self._tools = {name: tool for name, tool in self._tools.items() if name in allowed}
+        if self.config.tools.disabled:
+            for name in self.config.tools.disabled:
+                self._tools.pop(name, None)
+        self._build_name_index()
+
+    def _builtin_tools(self) -> list[ToolDefinition]:
+        from .agent_tool import agent_tools
+        from .filesystem import filesystem_tools
+        from .memory_tools import memory_tools
+        from .misc import misc_tools
+        from .notebook import notebook_tools
+        from .office import office_tools
+        from .patch import patch_tools
+        from .shell import shell_tools
+        from .web import web_tools
+
+        tools: list[ToolDefinition] = []
+        tools.extend(filesystem_tools(self))
+        tools.extend(patch_tools(self))
+        tools.extend(shell_tools(self))
+        tools.extend(web_tools(self))
+        tools.extend(notebook_tools(self))
+        tools.extend(agent_tools(self))
+        tools.extend(misc_tools(self))
+        tools.extend(office_tools(self))
+        tools.extend(memory_tools(self))
+        # Registered here rather than in _extended_tool_specs() -- it is the
+        # only channel the agent has for asking the user something, and unlike
+        # the rest of that list it has a real handler. Gating it behind
+        # `tools.extended_tools_enabled` would leave the agent mute by default.
+        # Spelled out rather than built with _make_registry_tool() because that
+        # helper hardcodes _STUB_PARAMS, and a real tool needs a real schema --
+        # with empty `properties` the model cannot pass the question at all.
+        tools.append(ToolDefinition(
+            spec=ToolSpec(
+                name="AskUserQuestion",
+                description=(
+                    "Ask the user a question and wait for their answer. Use this only when "
+                    "the answer would change what you do next and you cannot determine it "
+                    "yourself from the workspace. Returns `cancelled: true` when there is no "
+                    "interactive terminal -- decide for yourself and state the assumption."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "question": {
+                            "type": "string",
+                            "description": "The question to put to the user.",
+                        },
+                        "options": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Optional list of suggested answers, shown numbered.",
+                        },
+                    },
+                    "required": ["question"],
+                },
+                permission="read-only",
+                risk_level=RiskLevel.LOW,
+            ),
+            handler=_run_ask_user,
+        ))
+        return tools
+
+    def _wire_mcp_lifecycle_tools(self) -> None:
+        """Replace MCP lifecycle stubs with handlers that delegate to McpManager."""
+        mgr = self.mcp_manager
+        assert mgr is not None
+
+        def list_resources(args: dict[str, Any]) -> str:
+            server_name = str(args.get("server_name", args.get("server", "")))
+            if not server_name:
+                report = mgr.discovery_report()
+                return json.dumps({"servers": [s.name for s in report.tools[:20]]})
+            try:
+                resources = mgr.list_resources(server_name)
+                return json.dumps(resources, indent=2)
+            except Exception as exc:
+                return json.dumps({"error": str(exc)})
+
+        def read_resource(args: dict[str, Any]) -> str:
+            server_name = str(args.get("server_name", args.get("server", "")))
+            uri = str(args.get("uri", ""))
+            if not server_name or not uri:
+                return json.dumps({"error": "server_name and uri are required"})
+            try:
+                result = mgr.read_resource(server_name, uri)
+                return json.dumps(result, indent=2) if not isinstance(result, str) else result
+            except Exception as exc:
+                return json.dumps({"error": str(exc)})
+
+        def mcp_call(args: dict[str, Any]) -> str:
+            server = str(args.get("server_name", args.get("server", "")))
+            tool = str(args.get("tool_name", args.get("tool", "")))
+            tool_args = args.get("arguments", {})
+            if not server or not tool:
+                return json.dumps({"error": "server_name and tool_name are required"})
+            prefixed = f"mcp__{server}__{tool}".replace("-", "_")
+            try:
+                result = mgr.execute_prefixed_tool(prefixed, tool_args)
+                return json.dumps(result, indent=2) if not isinstance(result, str) else result
+            except Exception as exc:
+                return json.dumps({"error": str(exc)})
+
+        for name, handler in [("ListMcpResources", list_resources), ("ReadMcpResource", read_resource), ("MCP", mcp_call)]:
+            if name in self._tools:
+                old_spec = self._tools[name].spec
+                self._tools[name] = ToolDefinition(spec=old_spec, handler=handler)
+
+    def _run_mcp_tool(self, tool_name: str, arguments: dict[str, Any]) -> str:
+        if not self.mcp_manager:
+            raise RuntimeError("No MCP manager configured")
+        return json.dumps(self.mcp_manager.execute_prefixed_tool(tool_name, arguments), indent=2)
+
+    def _resolve_path(
+        self,
+        raw_path: str,
+        allow_outside_workspace: bool = False,
+        *,
+        allow_spill_read: bool = False,
+    ) -> Path:
+        # Normalize backslashes so Windows-style and POSIX-style paths resolve
+        # identically. Weak models on Windows often mix the two when retrying
+        # a path; without this they trigger separate dedup keys and loop.
+        path = Path(raw_path.replace("\\", "/"))
+        resolved = (path if path.is_absolute() else self.workspace_root / path).resolve()
+        if not allow_outside_workspace:
+            # Canonical path comparison prevents symlink escapes (parity with Rust)
+            try:
+                canonical = resolved.resolve(strict=False)
+            except (OSError, ValueError):
+                canonical = resolved
+            ws_canonical = self.workspace_root.resolve(strict=False)
+            outside = ws_canonical not in (canonical, *canonical.parents)
+            # `allow_spill_read` is opt-in per call, and only the read tools
+            # pass it. An earlier version exempted the whole state directory
+            # here unconditionally, which -- because every write tool resolves
+            # through this same method -- also handed the model write access to
+            # its own audit log: `write_file` could overwrite
+            # `<state>/audit/<date>.jsonl` and erase or forge the trail. The
+            # exemption exists to let the model read spilled output, so it is
+            # scoped to reads and to the two spill directories.
+            if outside and not (allow_spill_read and self._is_spill_path(canonical)):
+                raise ValueError(
+                    f"Path `{resolved}` escapes the workspace (canonical: {canonical})"
+                )
+        return resolved
+
+    def _is_spill_path(self, canonical: Path) -> bool:
+        """True for the two directories the agent spills oversized output to.
+
+        Spilled tool output and full bash logs are written under
+        `state_dir(workspace_root)` and their paths are handed back to the model
+        with an instruction to read them. That instruction was impossible to
+        follow: the directory is outside the workspace, so this check rejected
+        it, and the fallback of suggesting `bash` fails too because bash needs
+        `danger-full-access` while the shipped default is `workspace-write`.
+        The spill was therefore unreachable by any means.
+
+        Narrow on purpose: only the two spill directories, never the rest of
+        the state tree. `audit/`, `sessions/`, `archives/`, `checkpoints/` and
+        `metrics/` stay unreachable, so the record of what the agent did cannot
+        be edited by the agent.
+        """
+        try:
+            from ..config.settings import state_dir
+            root = state_dir(self.workspace_root).resolve(strict=False)
+        except (OSError, ValueError):
+            return False
+        return any(
+            (root / name) in (canonical, *canonical.parents)
+            for name in ("tool_output", "bash_output")
+        )
+
+    def register_background_task(
+        self, task_id: str, command: str, popen: subprocess.Popen, output_path: Path,
+    ) -> None:
+        """Track a detached bash process so the runtime can poll it for
+        completion after each tool call (see tools/shell.py)."""
+        self.background_tasks[task_id] = BackgroundTask(
+            task_id=task_id, command=command, popen=popen, output_path=output_path,
+        )
+
+    def register_subagent_task(
+        self, task_id: str, prompt: str, thread: threading.Thread,
+        result_holder: list[str], error_holder: list[BaseException],
+    ) -> None:
+        """Track a detached subagent so the runtime can poll it for
+        completion after each tool call (see tools/agent_tool.py)."""
+        self.subagent_tasks[task_id] = SubagentTask(
+            task_id=task_id, prompt=prompt, thread=thread,
+            result_holder=result_holder, error_holder=error_holder,
+        )
+
+
+def _normalize_tool_name(name: str) -> str:
+    return name.strip().replace("-", "_").lower()
+
+
+def normalize_allowed_tools(
+    names: list[str],
+    known_tools: set[str] | None = None,
+) -> set[str] | None:
+    """Normalize a list of tool names into canonical form.
+
+    Returns None if the input is empty (meaning no restriction).
+    Resolves aliases (read -> read_file, etc.) and splits comma/whitespace tokens.
+    """
+    if not names:
+        return None
+
+    canonical_by_normalized: dict[str, str] = {}
+    if known_tools:
+        for name in known_tools:
+            canonical_by_normalized[_normalize_tool_name(name)] = name
+
+    result: set[str] = set()
+    for entry in names:
+        for token in entry.replace(",", " ").split():
+            normalized = _normalize_tool_name(token)
+            if normalized in _TOOL_ALIASES:
+                normalized = _normalize_tool_name(_TOOL_ALIASES[normalized])
+            if canonical_by_normalized and normalized in canonical_by_normalized:
+                result.add(canonical_by_normalized[normalized])
+            else:
+                result.add(token.strip())
+    return result if result else None

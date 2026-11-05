@@ -1,0 +1,623 @@
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+
+import pytest
+
+from coding_agent import __version__
+from coding_agent.config.settings import _resolve_api_key, is_dangerous_mode
+from coding_agent.core.errors import AgentError, tool_error_response
+from coding_agent.core.providers import _extract_usage
+from coding_agent.core.runtime import _MAX_CONSECUTIVE_READONLY, _MAX_STUCK_DEDUP_BLOCKS
+from coding_agent.core.session import Message, Session, ToolCall, Usage
+from coding_agent.core.summary_compression import SummaryCompressionBudget, compress_summary
+from coding_agent.memory.compact import CompactionConfig, compact_session, should_compact
+from coding_agent.security.permissions import PermissionPolicy
+
+
+def test_version_matches_repo() -> None:
+    assert __version__ == "0.6.0"
+
+
+def test_pyproject_declares_tomli_for_python_310() -> None:
+    """coding_agent/__init__.py does `import tomli as tomllib` when the
+    stdlib tomllib (3.11+) isn't available. Without a declared dependency,
+    a genuinely clean `pip install` on Python 3.10 (e.g. a fresh company-PC
+    venv) crashes on the first `import coding_agent` — this only stays
+    invisible in dev environments where some *other* tool (black/pytest/
+    mypy/build) happens to pull tomli in transitively. Regression test for
+    that exact bug (found via WI-6's offline-install verification)."""
+    try:
+        import tomllib as _toml
+    except ModuleNotFoundError:
+        import tomli as _toml  # type: ignore[no-redef]
+
+    pyproject_path = Path(__file__).resolve().parent.parent / "pyproject.toml"
+    data = _toml.loads(pyproject_path.read_text(encoding="utf-8"))
+    deps = data["project"]["dependencies"]
+    tomli_deps = [d for d in deps if d.strip().lower().startswith("tomli")]
+    assert tomli_deps, "pyproject.toml must declare a tomli dependency for Python <3.11"
+    assert "python_version" in tomli_deps[0] and "3.11" in tomli_deps[0], (
+        f"tomli dependency should be conditioned on python_version < '3.11', got: {tomli_deps[0]!r}"
+    )
+
+
+def test_env_api_key_takes_priority() -> None:
+    previous = os.environ.get("YUCODE_API_KEY")
+    os.environ["YUCODE_API_KEY"] = "env-secret"
+    try:
+        assert _resolve_api_key("config-secret") == "env-secret"
+    finally:
+        if previous is None:
+            os.environ.pop("YUCODE_API_KEY", None)
+        else:
+            os.environ["YUCODE_API_KEY"] = previous
+
+
+def test_dangerous_mode_defaults_false() -> None:
+    previous = os.environ.get("YUCODE_DANGEROUS_MODE")
+    os.environ.pop("YUCODE_DANGEROUS_MODE", None)
+    try:
+        assert is_dangerous_mode() is False
+    finally:
+        if previous is not None:
+            os.environ["YUCODE_DANGEROUS_MODE"] = previous
+
+
+def test_tool_error_response_is_structured() -> None:
+    payload = json.loads(
+        tool_error_response(
+            "failed",
+            error_code="provider_error",
+            recoverable=False,
+            suggestion="retry later",
+        )
+    )
+    assert payload == {
+        "error": "failed",
+        "error_code": "provider_error",
+        "recoverable": False,
+        "suggestion": "retry later",
+    }
+
+
+def test_agent_error_to_dict() -> None:
+    err = AgentError("boom", recoverable=True, category="demo")
+    assert err.to_dict()["error_code"] == "demo"
+
+
+def test_permission_policy_denies_write_in_read_only() -> None:
+    decision = PermissionPolicy("read-only").authorize("workspace-write", "write_file")
+    assert decision.allowed is False
+
+
+def test_compaction_preserves_recent_messages() -> None:
+    messages = [Message(role="user", content="x" * 3000) for _ in range(8)]
+    config = CompactionConfig(preserve_recent_messages=2, max_estimated_tokens=100)
+    assert should_compact(messages, config) is True
+    result = compact_session(messages, config)
+    assert result.removed_message_count > 0
+    assert result.compacted_messages[0].role == "system"
+    assert len(result.compacted_messages) == 3
+
+
+def test_compaction_never_splits_tool_use_result_pair() -> None:
+    """The compaction boundary must not leave a tool-result orphaned at preserved[0]."""
+    tc = ToolCall(id="c1", name="read_file", arguments='{"path": "foo.py"}')
+    messages = [
+        Message(role="user", content="x" * 400),
+        Message(role="assistant", content="", tool_calls=[tc]),  # tool-use
+        Message(role="tool", content="file contents", tool_call_id="c1"),  # tool-result
+        Message(role="user", content="x" * 400),
+        Message(role="assistant", content="done"),
+    ]
+    # With preserve_recent=2, naive keep_from=3 would put the tool-result at preserved[0]
+    config = CompactionConfig(preserve_recent_messages=2, max_estimated_tokens=50)
+    result = compact_session(messages, config)
+    # The first preserved message must never be a tool-result
+    first_preserved = result.compacted_messages[1]  # [0] is the system summary
+    assert first_preserved.role != "tool", (
+        f"First preserved message must not be a tool-result, got role={first_preserved.role!r}"
+    )
+
+
+# --- summary compression priority scoring ---
+
+
+def test_compress_summary_headers_survive_prose() -> None:
+    """When budget is tight, headers and bullets outlast plain prose."""
+    lines = [
+        "# Main heading",          # score 4
+        "Some prose sentence.",     # score 1
+        "More prose here.",         # score 1
+        "- bullet point A",         # score 2
+    ]
+    summary = "\n".join(lines)
+    # Budget allows only 2 lines
+    budget = SummaryCompressionBudget(max_chars=50, max_lines=2)
+    result = compress_summary(summary, budget)
+    kept = result.summary
+    assert "# Main heading" in kept, "Header should survive tight budget"
+    assert "- bullet point A" in kept, "Bullet should survive tight budget"
+
+
+def test_compress_summary_restores_reading_order() -> None:
+    """Lines kept by priority scoring are output in original document order."""
+    lines = [
+        "# Section A",      # score 4, index 0
+        "prose line one",   # score 1, index 1
+        "## Section B",     # score 3, index 2
+        "prose line two",   # score 1, index 3
+    ]
+    summary = "\n".join(lines)
+    budget = SummaryCompressionBudget(max_chars=500, max_lines=3)
+    result = compress_summary(summary, budget)
+    kept_lines = [ln for ln in result.summary.splitlines() if ln and not ln.startswith("[")]
+    positions = {line: i for i, line in enumerate(kept_lines)}
+    # Section A (score 4) should appear before Section B (score 3) in output
+    assert positions["# Section A"] < positions["## Section B"]
+
+
+def test_max_stuck_dedup_blocks_constant() -> None:
+    """_MAX_STUCK_DEDUP_BLOCKS must be a positive integer — it guards the forced-exit path."""
+    assert isinstance(_MAX_STUCK_DEDUP_BLOCKS, int)
+    assert _MAX_STUCK_DEDUP_BLOCKS > 0
+
+
+def test_max_consecutive_readonly_constant() -> None:
+    """_MAX_CONSECUTIVE_READONLY must be a positive integer and larger than dedup threshold."""
+    assert isinstance(_MAX_CONSECUTIVE_READONLY, int)
+    assert _MAX_CONSECUTIVE_READONLY > 0
+
+
+def test_compress_summary_deduplicates_case_insensitively() -> None:
+    lines = ["Pending work: fix bug", "pending work: fix bug", "Other note"]
+    result = compress_summary("\n".join(lines))
+    kept = [ln for ln in result.summary.splitlines() if ln and not ln.startswith("[")]
+    assert result.removed_duplicate_lines == 1
+    # Only one of the duplicate pair should appear
+    assert sum(1 for ln in kept if "pending work" in ln.lower()) == 1
+
+
+# --- tool name resolution (camelCase ↔ snake_case) ---
+
+
+def _make_registry(tmp_path: Path):
+    """Build a minimal ToolRegistry for name-resolution tests."""
+    from coding_agent.config import AppConfig
+    from coding_agent.tools import ToolRegistry
+    cfg = AppConfig()
+    return ToolRegistry(workspace_root=tmp_path, config=cfg)
+
+
+def test_tool_registry_resolves_camel_web_search(tmp_path: Path) -> None:
+    """WebSearch (camelCase) must resolve to the registered web_search tool."""
+    reg = _make_registry(tmp_path)
+    assert reg.has_tool("WebSearch"), "WebSearch should resolve to web_search"
+
+
+def test_tool_registry_resolves_camel_web_fetch(tmp_path: Path) -> None:
+    reg = _make_registry(tmp_path)
+    assert reg.has_tool("WebFetch"), "WebFetch should resolve to web_fetch"
+
+
+def test_tool_registry_execute_camel_name_does_not_raise(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Calling execute() with WebSearch must not raise KeyError.
+
+    The handler is stubbed because the assertion is about *name routing* --
+    that `WebSearch` reaches the tool registered as `web_search` -- and not
+    about searching. Left unstubbed this test made a real network call and
+    took 30s, 62% of the whole suite's runtime, and would fail outright on an
+    offline or egress-restricted machine, which is the deployment target.
+    """
+    import coding_agent.tools.web as web_mod
+
+    called: list[dict] = []
+    monkeypatch.setattr(
+        web_mod, "_web_search",
+        lambda args, registry=None: called.append(args) or '{"results": []}',
+    )
+    reg = _make_registry(tmp_path)
+    try:
+        reg.execute("WebSearch", {"query": "test"})
+    except KeyError as exc:
+        pytest.fail(f"execute('WebSearch', ...) raised KeyError: {exc}")
+    assert called == [{"query": "test"}], "routed somewhere other than web_search"
+
+
+def test_tool_registry_unknown_tool_still_raises(tmp_path: Path) -> None:
+    reg = _make_registry(tmp_path)
+    with pytest.raises(KeyError, match="NonExistentTool"):
+        reg.execute("NonExistentTool", {})
+
+
+# --- system prompt content ---
+
+
+def test_system_prompt_contains_table_unit_guidance(tmp_path: Path) -> None:
+    """The rendered system prompt must instruct the model to look for units in table headers."""
+    from coding_agent.config import AppConfig
+    from coding_agent.memory.prompting import ProjectContext, PromptAssembler
+    ctx = ProjectContext(cwd=tmp_path, current_date="2026-01-01", git_status=None, git_diff=None, instruction_files=[])
+    prompt = PromptAssembler(AppConfig(), ctx).render()
+    assert "header" in prompt.lower() and "unit" in prompt.lower(), (
+        "System prompt should mention reading headers for units in tables"
+    )
+
+
+def test_system_prompt_contains_complex_task_guidance(tmp_path: Path) -> None:
+    """The rendered system prompt must include guidance for multi-step task planning."""
+    from coding_agent.config import AppConfig
+    from coding_agent.memory.prompting import ProjectContext, PromptAssembler
+    ctx = ProjectContext(cwd=tmp_path, current_date="2026-01-01", git_status=None, git_diff=None, instruction_files=[])
+    prompt = PromptAssembler(AppConfig(), ctx).render()
+    assert "plan" in prompt.lower(), "System prompt should mention writing a plan for complex tasks"
+
+
+# --- is_complex_prompt / looks_like_investigation ---
+
+@pytest.mark.parametrize("prompt", [
+    "Please check why kedro tells me Pipeline does not contain nodes named [...]",
+    "List every environment variable that yucode reads. Group by purpose.",
+    "How many tools does yucode register? Group them by RiskLevel.",
+    "幫我調查這個 kedro 錯誤",
+    "為什麼 X 不存在",
+    "refactor the auth module",
+])
+def test_is_complex_prompt_triggers_for_investigation_and_implementation(prompt: str) -> None:
+    """Investigation question forms and implementation verbs must trigger coordinator."""
+    from coding_agent.core.coordinator import is_complex_prompt
+    assert is_complex_prompt(prompt, intelligence_tier="weak"), f"Should trigger: {prompt!r}"
+
+
+@pytest.mark.parametrize("prompt", ["ls", "print pi", "hello", ""])
+def test_is_complex_prompt_skips_trivial_short_prompts(prompt: str) -> None:
+    from coding_agent.core.coordinator import is_complex_prompt
+    assert not is_complex_prompt(prompt, intelligence_tier="strong"), f"Should not trigger: {prompt!r}"
+
+
+def test_weak_tier_triggers_earlier_than_strong() -> None:
+    """Weak-tier should trigger on prompts strong-tier ignores (e.g. 'find function foo')."""
+    from coding_agent.core.coordinator import is_complex_prompt
+    prompt = "find function foo"
+    assert is_complex_prompt(prompt, intelligence_tier="weak")
+    assert not is_complex_prompt(prompt, intelligence_tier="strong")
+
+
+# --- classify_reasoning_effort ---
+
+@pytest.mark.parametrize("prompt", [
+    "Please check why kedro tells me Pipeline does not contain nodes named [...]",
+    "refactor the auth module to use JWT instead of session cookies",
+    "為什麼 X 不存在",
+    "幫我調查這個 kedro 錯誤",
+    "implement a rate limiter for the API across all endpoints",
+])
+def test_classify_reasoning_effort_high_for_complex_prompts(prompt: str) -> None:
+    from coding_agent.core.coordinator import classify_reasoning_effort
+    assert classify_reasoning_effort(prompt) == "high", f"Should be high: {prompt!r}"
+
+
+@pytest.mark.parametrize("prompt", ["hello", "hi there", "ls", "thanks!", "continue", ""])
+def test_classify_reasoning_effort_low_for_trivial_prompts(prompt: str) -> None:
+    from coding_agent.core.coordinator import classify_reasoning_effort
+    assert classify_reasoning_effort(prompt) == "low", f"Should be low: {prompt!r}"
+
+
+@pytest.mark.parametrize("prompt", [
+    "Summarize the changes in the last three commits for the release notes",
+    "Format this JSON blob to be more readable and consistent",
+])
+def test_classify_reasoning_effort_medium_for_ambiguous_prompts(prompt: str) -> None:
+    from coding_agent.core.coordinator import classify_reasoning_effort
+    assert classify_reasoning_effort(prompt) == "medium", f"Should be medium: {prompt!r}"
+
+
+def test_classify_reasoning_effort_weak_tier_triggers_high_earlier() -> None:
+    """Same underlying signal as is_complex_prompt — weak tier is more aggressive."""
+    from coding_agent.core.coordinator import classify_reasoning_effort
+    prompt = "find function foo bar baz qux"
+    assert classify_reasoning_effort(prompt, intelligence_tier="weak") == "high"
+    assert classify_reasoning_effort(prompt, intelligence_tier="strong") in ("low", "medium")
+
+
+def test_intelligence_tier_auto_detects_weak_models() -> None:
+    from coding_agent.config.settings import resolve_intelligence_tier
+    assert resolve_intelligence_tier("auto", "qwen3-32b") == "weak"
+    assert resolve_intelligence_tier("auto", "llama-3.1-70b") == "weak"
+    assert resolve_intelligence_tier("auto", "gpt-4o") == "strong"
+    assert resolve_intelligence_tier("auto", "claude-opus-4-7") == "strong"
+    assert resolve_intelligence_tier("auto", "unknown-model") == "strong"
+    # Explicit overrides ignore model name
+    assert resolve_intelligence_tier("strong", "qwen3-32b") == "strong"
+    assert resolve_intelligence_tier("weak", "gpt-4o") == "weak"
+
+
+def test_resolve_path_normalizes_backslashes(tmp_path: Path) -> None:
+    """Windows backslash paths must resolve identically to forward-slash paths."""
+    from coding_agent.config import AppConfig
+    from coding_agent.tools import ToolRegistry
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "file.py").write_text("x")
+    reg = ToolRegistry(tmp_path, AppConfig())
+    posix = reg._resolve_path("pkg/file.py")
+    windows = reg._resolve_path("pkg\\file.py")
+    assert posix == windows, "Backslash and forward-slash paths must resolve to the same Path"
+    assert posix.exists()
+
+
+def test_read_file_auto_resolves_bare_filename(tmp_path: Path) -> None:
+    """Bare filename with unique workspace match should resolve automatically."""
+    from coding_agent.config import AppConfig
+    from coding_agent.tools import ToolRegistry
+    from coding_agent.tools.filesystem import _read_file
+    (tmp_path / "pkg" / "sub").mkdir(parents=True)
+    (tmp_path / "pkg" / "sub" / "uniquename.py").write_text("content")
+    reg = ToolRegistry(tmp_path, AppConfig())
+    result = _read_file(reg, {"path": "uniquename.py"})
+    assert "content" in result
+
+
+# --- response_dedup ---
+
+def test_response_dedup_collapses_repeated_passes() -> None:
+    from coding_agent.core.response_dedup import dedup_repetitive_response
+    lead_in = (
+        "The compaction mechanism in yucode is designed to manage the size "
+        "of the conversation history. It triggers when token count exceeds "
+        "the compact_token_threshold. "
+    )
+    text = "\n\n".join([
+        lead_in + "PASS1: threshold = 10,000.",
+        lead_in + "PASS2: threshold = 60,000.",
+        lead_in + "PASS3: threshold = 60,000 (final).",
+    ])
+    # Lower min_total_len so this concise test fixture triggers the dedup.
+    out = dedup_repetitive_response(text, min_total_len=200)
+    assert "PASS3" in out
+    assert "PASS1" not in out, "First pass should be dropped"
+    assert "PASS2" not in out, "Second pass should be dropped"
+
+
+def test_response_dedup_keeps_full_last_pass_when_passes_are_multi_paragraph() -> None:
+    """Regression: response_dedup must keep ALL paragraphs of the final pass,
+    not just the last paragraph (the A3/D2 bug in v3 eval)."""
+    from coding_agent.core.response_dedup import dedup_repetitive_response
+    pass_paragraphs = [
+        "The AgentRuntime class is declared in coding_agent/core/runtime.py at line 92.",
+        "Constructor signature: __init__(self, workspace_root, config, *, provider, ...)",
+        "This is the complete constructor signature for AgentRuntime.",
+    ]
+    # Two identical passes; new dedup should keep the second full pass.
+    text = "\n\n".join(pass_paragraphs + pass_paragraphs)
+    out = dedup_repetitive_response(text, min_total_len=200)
+    paras = out.split("\n\n")
+    assert len(paras) == 3, f"Expected 3 paragraphs (one pass), got {len(paras)}"
+    assert "AgentRuntime class is declared" in out
+    assert "Constructor signature" in out
+    assert "complete constructor signature" in out
+
+
+def test_response_dedup_preserves_long_answer_with_short_trailing_summary() -> None:
+    """Regression for v5 D2: when worker A produces a full answer and worker B
+    appends only a short summary, dedup must NOT truncate the response to
+    just the summary. Guard: if last "pass" is <15% of total chars, skip."""
+    from coding_agent.core.response_dedup import dedup_repetitive_response
+    long_body = (
+        "### RESEARCH\n"
+        "The research role has access to read-only tools: read_file, grep_search, "
+        "glob_search, web_search. It is used for gathering information.\n\n"
+        "### WORK\n"
+        "The work role has access to write tools: write_file, edit_file, bash, "
+        "plus all the read tools. It performs the actual implementation.\n\n"
+        "### VALIDATE\n"
+        "The validate role has read-only tools plus bash for running tests. "
+        "It verifies the work meets the criteria."
+    )
+    short_summary = "Summary: each role gets minimal tools for its responsibility."
+    text = long_body + "\n\n" + short_summary
+    out = dedup_repetitive_response(text, min_total_len=200)
+    assert "RESEARCH" in out, "Full body must be preserved"
+    assert "WORK" in out, "Full body must be preserved"
+    assert "VALIDATE" in out, "Full body must be preserved"
+
+
+def test_response_dedup_fallback_catches_restructured_passes() -> None:
+    """When passes use different lead-ins but share body content, the
+    whole-paragraph fallback should still catch the repetition."""
+    from coding_agent.core.response_dedup import dedup_repetitive_response
+    body = (
+        "max_tool_calls is defined in coding_agent/config/config.yml line 21. "
+        "It is loaded by coding_agent/config/settings.py and used by "
+        "coding_agent/core/runtime.py to cap tool invocations per turn. "
+    )
+    text = "\n\n".join([
+        "## Summary\n" + body,
+        "## Transmission path\n" + body,
+        "## Flow diagram\n" + body,
+    ])
+    out = dedup_repetitive_response(text, min_total_len=200)
+    # Last pass starts with "## Flow diagram"
+    assert "## Flow diagram" in out
+    assert "## Summary" not in out
+
+
+def test_response_dedup_leaves_normal_text_alone() -> None:
+    from coding_agent.core.response_dedup import dedup_repetitive_response
+    text = "Step 1: do X.\n\nStep 2: do Y.\n\nConclusion: done."
+    assert dedup_repetitive_response(text) == text
+
+
+def test_response_dedup_skips_short_text() -> None:
+    from coding_agent.core.response_dedup import dedup_repetitive_response
+    short = "Repeated.\n\nRepeated.\n\nRepeated."
+    # Short text should never be touched even if it looks repetitive
+    assert dedup_repetitive_response(short) == short
+
+
+# --- streaming display ---
+
+def test_streaming_display_active_state() -> None:
+    from coding_agent.interface.render import StreamingTextDisplay
+    s = StreamingTextDisplay()
+    assert s.is_active is False
+    s.feed("hello ")
+    assert s.is_active is True
+    s.finalize()
+    assert s.is_active is False
+    # Finalize on already-inactive is a no-op
+    s.finalize()
+    assert s.is_active is False
+
+
+# --- canonical dedup hashing ---
+
+def test_dedup_hash_matches_for_different_json_formatting() -> None:
+    """Two semantically identical tool calls with different JSON formatting
+    must collapse to the same dedup key after canonicalization."""
+    import json as _json
+    from coding_agent.core.runtime import _content_stable_hash
+    a = '{"pattern":"foo","path":"bar"}'
+    b = '{"path": "bar", "pattern": "foo"}'
+    canon_a = _json.dumps(_json.loads(a), sort_keys=True, separators=(",", ":"))
+    canon_b = _json.dumps(_json.loads(b), sort_keys=True, separators=(",", ":"))
+    assert _content_stable_hash(canon_a) == _content_stable_hash(canon_b)
+
+
+# --- session identity & persistence ---
+
+def test_session_gets_a_generated_session_id() -> None:
+    """Every Session is identifiable without the caller doing anything —
+    compaction archives key their filename off this."""
+    session = Session(model="x")
+    assert session.session_id
+    assert Session(model="x").session_id != session.session_id
+
+
+def test_session_round_trips_session_id_and_system_prompt(tmp_path: Path) -> None:
+    session = Session(model="m", system_prompt="RENDERED PROMPT")
+    session.add_message(Message(role="user", content="hi"))
+    path = tmp_path / "s.json"
+    session.save(path)
+
+    on_disk = json.loads(path.read_text(encoding="utf-8"))
+    assert on_disk["session_id"] == session.session_id
+    assert on_disk["system_prompt"] == "RENDERED PROMPT"
+
+    loaded = Session.load(path)
+    assert loaded.session_id == session.session_id
+    assert loaded.system_prompt == "RENDERED PROMPT"
+    assert loaded.model == "m"
+    assert [m.content for m in loaded.messages] == ["hi"]
+
+
+def test_session_load_tolerates_legacy_json_without_new_fields(tmp_path: Path) -> None:
+    """Sessions saved before session_id/system_prompt existed must still load."""
+    legacy = {
+        "version": 1,
+        "created_at": 123.0,
+        "model": "old-model",
+        "usage": {"input_tokens": 5, "output_tokens": 2},
+        "messages": [{"role": "user", "content": "legacy"}],
+    }
+    path = tmp_path / "legacy.json"
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+
+    loaded = Session.load(path)
+    assert loaded.session_id  # minted on load, not left empty
+    assert loaded.system_prompt == ""
+    assert loaded.model == "old-model"
+    assert loaded.created_at == 123.0
+    assert [m.content for m in loaded.messages] == ["legacy"]
+
+
+def test_provider_messages_uses_argument_not_stored_system_prompt() -> None:
+    """The stored system_prompt is forensics only — it must never change what
+    actually gets sent to the provider."""
+    session = Session(model="m", system_prompt="STORED")
+    session.add_message(Message(role="user", content="hi"))
+    messages = session.provider_messages("SENT")
+    assert messages[0] == {"role": "system", "content": "SENT"}
+    assert len(messages) == 2
+    assert messages[1]["role"] == "user"
+
+
+# --- usage accounting ---
+
+def test_total_tokens_does_not_double_count_cached_tokens() -> None:
+    """prompt_tokens already includes prompt_tokens_details.cached_tokens, so
+    the cache counters must not be added on top of input_tokens."""
+    usage = Usage(input_tokens=1000, output_tokens=50, cache_read_input_tokens=800)
+    assert usage.total_tokens() == 1050
+
+    with_creation = Usage(
+        input_tokens=1000,
+        output_tokens=50,
+        cache_creation_input_tokens=200,
+        cache_read_input_tokens=800,
+    )
+    assert with_creation.total_tokens() == 1050
+
+
+def test_total_tokens_is_zero_for_empty_usage() -> None:
+    assert Usage().total_tokens() == 0
+
+
+def test_extract_usage_folds_in_anthropic_cache_buckets() -> None:
+    """`Usage` carries OpenAI semantics throughout — input_tokens is the whole
+    prompt and the two cache fields are a *breakdown* of it — which is what
+    lets total_tokens() be input+output.
+
+    Anthropic-shaped usage means the opposite: cache_read_input_tokens and
+    cache_creation_input_tokens sit *alongside* input_tokens, not inside it.
+    `_extract_usage` reads those top-level keys (providers.py:388-395), and a
+    gateway that fronts an Anthropic model over an OpenAI-compatible
+    chat-completions endpoint sends exactly this shape — the same reason
+    _extract_usage already falls back to `input_tokens`/`output_tokens` at
+    all. Left unnormalised, a 48k-token cache read is reported as 12 prompt
+    tokens in /cost and in the headless JSON usage block.
+    """
+    usage = _extract_usage({
+        "input_tokens": 12,
+        "cache_read_input_tokens": 48000,
+        "output_tokens": 300,
+    })
+    assert usage.cache_read_input_tokens == 48000
+    assert usage.input_tokens == 48012
+    assert usage.total_tokens() == 48312
+
+    with_creation = _extract_usage({
+        "input_tokens": 12,
+        "cache_creation_input_tokens": 2000,
+        "cache_read_input_tokens": 48000,
+        "output_tokens": 300,
+    })
+    assert with_creation.total_tokens() == 50312
+
+
+def test_extract_usage_keeps_openai_cache_counts_as_a_breakdown() -> None:
+    """The other side of the same branch: when the totals arrived under the
+    OpenAI names, cache counts are already inside prompt_tokens however they
+    are spelled, so folding them in would double-count."""
+    nested = _extract_usage({
+        "prompt_tokens": 1000,
+        "completion_tokens": 50,
+        "prompt_tokens_details": {"cached_tokens_creation": 200, "cached_tokens": 800},
+    })
+    assert nested.input_tokens == 1000
+    assert nested.total_tokens() == 1050
+
+    # Some OpenAI-compatible gateways spell the breakdown with the flat names
+    # while still reporting `prompt_tokens` — still a breakdown, not buckets.
+    flat = _extract_usage({
+        "prompt_tokens": 1000,
+        "completion_tokens": 50,
+        "cache_creation_input_tokens": 200,
+        "cache_read_input_tokens": 800,
+    })
+    assert flat.input_tokens == 1000
+    assert flat.total_tokens() == 1050

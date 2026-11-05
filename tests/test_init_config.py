@@ -1,0 +1,731 @@
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+from coding_agent.config import AppConfig, ProviderConfig, RuntimeOptions
+from coding_agent.config.settings import (
+    BUNDLED_CONFIG_PATH,
+    _coerce_streaming_mode,
+    app_config_from_dict,
+    state_dir,
+    workspace_key,
+)
+from coding_agent.config.simple_yaml import load_yaml
+from coding_agent.core.session import AssistantResponse, Usage
+from coding_agent.interface import cli
+from coding_agent.interface.cli import (
+    _apply_cli_overrides,
+    _ensure_project_support_files,
+    _has_configured_api_key,
+    _probe_provider_connection,
+)
+
+
+def test_ensure_project_support_files_creates_expected_files(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    created = _ensure_project_support_files(tmp_path)
+
+    env_example = tmp_path / ".env.example"
+    gitignore = tmp_path / ".gitignore"
+    local_overlay = tmp_path / ".yucode" / "settings.local.yml"
+
+    assert env_example in created
+    assert gitignore in created
+    assert local_overlay in created
+    assert env_example.is_file()
+    assert local_overlay.is_file()
+    gitignore_text = gitignore.read_text(encoding="utf-8")
+    assert ".yucode/settings.local.yml" in gitignore_text
+    assert ".env" in gitignore_text
+
+
+def test_has_configured_api_key_reads_env(tmp_path: Path, monkeypatch) -> None:
+    config_path = tmp_path / ".yucode" / "settings.yml"
+    monkeypatch.setenv("YUCODE_API_KEY", "env-test-key")
+    assert _has_configured_api_key(str(config_path), workspace=tmp_path) is True
+
+
+def test_probe_provider_connection_reports_non_stream_success(tmp_path: Path, monkeypatch) -> None:
+    config = AppConfig(
+        provider=ProviderConfig(
+            name="test",
+            api_key="key",
+            base_url="https://example.com",
+            model="demo-model",
+            stream=True,
+        ),
+        runtime=RuntimeOptions(),
+    )
+
+    monkeypatch.setattr(cli, "load_app_config", lambda *args, **kwargs: config)
+
+    def fake_complete(self, messages, tools, stream_callback=None):
+        return AssistantResponse(text="OK", usage=Usage(input_tokens=1, output_tokens=1))
+
+    monkeypatch.setattr(cli.OpenAICompatibleProvider, "complete", fake_complete)
+
+    ok, status, message = _probe_provider_connection(None, workspace=tmp_path, stream=False)
+    assert ok is True
+    assert status == "ok"
+    assert "Non-streaming request succeeded" in message
+
+
+def test_probe_provider_connection_reports_stream_warning(tmp_path: Path, monkeypatch) -> None:
+    config = AppConfig(
+        provider=ProviderConfig(
+            name="test",
+            api_key="key",
+            base_url="https://example.com",
+            model="demo-model",
+            stream=True,
+        ),
+        runtime=RuntimeOptions(),
+    )
+
+    monkeypatch.setattr(cli, "load_app_config", lambda *args, **kwargs: config)
+
+    def fake_complete(self, messages, tools, stream_callback=None):
+        if stream_callback is not None:
+            stream_callback({
+                "type": "warning",
+                "warning": "Provider streaming completed with no text and no tool calls.",
+                "category": "provider_streaming_empty_response",
+            })
+        return AssistantResponse(text="", usage=Usage())
+
+    monkeypatch.setattr(cli.OpenAICompatibleProvider, "complete", fake_complete)
+
+    ok, status, message = _probe_provider_connection(None, workspace=tmp_path, stream=True)
+    assert ok is False
+    assert status == "warning"
+    assert "provider.stream: false" in message
+
+
+# ---------------------------------------------------------------------------
+# workspace_key / state_dir
+# ---------------------------------------------------------------------------
+
+
+def test_workspace_key_is_deterministic(tmp_path: Path) -> None:
+    k1 = workspace_key(tmp_path)
+    k2 = workspace_key(tmp_path)
+    assert k1 == k2
+    assert len(k1) == 12
+
+
+def test_workspace_key_different_for_different_paths(tmp_path: Path) -> None:
+    a = tmp_path / "project_a"
+    b = tmp_path / "project_b"
+    a.mkdir()
+    b.mkdir()
+    assert workspace_key(a) != workspace_key(b)
+
+
+def test_state_dir_returns_home_based_path(tmp_path: Path, monkeypatch) -> None:
+    fake_home = tmp_path / "fake_home"
+    fake_home.mkdir()
+    monkeypatch.setattr("coding_agent.config.settings._HOME_YUCODE", fake_home / ".yucode")
+    project = tmp_path / "my_project"
+    project.mkdir()
+    sd = state_dir(project)
+    assert str(sd).startswith(str(fake_home / ".yucode" / "projects"))
+
+
+# ---------------------------------------------------------------------------
+# _coerce_streaming_mode
+# ---------------------------------------------------------------------------
+
+
+def test_coerce_streaming_mode_valid_values() -> None:
+    assert _coerce_streaming_mode("stream") == "stream"
+    assert _coerce_streaming_mode("no_stream") == "no_stream"
+    assert _coerce_streaming_mode("hybrid") == "hybrid"
+
+
+def test_coerce_streaming_mode_empty_defaults_to_hybrid() -> None:
+    assert _coerce_streaming_mode("") == "hybrid"
+
+
+def test_coerce_streaming_mode_boolean_strings() -> None:
+    assert _coerce_streaming_mode("true") == "stream"
+    assert _coerce_streaming_mode("false") == "no_stream"
+
+
+def test_coerce_streaming_mode_auto_maps_to_hybrid() -> None:
+    assert _coerce_streaming_mode("auto") == "hybrid"
+
+
+def test_coerce_streaming_mode_unknown_defaults_to_hybrid() -> None:
+    assert _coerce_streaming_mode("foobar") == "hybrid"
+
+
+# ---------------------------------------------------------------------------
+# _probe_provider_connection — non-OpenAI envelope
+# ---------------------------------------------------------------------------
+
+
+def test_probe_provider_connection_reports_gateway_error(tmp_path: Path, monkeypatch) -> None:
+    """When the provider raises RuntimeError (non-OpenAI envelope), doctor
+    should report an error with the effective URL."""
+    config = AppConfig(
+        provider=ProviderConfig(
+            name="test",
+            api_key="key",
+            base_url="https://gateway.example.com",
+            model="demo-model",
+            chat_path="/v1/chat/completions",
+            stream=True,
+        ),
+        runtime=RuntimeOptions(),
+    )
+
+    monkeypatch.setattr(cli, "load_app_config", lambda *args, **kwargs: config)
+
+    def fake_complete(self, messages, tools, stream_callback=None):
+        raise RuntimeError(
+            "The provider endpoint (https://gateway.example.com/v1/chat/completions) "
+            "returned a non-OpenAI response. Payload keys: ['code', 'flag', 'msg', 'ts']. "
+            "Server message: auth failed"
+        )
+
+    monkeypatch.setattr(cli.OpenAICompatibleProvider, "complete", fake_complete)
+
+    ok, status, message = _probe_provider_connection(None, workspace=tmp_path, stream=False)
+    assert ok is False
+    assert status == "error"
+    assert "gateway.example.com" in message
+    assert "non-OpenAI" in message
+
+
+def test_probe_provider_connection_error_includes_url(tmp_path: Path, monkeypatch) -> None:
+    """Doctor error messages now include the effective URL."""
+    config = AppConfig(
+        provider=ProviderConfig(
+            name="test",
+            api_key="key",
+            base_url="https://example.com",
+            model="demo-model",
+            chat_path="/chat/completions",
+            stream=True,
+        ),
+        runtime=RuntimeOptions(),
+    )
+
+    monkeypatch.setattr(cli, "load_app_config", lambda *args, **kwargs: config)
+
+    def fake_complete(self, messages, tools, stream_callback=None):
+        raise ConnectionError("Connection refused")
+
+    monkeypatch.setattr(cli.OpenAICompatibleProvider, "complete", fake_complete)
+
+    ok, status, message = _probe_provider_connection(None, workspace=tmp_path, stream=False)
+    assert ok is False
+    assert status == "error"
+    assert "example.com/chat/completions" in message
+
+
+def test_app_config_from_dict_reads_append_chat_path() -> None:
+    config = app_config_from_dict({
+        "provider": {
+            "base_url": "https://api.example.com/v1/chat/completions",
+            "api_key": "key",
+            "model": "demo-model",
+            "chat_path": "/chat/completions",
+            "append_chat_path": False,
+        }
+    })
+    assert config.provider.append_chat_path is False
+
+
+def test_app_config_from_dict_reads_verify_tls() -> None:
+    config = app_config_from_dict({
+        "provider": {
+            "base_url": "https://api.example.com",
+            "api_key": "key",
+            "model": "demo-model",
+            "verify_tls": False,
+        }
+    })
+    assert config.provider.verify_tls is False
+
+
+def test_to_control_dict_includes_append_chat_path() -> None:
+    config = AppConfig(
+        provider=ProviderConfig(
+            base_url="https://api.example.com",
+            api_key="key",
+            model="demo-model",
+            append_chat_path=False,
+        ),
+        runtime=RuntimeOptions(),
+    )
+    assert config.to_control_dict()["provider"]["append_chat_path"] is False
+
+
+def test_to_control_dict_includes_verify_tls() -> None:
+    config = AppConfig(
+        provider=ProviderConfig(
+            base_url="https://api.example.com",
+            api_key="key",
+            model="demo-model",
+            verify_tls=False,
+        ),
+        runtime=RuntimeOptions(),
+    )
+    assert config.to_control_dict()["provider"]["verify_tls"] is False
+
+
+def test_app_config_from_dict_reads_api_version() -> None:
+    config = app_config_from_dict({
+        "provider": {
+            "base_url": "https://api.workbench.example",
+            "api_key": "key",
+            "model": "gpt-5-5",
+            "api_version": "2024-12-01-preview",
+        }
+    })
+    assert config.provider.api_version == "2024-12-01-preview"
+
+
+def test_app_config_from_dict_api_version_defaults_empty() -> None:
+    config = app_config_from_dict({
+        "provider": {
+            "base_url": "https://api.example.com",
+            "api_key": "key",
+            "model": "demo-model",
+        }
+    })
+    assert config.provider.api_version == ""
+
+
+def test_to_control_dict_includes_api_version() -> None:
+    config = AppConfig(
+        provider=ProviderConfig(
+            base_url="https://api.workbench.example",
+            api_key="key",
+            model="gpt-5-5",
+            api_version="2024-12-01-preview",
+        ),
+        runtime=RuntimeOptions(),
+    )
+    assert config.to_control_dict()["provider"]["api_version"] == "2024-12-01-preview"
+
+
+def test_app_config_from_dict_reads_omit_params() -> None:
+    config = app_config_from_dict({
+        "provider": {
+            "base_url": "https://api.example.com",
+            "api_key": "key",
+            "model": "demo-model",
+            "omit_params": ["temperature"],
+        }
+    })
+    assert config.provider.omit_params == ["temperature"]
+
+
+def test_to_control_dict_includes_omit_params() -> None:
+    config = AppConfig(
+        provider=ProviderConfig(
+            base_url="https://api.example.com",
+            api_key="key",
+            model="demo-model",
+            omit_params=["temperature"],
+        ),
+        runtime=RuntimeOptions(),
+    )
+    assert config.to_control_dict()["provider"]["omit_params"] == ["temperature"]
+
+
+def test_bundled_config_defaults_to_workbench() -> None:
+    """WI-3: the bundled config.yml (becomes ~/.yucode/settings.yml on first
+    run) ships workbench as the default provider, not deepseek."""
+    text = BUNDLED_CONFIG_PATH.read_text(encoding="utf-8")
+    raw = load_yaml(text)
+    config = app_config_from_dict(raw)
+    assert config.provider.name == "workbench"
+    assert config.provider.api_version == "2024-12-01-preview"
+    assert config.provider.omit_params == ["temperature"]
+    assert config.provider.streaming_mode == "no_stream"
+    assert config.provider.request_timeout_seconds == 300
+    assert config.provider.verify_tls is False
+    assert config.runtime.orchestration_mode == "auto"
+    assert config.provider.resolved_tier() == "strong"
+
+
+def test_bundled_config_builds_expected_azure_url_and_headers() -> None:
+    import dataclasses
+
+    from coding_agent.core.providers import OpenAICompatibleProvider
+
+    raw = load_yaml(BUNDLED_CONFIG_PATH.read_text(encoding="utf-8"))
+    config = app_config_from_dict(raw)
+    provider = OpenAICompatibleProvider(config=config.provider)
+    assert provider._build_url() == (
+        "https://api.workbench.example.internal/genai/azure/openai"
+        "/deployments/gpt-5-5-2026-04-24-gs-sdc/chat/completions"
+        "?api-version=2024-12-01-preview"
+    )
+    # api_key ships empty in the bundled default (real value lives only in
+    # the user's settings.yml) — no Authorization header without one either
+    # way, so verify the api-key-vs-Bearer switch with a filled-in copy.
+    headers_unfilled = provider._headers(stream=False)
+    assert "Authorization" not in headers_unfilled
+    assert "Ocp-Apim-Subscription-Key" in headers_unfilled
+
+    filled_provider = OpenAICompatibleProvider(config=dataclasses.replace(config.provider, api_key="TESTKEY"))
+    headers_filled = filled_provider._headers(stream=False)
+    assert headers_filled["api-key"] == "TESTKEY"
+    assert "Authorization" not in headers_filled
+
+    body = provider._build_body([{"role": "user", "content": "hi"}], [], False)
+    assert "temperature" not in body
+    assert body["reasoning_effort"] == "medium"
+
+
+def test_workbench_settings_template_parses_and_matches_bundled_shape() -> None:
+    """docs/settings.workbench.yml is the full copy-paste template for the
+    company PC — it must parse and produce the same request shape as the
+    bundled default (WI-3 verify step)."""
+    from coding_agent.core.providers import OpenAICompatibleProvider
+
+    template_path = Path(__file__).resolve().parents[1] / "docs" / "settings.workbench.yml"
+    raw = load_yaml(template_path.read_text(encoding="utf-8"))
+    config = app_config_from_dict(raw)
+    assert config.provider.omit_params == ["temperature"]  # regression: inline `[x]` mis-parses as a string
+    assert config.runtime.orchestration_mode == "auto"
+    provider = OpenAICompatibleProvider(config=config.provider)
+    assert "/deployments/" in provider._build_url()
+    assert "api-version=2024-12-01-preview" in provider._build_url()
+    body = provider._build_body([{"role": "user", "content": "hi"}], [], False)
+    assert "temperature" not in body
+
+
+def test_slash_model_command_preserves_workbench_provider_fields(tmp_path: Path) -> None:
+    """Regression: the interactive /model command manually reconstructed
+    ProviderConfig field-by-field, same bug class as _apply_cli_overrides —
+    switching model mid-session (e.g. GPT-5.5 -> GPT-5.4) would silently
+    drop api_version/omit_params and break the Workbench URL/body shape."""
+    from coding_agent.core.runtime import AgentRuntime
+    from coding_agent.interface.cli import _handle_slash_command_interactive
+
+    config = AppConfig(
+        provider=ProviderConfig(
+            name="workbench",
+            api_key="key",
+            base_url="https://api.workbench.example.internal/genai/azure/openai",
+            api_version="2024-12-01-preview",
+            model="gpt-5-5-2026-04-24-gs-sdc",
+            omit_params=["temperature"],
+            extra_headers={"Ocp-Apim-Subscription-Key": "key"},
+        ),
+        runtime=RuntimeOptions(permission_mode="danger-full-access"),
+    )
+    runtime = AgentRuntime(tmp_path, config)
+
+    _handle_slash_command_interactive("model", "gpt-5-4-2026-03-05-gs-sdc", config, tmp_path, runtime)
+
+    assert runtime.config.provider.model == "gpt-5-4-2026-03-05-gs-sdc"
+    assert runtime.config.provider.api_version == "2024-12-01-preview"
+    assert runtime.config.provider.omit_params == ["temperature"]
+    assert runtime.config.provider.extra_headers == {"Ocp-Apim-Subscription-Key": "key"}
+    assert runtime.provider.config.model == "gpt-5-4-2026-03-05-gs-sdc"
+    assert runtime.provider.config.api_version == "2024-12-01-preview"
+
+
+def test_handle_chat_with_no_prompt_starts_interactive_mode(monkeypatch) -> None:
+    """Regression: `chat` subcommand's own help text says "or start interactive
+    mode with no prompt" but handle_chat used to print a usage error instead
+    of actually doing that — found while confirming interactive-mode usage
+    for a user (chat --workspace . silently didn't work as documented)."""
+    monkeypatch.setattr(cli, "_ensure_api_key", lambda config_path: True)
+    captured: dict = {}
+
+    def fake_run_interactive(args):
+        captured["args"] = args
+        return 0
+
+    monkeypatch.setattr(cli, "_run_interactive", fake_run_interactive)
+    args = argparse.Namespace(
+        prompt=None, workspace=".", config_path=None, model=None, permission_mode=None,
+    )
+    result = cli.handle_chat(args)
+    assert result == 0
+    assert "args" in captured, "handle_chat must delegate to interactive mode, not error out"
+    assert captured["args"].workspace == "."
+
+
+def test_cli_model_override_preserves_workbench_provider_fields() -> None:
+    """Regression: --model must not silently drop omit_params/api_version/
+    intelligence_tier — a workbench user switching GPT-5.5 <-> 5.4 on the CLI
+    would otherwise lose the Azure URL building and the temperature omission."""
+    config = AppConfig(
+        provider=ProviderConfig(
+            base_url="https://api.workbench.example.internal/genai/azure/openai",
+            api_key="key",
+            model="gpt-5-5-2026-04-24-gs-sdc",
+            api_version="2024-12-01-preview",
+            omit_params=["temperature"],
+            intelligence_tier="strong",
+            extra_headers={"Ocp-Apim-Subscription-Key": "key"},
+            extra_body={"reasoning_effort": "medium"},
+        ),
+        runtime=RuntimeOptions(),
+    )
+    args = argparse.Namespace(model="gpt-5-4-2026-03-05-gs-sdc", permission_mode=None, allowed_tools=None)
+    updated = _apply_cli_overrides(config, args)
+    assert updated.provider.model == "gpt-5-4-2026-03-05-gs-sdc"
+    assert updated.provider.api_version == "2024-12-01-preview"
+    assert updated.provider.omit_params == ["temperature"]
+    assert updated.provider.intelligence_tier == "strong"
+    assert updated.provider.extra_headers == {"Ocp-Apim-Subscription-Key": "key"}
+    assert updated.provider.extra_body == {"reasoning_effort": "medium"}
+
+
+def test_cli_permission_mode_override_preserves_runtime_fields() -> None:
+    """Regression: --permission-mode manually reconstructed RuntimeOptions
+    field-by-field, same bug class as the ProviderConfig cases above -- it
+    had already silently dropped compact_strategy/error_strategy (both
+    non-default fields below) on every --permission-mode override, and would
+    have dropped max_coordinator_retries too."""
+    config = AppConfig(
+        provider=ProviderConfig(base_url="https://x", api_key="key", model="m"),
+        runtime=RuntimeOptions(
+            permission_mode="workspace-write",
+            max_coordinator_retries=7,
+            compact_strategy="llm",
+            error_strategy="strict",
+        ),
+    )
+    args = argparse.Namespace(model=None, permission_mode="danger-full-access", allowed_tools=None)
+    updated = _apply_cli_overrides(config, args)
+    assert updated.runtime.permission_mode == "danger-full-access"
+    assert updated.runtime.max_coordinator_retries == 7
+    assert updated.runtime.compact_strategy == "llm"
+    assert updated.runtime.error_strategy == "strict"
+
+
+def test_api_version_and_omit_params_round_trip_through_yaml(tmp_path: Path) -> None:
+    from coding_agent.config.simple_yaml import dump_yaml
+
+    config = AppConfig(
+        provider=ProviderConfig(
+            base_url="https://api.workbench.example",
+            api_key="key",
+            model="gpt-5-5",
+            api_version="2024-12-01-preview",
+            omit_params=["temperature"],
+        ),
+        runtime=RuntimeOptions(),
+    )
+    text = dump_yaml(config.to_control_dict())
+    raw = load_yaml(text)
+    reloaded = app_config_from_dict(raw)
+    assert reloaded.provider.api_version == "2024-12-01-preview"
+    assert reloaded.provider.omit_params == ["temperature"]
+
+
+def test_probe_provider_connection_uses_base_url_when_append_disabled(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config = AppConfig(
+        provider=ProviderConfig(
+            name="test",
+            api_key="key",
+            base_url="https://example.com/v1/chat/completions",
+            model="demo-model",
+            chat_path="/chat/completions",
+            append_chat_path=False,
+            stream=True,
+        ),
+        runtime=RuntimeOptions(),
+    )
+
+    monkeypatch.setattr(cli, "load_app_config", lambda *args, **kwargs: config)
+
+    def fake_complete(self, messages, tools, stream_callback=None):
+        raise ConnectionError("Connection refused")
+
+    monkeypatch.setattr(cli.OpenAICompatibleProvider, "complete", fake_complete)
+
+    ok, status, message = _probe_provider_connection(None, workspace=tmp_path, stream=False)
+    assert ok is False
+    assert status == "error"
+    assert "https://example.com/v1/chat/completions" in message
+    assert "https://example.com/v1/chat/completions/chat/completions" not in message
+
+
+def test_probe_provider_connection_preserves_verify_tls(tmp_path: Path, monkeypatch) -> None:
+    config = AppConfig(
+        provider=ProviderConfig(
+            name="test",
+            api_key="key",
+            base_url="https://example.com",
+            model="demo-model",
+            verify_tls=False,
+            stream=True,
+        ),
+        runtime=RuntimeOptions(),
+    )
+
+    monkeypatch.setattr(cli, "load_app_config", lambda *args, **kwargs: config)
+
+    def fake_complete(self, messages, tools, stream_callback=None):
+        assert self.config.verify_tls is False
+        return AssistantResponse(text="OK", usage=Usage(input_tokens=1, output_tokens=1))
+
+    monkeypatch.setattr(cli.OpenAICompatibleProvider, "complete", fake_complete)
+
+    ok, status, message = _probe_provider_connection(None, workspace=tmp_path, stream=False)
+    assert ok is True
+    assert status == "ok"
+    assert "Non-streaming request succeeded" in message
+
+
+def test_probe_provider_connection_preserves_api_version_and_omit_params(tmp_path: Path, monkeypatch) -> None:
+    """Regression: _probe_provider_connection used to manually reconstruct
+    ProviderConfig field-by-field and dropped api_version/omit_params — the
+    built-in `yucode init-config` / `yucode doctor` connectivity check would
+    silently probe an Azure-style gateway at the wrong (non-deployment) URL
+    with a rejected `temperature` in the body."""
+    config = AppConfig(
+        provider=ProviderConfig(
+            name="workbench",
+            api_key="key",
+            base_url="https://api.workbench.example.internal/genai/azure/openai",
+            api_version="2024-12-01-preview",
+            model="gpt-5-5-2026-04-24-gs-sdc",
+            omit_params=["temperature"],
+            stream=True,
+        ),
+        runtime=RuntimeOptions(),
+    )
+
+    monkeypatch.setattr(cli, "load_app_config", lambda *args, **kwargs: config)
+
+    def fake_complete_probe(self, messages, tools, stream_callback=None):
+        assert self.config.api_version == "2024-12-01-preview"
+        assert self._build_url() == (
+            "https://api.workbench.example.internal/genai/azure/openai"
+            "/deployments/gpt-5-5-2026-04-24-gs-sdc/chat/completions"
+            "?api-version=2024-12-01-preview"
+        )
+        body = self._build_body(messages, tools, False)
+        assert "temperature" not in body
+        return AssistantResponse(text="OK", usage=Usage(input_tokens=1, output_tokens=1))
+
+    monkeypatch.setattr(cli.OpenAICompatibleProvider, "complete", fake_complete_probe)
+
+    ok, status, message = _probe_provider_connection(None, workspace=tmp_path, stream=False)
+    assert ok is True
+    assert status == "ok"
+
+
+def test_handle_init_config_saves_append_chat_path(tmp_path: Path, monkeypatch) -> None:
+    config_path = tmp_path / ".yucode" / "settings.yml"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(
+        "provider:\n"
+        "  base_url: https://api.example.com\n"
+        "  api_key: key\n"
+        "  model: demo-model\n"
+        "  chat_path: /chat/completions\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    def fake_prompt(label, current, *, secret=False, choices=None):
+        if label.startswith("provider.append_chat_path"):
+            return False
+        if label.startswith("provider.verify_tls"):
+            return False
+        return current
+
+    monkeypatch.setattr(cli, "_prompt", fake_prompt)
+    monkeypatch.setattr(cli, "_test_api_connection", lambda *args, **kwargs: (True, "ok"))
+
+    result = cli.handle_init_config(argparse.Namespace(config_path=str(config_path)))
+    saved = load_yaml(config_path.read_text(encoding="utf-8"))
+
+    assert result == 0
+    assert isinstance(saved, dict)
+    assert saved["provider"]["append_chat_path"] is False
+    assert saved["provider"]["verify_tls"] is False
+
+
+class TestToolCallingProbe:
+    """`doctor` has to exercise the request shape the agent actually sends.
+
+    The plain connectivity check passes an empty tools list, which is a shape
+    yucode never uses in practice. On gpt-5.6 and later, a Chat Completions
+    request that carries function tools is rejected outright -- and it fires
+    even when the request omits `reasoning_effort`, because those models reason
+    by default. So the gateway can report healthy while every real turn fails.
+    """
+
+    def _config(self):
+        from coding_agent.config import load_app_config
+        return load_app_config(None)
+
+    def test_the_gpt_5_6_tools_rejection_is_reported_with_its_remedy(self, monkeypatch):
+        from coding_agent.interface import cli as cli_mod
+
+        message = (
+            "Function tools with reasoning_effort are not supported for "
+            "gpt-5.6-terra in /v1/chat/completions. To use function tools, "
+            "use /v1/responses or set reasoning_effort to 'none'."
+        )
+
+        def boom(self, *a, **kw):
+            raise RuntimeError(message)
+
+        monkeypatch.setattr(cli_mod.OpenAICompatibleProvider, "complete", boom)
+        ok, status, summary = cli_mod.probe_tool_calling(self._config())
+
+        assert ok is False
+        assert status == "error"
+        # Names the failure mode, not just the exception.
+        assert "every real turn will fail" in summary
+        assert "reasoning_effort: none" in summary
+
+    def test_an_unrelated_failure_is_not_dressed_up_as_the_tools_problem(self, monkeypatch):
+        from coding_agent.interface import cli as cli_mod
+
+        def boom(self, *a, **kw):
+            raise RuntimeError("Connection refused")
+
+        monkeypatch.setattr(cli_mod.OpenAICompatibleProvider, "complete", boom)
+        ok, status, summary = cli_mod.probe_tool_calling(self._config())
+
+        assert ok is False
+        assert "reasoning_effort" not in summary
+        assert "Connection refused" in summary
+
+    def test_a_working_gateway_reports_ok(self, monkeypatch):
+        from coding_agent.core.session import AssistantResponse, Usage
+        from coding_agent.interface import cli as cli_mod
+
+        monkeypatch.setattr(
+            cli_mod.OpenAICompatibleProvider, "complete",
+            lambda self, *a, **kw: AssistantResponse(text="OK", tool_calls=[], usage=Usage()),
+        )
+        ok, status, _ = cli_mod.probe_tool_calling(self._config())
+        assert (ok, status) == (True, "ok")
+
+    def test_the_probe_actually_carries_a_tools_array(self, monkeypatch):
+        """The whole point -- an empty tools list would reproduce the blind spot."""
+        from coding_agent.core.session import AssistantResponse, Usage
+        from coding_agent.interface import cli as cli_mod
+
+        seen = {}
+
+        def capture(self, messages, tools=None, **kw):
+            seen["tools"] = tools
+            return AssistantResponse(text="OK", tool_calls=[], usage=Usage())
+
+        monkeypatch.setattr(cli_mod.OpenAICompatibleProvider, "complete", capture)
+        cli_mod.probe_tool_calling(self._config())
+
+        assert seen["tools"], "probe sent no tools -- it would miss the very failure it exists for"
+        assert seen["tools"][0]["function"]["name"] == "yucode_probe"

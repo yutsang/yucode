@@ -1,0 +1,48 @@
+{
+  "licence_files": [
+    "OFL-NotoSans.txt",
+    "OFL-NotoSansSC.txt"
+  ],
+  "note": "Subsets of Google's Noto fonts, SIL OFL 1.1. Renamed so they cannot be confused with the upstream families. Hinting is kept deliberately: the goldens measure hinted, grid-fit advances, and an unhinted subset would make them derivable by arithmetic and so stop testing the thing they exist to test.",
+  "fonttools_version": "4.58.4",
+  "latin": {
+    "upstream": "Noto Sans (notofonts/latin-greek-cyrillic)",
+    "upstream_file": "NotoSans-Regular.ttf",
+    "upstream_sha256": "478c558ea716033cd60c03438f628dfa75694dcf6b5f6d505a2f05fd2b4f3823",
+    "licence": "SIL Open Font License 1.1 (see OFL-NotoSans.txt)",
+    "instanced_wght": null,
+    "subset_unicode_count": 145,
+    "subset_options": {
+      "layout_features": [],
+      "hinting": true,
+      "desubroutinize": true,
+      "notdef_outline": true,
+      "drop_tables": [
+        "DSIG"
+      ]
+    },
+    "renamed_to": "Yucode Golden Latin",
+    "output_sha256": "82d8c4bc6626ca2dd460ca966ff6e9db6097d00273a38f3ab5a9f424e7c1d30c",
+    "output_bytes": 19320
+  },
+  "cjk": {
+    "upstream": "Noto Sans SC (google/fonts ofl/notosanssc)",
+    "upstream_file": "NotoSansSC-VF.ttf",
+    "upstream_sha256": "a3041811a78c361b1de50f953c805e0244951c21c5bd412f7232ef0d899af0da",
+    "licence": "SIL Open Font License 1.1 (see OFL-NotoSansSC.txt)",
+    "instanced_wght": 400,
+    "subset_unicode_count": 145,
+    "subset_options": {
+      "layout_features": [],
+      "hinting": true,
+      "desubroutinize": true,
+      "notdef_outline": true,
+      "drop_tables": [
+        "DSIG"
+      ]
+    },
+    "renamed_to": "Yucode Golden CJK",
+    "output_sha256": "3316c816460e2470d2d0c271b5d37fe8fa389ce2c4630ffa79b811be72741f79",
+    "output_bytes": 21708
+  }
+}

@@ -1,0 +1,2418 @@
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import json
+import os
+import sys
+import time
+from contextlib import suppress
+from pathlib import Path
+from typing import Any
+
+from ..config import (
+    AppConfig,
+    ConfigError,
+    McpServerConfig,
+    add_mcp_server_to_config,
+    dump_yaml,
+    ensure_default_config,
+    load_app_config,
+    load_yaml,
+    remove_mcp_server_from_config,
+    resolve_config_path,
+)
+from ..core.errors import AgentError
+from ..core.providers import OpenAICompatibleProvider
+from ..core.runtime import AgentRuntime
+from ..memory.skills import list_skills
+from .bridge import BridgeServer
+from .render import (
+    BOLD,
+    DIM,
+    RESET,
+    THEME,
+    ProgressDisplay,
+    StreamingTextDisplay,
+    agent_label,
+    compact_tool_result_line,
+    compact_tool_start_label,
+    format_assistant_text,
+    format_cost_summary,
+    format_memory_display,
+    section_header,
+    startup_banner,
+    user_prompt,
+)
+from .render import (
+    error as render_error,
+)
+from .render import (
+    info as render_info,
+)
+from .render import (
+    success as render_success,
+)
+from .render import (
+    warning as render_warning,
+)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="yucode", description="YuCode coding agent CLI.")
+    parser.add_argument("--config", dest="config_path")
+    # Top-level flags so `yucode` (no subcommand) can accept --workspace etc.
+    parser.add_argument("--workspace", default=".", help="Workspace directory (default: current dir).")
+    parser.add_argument("--model", default=None, help="Override the chat model.")
+    parser.add_argument("--permission-mode", default=None,
+                        choices=["read-only", "workspace-write", "danger-full-access", "prompt", "allow"])
+    parser.set_defaults(handler=handle_default)
+    subparsers = parser.add_subparsers(dest="command", required=False)
+
+    _init_cfg = subparsers.add_parser("init-config", help="Interactive wizard to create/edit all settings in config.yml.")
+    _init_cfg.add_argument("--defaults", "-y", action="store_true", help="Write default config without prompting.")
+    _init_cfg.set_defaults(handler=handle_init_config)
+    subparsers.add_parser("show-config", help="Print the active config.").set_defaults(handler=handle_show_config)
+    subparsers.add_parser("config-path", help="Print the active config path.").set_defaults(handler=handle_config_path)
+    subparsers.add_parser("bridge", help="Start the JSONL bridge used by VS Code.").set_defaults(handler=handle_bridge)
+
+    trust_cmd = subparsers.add_parser(
+        "trust",
+        help="Trust (or revoke/list trust for) a workspace's repo-local .yucode/ hooks and MCP servers.",
+    )
+    trust_cmd.add_argument("--workspace", default=".", help="Workspace directory (default: current dir).")
+    trust_cmd.add_argument("--remove", action="store_true", help="Revoke trust for this workspace instead of granting it.")
+    trust_cmd.add_argument("--list", action="store_true", dest="list_trusted", help="List all trusted workspace directories.")
+    trust_cmd.set_defaults(handler=handle_trust)
+
+    init = subparsers.add_parser("init", help="Scaffold a new project directory with config and instruction files.")
+    init.add_argument("target", nargs="?", default=".", help="Target directory (default: current dir).")
+    init.set_defaults(handler=handle_init)
+
+    init_agents = subparsers.add_parser("init-agents", help="Scan the workspace and generate a starter AGENTS.md.")
+    init_agents.add_argument("target", nargs="?", default=".", help="Target directory (default: current dir).")
+    init_agents.add_argument("--force", action="store_true", help="Overwrite an existing AGENTS.md.")
+    init_agents.add_argument("--filename", default="AGENTS.md", help="Output filename (default: AGENTS.md).")
+    init_agents.set_defaults(handler=handle_init_agents)
+
+    init_memory = subparsers.add_parser("init-memory", help="Bootstrap a user-scope memory file from ~/.gitconfig and environment.")
+    init_memory.add_argument("--force", action="store_true", help="Overwrite an existing user-profile memory.")
+    init_memory.set_defaults(handler=handle_init_memory)
+
+    chat = subparsers.add_parser("chat", help="Run a coding-agent turn (or start interactive mode with no prompt).")
+    chat.add_argument("prompt", nargs="?", default=None)
+    chat.add_argument("--workspace", default=".")
+    chat.add_argument("--json", action="store_true", dest="json_output")
+    chat.add_argument("--model", default=None, help="Override the chat model.")
+    chat.add_argument("--allowed-tools", nargs="*", default=None, help="Restrict tools to this list.")
+    chat.add_argument("--permission-mode", default=None, choices=["read-only", "workspace-write", "danger-full-access", "prompt", "allow"])
+    chat.add_argument("--resume", default=None, metavar="SESSION_ID", help="Resume a saved session by ID.")
+    chat.add_argument("--output-format", default="text", choices=["text", "json"], help="Output format.")
+    chat.set_defaults(handler=handle_chat)
+
+    mcp_list = subparsers.add_parser("mcp-list", help="List configured MCP servers.")
+    mcp_list.add_argument("--workspace", default=".")
+    mcp_list.set_defaults(handler=handle_mcp_list)
+
+    mcp_add = subparsers.add_parser("mcp-add", help="Add an MCP server to .yucode/mcp.yml.")
+    mcp_add.add_argument("name", help="Unique server name.")
+    mcp_add.add_argument("mcp_command", metavar="command", help="Executable command (e.g. uvx, python).")
+    mcp_add.add_argument("args", nargs="*", default=[], help="Command arguments.")
+    mcp_add.add_argument("--transport", default="stdio", choices=["stdio", "sse", "http", "ws"])
+    mcp_add.add_argument("--workspace", default=".")
+    mcp_add.set_defaults(handler=handle_mcp_add)
+
+    mcp_remove = subparsers.add_parser("mcp-remove", help="Remove an MCP server from .yucode/mcp.yml.")
+    mcp_remove.add_argument("name", help="Server name to remove.")
+    mcp_remove.add_argument("--workspace", default=".")
+    mcp_remove.set_defaults(handler=handle_mcp_remove)
+
+    mcp_validate = subparsers.add_parser("mcp-validate", help="Validate configured MCP servers can connect.")
+    mcp_validate.add_argument("--workspace", default=".")
+    mcp_validate.set_defaults(handler=handle_mcp_validate)
+
+    mcp_preset = subparsers.add_parser("mcp-preset", help="Add a pre-built MCP server from the catalog.")
+    mcp_preset.add_argument("preset_name", nargs="?", default=None, help="Preset name (omit to list all).")
+    mcp_preset.add_argument("preset_args", nargs="*", default=[], help="Extra arguments for the preset.")
+    mcp_preset.add_argument("--workspace", default=".")
+    mcp_preset.set_defaults(handler=handle_mcp_preset)
+
+    skills = subparsers.add_parser("skills", help="List discovered skill files.")
+    skills.add_argument("--workspace", default=".")
+    skills.add_argument("--output-format", default="text", choices=["text", "json"])
+    skills.set_defaults(handler=handle_skills)
+
+    status = subparsers.add_parser("status", help="Show runtime status summary.")
+    status.add_argument("--output-format", default="text", choices=["text", "json"])
+    status.set_defaults(handler=handle_status)
+
+    system_prompt = subparsers.add_parser("system-prompt", help="Print the assembled system prompt.")
+    system_prompt.add_argument("--workspace", default=".", dest="cwd")
+    system_prompt.add_argument("--date", default=None, help="Override the current date (YYYY-MM-DD).")
+    system_prompt.add_argument("--output-format", default="text", choices=["text", "json"])
+    system_prompt.set_defaults(handler=handle_system_prompt)
+
+    version = subparsers.add_parser("version", help="Show YuCode version.")
+    version.add_argument("--output-format", default="text", choices=["text", "json"])
+    version.set_defaults(handler=handle_version)
+
+    doctor = subparsers.add_parser("doctor", help="Run preflight diagnostics and health checks.")
+    doctor.add_argument("--workspace", default=".")
+    doctor.add_argument("--output-format", default="text", choices=["text", "json"])
+    doctor.set_defaults(handler=handle_doctor)
+
+    serve = subparsers.add_parser("serve", help="Start the HTTP + SSE session server.")
+    serve.add_argument("--host", default="127.0.0.1")
+    serve.add_argument("--port", type=int, default=8080)
+    serve.add_argument("--workspace", default=".")
+    serve.set_defaults(handler=handle_serve)
+
+    eval_cmd = subparsers.add_parser(
+        "eval",
+        help="Run a prompt suite and capture tool calls / files read / final answers to JSON.",
+    )
+    eval_cmd.add_argument("--suite", required=True, help="Path to eval_prompts.yaml.")
+    eval_cmd.add_argument("--out", required=True, help="Output JSON file.")
+    eval_cmd.add_argument("--workspace", default=".")
+    eval_cmd.add_argument("--only", default=None, help="Comma-separated prompt IDs to run.")
+    eval_cmd.add_argument("--label", default="", help="Free-form label for the run (e.g. before/after).")
+    eval_cmd.set_defaults(handler=handle_eval)
+
+    return parser
+
+
+# ---------------------------------------------------------------------------
+# Handlers
+# ---------------------------------------------------------------------------
+
+def _prompt(label: str, current: Any, *, secret: bool = False, choices: list[str] | None = None) -> Any:
+    display = ("*" * min(len(str(current)), 8) + "\u2026") if secret and current else (repr(current) if not isinstance(current, str) else current)
+    hint = f" [{', '.join(choices)}]" if choices else ""
+    try:
+        raw = input(f"  {label}{hint} (current: {display}): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        raise
+    if raw == "":
+        return current
+    if choices and raw not in choices:
+        print(f"    Invalid choice. Keeping: {current}")
+        return current
+    if isinstance(current, bool):
+        return raw.lower() in ("true", "yes", "1", "y")
+    if isinstance(current, float):
+        try:
+            return float(raw)
+        except ValueError:
+            print(f"    Not a number. Keeping: {current}")
+            return current
+    if isinstance(current, int):
+        try:
+            return int(raw)
+        except ValueError:
+            print(f"    Not a number. Keeping: {current}")
+            return current
+    return raw
+
+
+_PROJECT_ENV_EXAMPLE = """\
+YUCODE_API_KEY=
+YUCODE_BASE_URL=
+YUCODE_MODEL=
+YUCODE_PROVIDER_NAME=
+YUCODE_DANGEROUS_MODE=0
+"""
+
+
+def _ensure_project_support_files(project_root: Path) -> list[Path]:
+    created: list[Path] = []
+
+    env_example = project_root / ".env.example"
+    if not env_example.exists():
+        env_example.write_text(_PROJECT_ENV_EXAMPLE, encoding="utf-8")
+        created.append(env_example)
+
+    gitignore = project_root / ".gitignore"
+    required_entries = [
+        ".env",
+        ".env.*",
+        "!.env.example",
+        ".yucode/settings.yml",
+        ".yucode/settings.json",
+        ".yucode/settings.local.yml",
+        ".yucode/settings.local.json",
+    ]
+    existing_lines: list[str] = []
+    if gitignore.exists():
+        existing_lines = gitignore.read_text(encoding="utf-8").splitlines()
+    missing = [entry for entry in required_entries if entry not in existing_lines]
+    if missing:
+        prefix = "\n" if existing_lines and existing_lines[-1] != "" else ""
+        with gitignore.open("a", encoding="utf-8") as handle:
+            handle.write(prefix)
+            if not existing_lines or "# Secrets / local config" not in existing_lines:
+                handle.write("# Secrets / local config\n")
+            for entry in missing:
+                handle.write(f"{entry}\n")
+        if gitignore not in created:
+            created.append(gitignore)
+
+    yucode_dir = project_root / ".yucode"
+    yucode_dir.mkdir(parents=True, exist_ok=True)
+    local_overlay = yucode_dir / "settings.local.yml"
+    if not local_overlay.exists():
+        local_overlay.write_text(
+            "provider:\n"
+            "  api_key: \"\"\n",
+            encoding="utf-8",
+        )
+        created.append(local_overlay)
+
+    return created
+
+
+def _has_configured_api_key(config_path: str | None, workspace: Path | None = None) -> bool:
+    try:
+        config = load_app_config(config_path, workspace=workspace)
+    except Exception:
+        return False
+    return bool(config.provider.api_key.strip())
+
+
+def _test_api_connection(config_path: str | None, workspace: Path | None = None) -> tuple[bool, str]:
+    ok, _, message = _probe_provider_connection(config_path, workspace=workspace, stream=False)
+    return ok, message
+
+
+def _probe_provider_connection(
+    config_path: str | None,
+    workspace: Path | None = None,
+    *,
+    stream: bool,
+) -> tuple[bool, str, str]:
+    try:
+        config = load_app_config(config_path, workspace=workspace)
+    except Exception as exc:  # noqa: BLE001
+        return False, "error", f"Could not load config: {exc}"
+
+    if not config.provider.api_key.strip():
+        return False, "error", "No API key configured via env or config."
+    if not config.provider.base_url.strip():
+        return False, "error", "No provider base_url configured."
+    if not config.provider.model.strip():
+        return False, "error", "No provider model configured."
+
+    # dataclasses.replace (not a manual field-by-field copy) so this probe
+    # can never silently drop a ProviderConfig field it doesn't know about
+    # (e.g. api_version/omit_params — an Azure-style gateway config would
+    # otherwise get probed against the wrong URL with a rejected temperature).
+    test_provider = dataclasses.replace(
+        config.provider,
+        stream=stream,
+        streaming_mode="stream" if stream else "no_stream",
+        temperature=0.0,
+    )
+    provider = OpenAICompatibleProvider(test_provider)
+    effective_url = provider._build_url()  # noqa: SLF001
+    mode_name = "Streaming" if stream else "Non-streaming"
+
+    events: list[dict[str, Any]] = []
+    try:
+        response = provider.complete(
+            [{"role": "user", "content": "Reply with exactly OK."}],
+            [],
+            stream_callback=events.append,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return False, "error", f"{mode_name} request to {effective_url} failed: {exc}"
+
+    text = (response.text or "").strip()
+    if text:
+        return True, "ok", f"{mode_name} request succeeded: {text[:80]}"
+    if response.tool_calls:
+        return True, "warning", f"{mode_name} request returned tool calls during smoke test."
+    warnings = [e.get("warning", "") for e in events if e.get("type") == "warning"]
+    if warnings:
+        summary = warnings[0]
+        if stream:
+            return False, "warning", (
+                f"{mode_name} request returned no usable text. {summary} "
+                "Try setting `provider.stream: false`."
+            )
+        return False, "warning", f"{mode_name} request returned no usable text. {summary}"
+    if stream:
+        return False, "warning", (
+            f"{mode_name} request to {effective_url} completed but returned no text or usage. "
+            "This provider may not support SSE streaming; try setting `provider.stream: false`."
+        )
+    return False, "warning", (
+        f"{mode_name} request to {effective_url} completed but returned no text."
+    )
+
+
+# A minimal, obviously-harmless tool. Its only job is to make the request carry
+# a `tools` array; the model is never expected to call it.
+_TOOL_PROBE_SCHEMA = [{
+    "type": "function",
+    "function": {
+        "name": "yucode_probe",
+        "description": "Connectivity probe. Do not call.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+}]
+
+
+def probe_tool_calling(config: AppConfig) -> tuple[bool, str, str]:
+    """Send one request that carries a tool definition.
+
+    The plain smoke test above passes an empty tools list, so it exercises a
+    request shape the agent itself never sends. That gap is not hypothetical:
+    on gpt-5.6 and later, a Chat Completions request carrying function tools is
+    rejected outright --
+
+        Function tools with reasoning_effort are not supported for
+        gpt-5.6-terra in /v1/chat/completions. To use function tools, use
+        /v1/responses or set reasoning_effort to 'none'.
+
+    -- and it fires even when the request omits `reasoning_effort`, because
+    those models reason by default. So a gateway can report a healthy
+    connection and still fail every real turn the moment a deployment is
+    upgraded. Since yucode speaks Chat Completions and sends tools on every
+    turn, that is exactly its shape.
+
+    A raised exception is only one of the two outcomes. ``_apply_self_heal``
+    recognises this same 400, pins ``reasoning_effort: none`` on the provider
+    instance and retries, so the usual outcome is a request that *succeeds*
+    with the model's reasoning silently switched off for the rest of the
+    session. Judging on the exception alone reported that as a clean "ok" and
+    the user never learned what the connection had cost them.
+    """
+    provider = OpenAICompatibleProvider(dataclasses.replace(
+        config.provider, stream=False, streaming_mode="no_stream",
+    ))
+    url = provider._build_url()  # noqa: SLF001
+    try:
+        provider.complete(
+            [{"role": "user", "content": "Reply with exactly OK."}],
+            _TOOL_PROBE_SCHEMA,
+        )
+    except Exception as exc:  # noqa: BLE001
+        detail = str(exc)
+        lowered = detail.lower()
+        if "reasoning_effort" in lowered and "tool" in lowered:
+            return False, "error", (
+                "The gateway rejects requests that carry tools — every real turn "
+                "will fail even though the plain connectivity check passes. "
+                "Set `provider.reasoning_effort: none`, or move to a deployment "
+                f"that accepts tools on this endpoint. Gateway said: {detail[:200]}"
+            )
+        return False, "error", f"Tool-calling request to {url} failed: {detail[:200]}"
+    # The heal leaves no other trace on a successful call: `complete()` returns
+    # an ordinary response and the correction is recorded only on the provider
+    # instance. Read it through getattr so doctor keeps working if the field
+    # ever moves; the companion test pins the name so the warning can't go
+    # quiet unnoticed.
+    if getattr(provider, "_learned_reasoning_effort_none", False):  # noqa: SLF001
+        return True, "warning", (
+            "Tools are accepted, but only after the gateway refused them "
+            "alongside reasoning: yucode pinned `reasoning_effort: none` and "
+            "retried. Real turns will connect, and this model will not reason "
+            "on any of them. Set `provider.reasoning_effort: none` to make that "
+            "explicit, or move to a deployment that accepts tools together with "
+            "reasoning (the Responses API, which yucode does not speak)."
+        )
+    return True, "ok", "Tool-calling request succeeded (tools are accepted on this endpoint)."
+
+
+def handle_init_config(args: argparse.Namespace) -> int:
+    path = resolve_config_path(args.config_path)
+    config_missing = not path.exists()
+    ensure_default_config(path)
+
+    # --defaults / -y: just ensure the file exists with defaults, skip the wizard
+    if getattr(args, "defaults", False):
+        if config_missing:
+            print(f"  Created default config at {path}")
+        else:
+            print(f"  Config already exists at {path} (unchanged)")
+        print("  Edit it directly or re-run without --defaults to use the wizard.")
+        return 0
+
+    raw: dict[str, Any] = {}
+    with suppress(Exception):
+        raw = load_yaml(path.read_text(encoding="utf-8")) or {}
+    if not isinstance(raw, dict):
+        raw = {}
+
+    created_support_files: list[Path] = []
+    if config_missing and path.parent.name == ".yucode":
+        created_support_files = _ensure_project_support_files(path.parent.parent)
+
+    print(f"\n\033[1mYuCode config wizard\033[0m  \u2192  {path}")
+    print("Press Enter to keep the current value, or type a new one.\n")
+    if created_support_files:
+        print("Created support files:")
+        for created in created_support_files:
+            print(f"  - {created}")
+        print()
+
+    try:
+        print("\033[36m\u2500\u2500 Provider \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\033[0m")
+        p = raw.setdefault("provider", {})
+        p["name"]        = _prompt("provider.name        (display name)",   p.get("name", ""))
+        p["api_key"]     = _prompt("provider.api_key     (your API key)",   p.get("api_key", ""), secret=True)
+        p["base_url"]    = _prompt("provider.base_url    (API endpoint)",   p.get("base_url", ""))
+        p["model"]       = _prompt("provider.model       (model name)",     p.get("model", ""))
+        p["chat_path"]   = _prompt("provider.chat_path",                    p.get("chat_path", "/chat/completions"))
+        p["append_chat_path"] = _prompt(
+            "provider.append_chat_path (append chat_path to base_url)",
+            p.get("append_chat_path", True),
+            choices=["true", "false"],
+        )
+        p["verify_tls"]  = _prompt("provider.verify_tls  (verify TLS certificates)", p.get("verify_tls", True), choices=["true", "false"])
+        p["stream"]      = _prompt("provider.stream",                       p.get("stream", True),   choices=["true", "false"])
+        p["temperature"] = _prompt("provider.temperature",                  p.get("temperature", 0.0))
+
+        print("\n\033[36m\u2500\u2500 Runtime \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\033[0m")
+        r = raw.setdefault("runtime", {})
+        r["permission_mode"]       = _prompt("runtime.permission_mode", r.get("permission_mode", "workspace-write"),
+                                             choices=["read-only", "workspace-write", "danger-full-access", "prompt", "allow"])
+        r["max_iterations"]        = _prompt("runtime.max_iterations",        r.get("max_iterations", 12))
+        r["shell_timeout_seconds"] = _prompt("runtime.shell_timeout_seconds", r.get("shell_timeout_seconds", 30))
+        r["include_git_context"]   = _prompt("runtime.include_git_context",   r.get("include_git_context", True),  choices=["true", "false"])
+        r["config_dump_in_prompt"] = _prompt("runtime.config_dump_in_prompt", r.get("config_dump_in_prompt", True), choices=["true", "false"])
+
+        print("\n\033[36m\u2500\u2500 VS Code bridge \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\033[0m")
+        v = raw.setdefault("vscode", {})
+        v["auto_start_backend"]       = _prompt("vscode.auto_start_backend",       v.get("auto_start_backend", True),  choices=["true", "false"])
+        v["python_command"]           = _prompt("vscode.python_command",           v.get("python_command", ""))
+        v["startup_timeout_seconds"]  = _prompt("vscode.startup_timeout_seconds",  v.get("startup_timeout_seconds", 15))
+
+        print("\n\033[36m\u2500\u2500 Sandbox \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\033[0m")
+        s = raw.setdefault("sandbox", {})
+        s["enabled"]          = _prompt("sandbox.enabled          (null=auto)", s.get("enabled", None),
+                                        choices=["null", "true", "false"])
+        if s["enabled"] == "null":
+            s["enabled"] = None
+        s["filesystem_mode"]  = _prompt("sandbox.filesystem_mode",              s.get("filesystem_mode", "workspace-only"),
+                                        choices=["workspace-only", "read-only", "unrestricted"])
+        s["network_isolation"] = _prompt("sandbox.network_isolation (null=auto)", s.get("network_isolation", None),
+                                         choices=["null", "true", "false"])
+        if s["network_isolation"] == "null":
+            s["network_isolation"] = None
+
+    except KeyboardInterrupt:
+        print("\n\nCancelled \u2014 no changes saved.")
+        return 1
+
+    path.write_text(dump_yaml(raw), encoding="utf-8")
+    print(f"\n\033[32m\u2713 Config saved to {path}\033[0m\n")
+    ok, message = _test_api_connection(args.config_path, workspace=Path.cwd().resolve())
+    if ok:
+        print(render_success(f"API check passed. {message}"))
+    else:
+        print(render_warning(f"API check failed: {message}"))
+        print(render_info("You can keep secrets in YUCODE_API_KEY or .yucode/settings.local.yml instead of tracked files."))
+        print()
+    return 0
+
+
+def handle_show_config(args: argparse.Namespace) -> int:
+    path = ensure_default_config(resolve_config_path(args.config_path))
+    print(path.read_text(encoding="utf-8"), end="")
+    return 0
+
+
+def handle_config_path(args: argparse.Namespace) -> int:
+    print(resolve_config_path(args.config_path))
+    return 0
+
+
+def handle_bridge(args: argparse.Namespace) -> int:
+    return BridgeServer().serve_forever()
+
+
+def handle_trust(args: argparse.Namespace) -> int:
+    from ..config.trust import list_trusted_workspaces, trust_workspace, untrust_workspace
+
+    if getattr(args, "list_trusted", False):
+        trusted = list_trusted_workspaces()
+        if not trusted:
+            print("No trusted workspace directories.")
+        else:
+            for entry in trusted:
+                print(entry)
+        return 0
+
+    workspace = Path(args.workspace).resolve()
+    if args.remove:
+        untrust_workspace(workspace)
+        render_success(
+            f"Revoked trust for {workspace} — its repo-local .yucode/ hooks and MCP servers will no "
+            "longer be applied until trusted again."
+        )
+    else:
+        trust_workspace(workspace)
+        render_success(
+            f"Trusted {workspace} — its repo-local .yucode/settings*.yml hooks and MCP servers will "
+            "now be applied. Run `yucode trust --remove` to revoke."
+        )
+    return 0
+
+
+_DEFAULT_YUCODE_MD = """\
+# Project Instructions
+
+<!-- YuCode reads this file to understand project-specific conventions. -->
+
+## Overview
+
+Describe your project here.
+
+## Conventions
+
+- Preferred language / framework:
+- Code style:
+- Testing approach:
+"""
+
+_DEFAULT_INIT_CONFIG = """\
+provider:
+  name: ""
+  type: openai_compatible
+  base_url: ""
+  api_key: ""
+  model: ""
+  chat_path: /chat/completions
+  append_chat_path: true
+  verify_tls: true
+  stream: true
+  temperature: 0.0
+  extra_headers: {}
+  extra_body: {}
+runtime:
+  permission_mode: workspace-write
+  max_iterations: 32
+  max_worker_steps: 20
+  max_coordinator_retries: 3
+  orchestration_mode: auto
+  parallel_workers: false
+  shell_timeout_seconds: 30
+  include_git_context: true
+  config_dump_in_prompt: true
+tools:
+  allowed: []
+  disabled: []
+mcp:
+  servers: []
+hooks:
+  pre_tool_use: []
+  post_tool_use: []
+plugins:
+  enabled_plugins: []
+  extra_dirs: []
+sandbox:
+  enabled: null
+  namespace_restrictions: null
+  network_isolation: null
+  filesystem_mode: workspace-only
+  allowed_mounts: []
+instruction_files: []
+"""
+
+
+def handle_init(args: argparse.Namespace) -> int:
+    from ..config.settings import state_dir
+    target = Path(args.target).resolve()
+    target.mkdir(parents=True, exist_ok=True)
+
+    home_state = state_dir(target)
+    home_state.mkdir(parents=True, exist_ok=True)
+    print(f"  State dir {home_state}")
+
+    config_path = home_state / "settings.yml"
+    if not config_path.exists():
+        config_path.write_text(_DEFAULT_INIT_CONFIG, encoding="utf-8")
+        print(f"  Created {config_path}")
+    else:
+        print(f"  Exists  {config_path}")
+
+    instruction_path = target / "YUCODE.md"
+    if not instruction_path.exists():
+        instruction_path.write_text(_DEFAULT_YUCODE_MD, encoding="utf-8")
+        print(f"  Created {instruction_path}")
+    else:
+        print(f"  Exists  {instruction_path}")
+
+    mcp_path = home_state / "mcp.yml"
+    if not mcp_path.exists():
+        mcp_path.write_text("servers: []\n", encoding="utf-8")
+        print(f"  Created {mcp_path}")
+    else:
+        print(f"  Exists  {mcp_path}")
+
+    skills_dir = home_state / "skills"
+    skills_dir.mkdir(parents=True, exist_ok=True)
+
+    for created in _ensure_project_support_files(target):
+        if created not in {config_path, mcp_path, instruction_path}:
+            print(f"  Created {created}")
+
+    print(f"\n  Project initialized at {target}")
+    print("\n  Getting started:")
+    print("    1. Set YUCODE_API_KEY in .env or edit ~/.yucode/settings.yml")
+    print("       (or run: yucode init-config --defaults  to write a template config)")
+    print("    2. Edit YUCODE.md to describe your project conventions")
+    print(f"    3. Run: yucode chat --workspace {target}")
+    print()
+    print("  Note: do NOT run `pip install .` from this directory.")
+    print("        To install/update yucode, run: pip install yucode-agent")
+    print()
+    return 0
+
+
+def handle_init_agents(args: argparse.Namespace) -> int:
+    from .init_workspace import detect_profile, write_agents_md
+
+    target = Path(args.target).resolve()
+    if not target.is_dir():
+        print(render_warning(f"`{target}` is not a directory."))
+        return 1
+    try:
+        path, _ = write_agents_md(target, force=args.force, filename=args.filename)
+    except FileExistsError as exc:
+        print(render_warning(str(exc)))
+        return 1
+    profile = detect_profile(target)
+    print(render_success(f"Wrote {path}"))
+    if profile.languages:
+        print(f"  Detected: {', '.join(profile.languages)}"
+              + (f"  +{', '.join(profile.frameworks)}" if profile.frameworks else ""))
+    if profile.test_command:
+        print(f"  Test command:  {profile.test_command}")
+    if profile.build_command:
+        print(f"  Build command: {profile.build_command}")
+    print("\n  Edit the file and add anything the agent should always know about this repo.")
+    return 0
+
+
+def handle_init_memory(args: argparse.Namespace) -> int:
+    from .memory_bootstrap import bootstrap_user_profile
+
+    try:
+        entry, was_new = bootstrap_user_profile(Path.cwd().resolve(), force=args.force)
+    except FileExistsError as exc:
+        print(render_warning(str(exc)))
+        return 1
+    action = "Wrote" if was_new else "Updated"
+    print(render_success(f"{action} {entry.path}"))
+    print(f"  Memory `{entry.name}` saved to user scope.")
+    print(f"  Body:\n{entry.body[:400]}{'...' if len(entry.body) > 400 else ''}")
+    return 0
+
+
+def _ensure_api_key(config_path: str | None) -> bool:
+    if _has_configured_api_key(config_path, workspace=Path.cwd().resolve()):
+        return True
+    print(render_warning("No API key configured."))
+    print(render_info("Run  yucode init-config  to set your provider, or export YUCODE_API_KEY.\n"))
+    try:
+        answer = input(f"  Run the config wizard now? {DIM}[Y/n]:{RESET} ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print(f"\n{render_info('Cancelled.')}")
+        return False
+    if answer in ("", "y", "yes"):
+        import argparse as _ap
+        fake_args = _ap.Namespace(config_path=config_path)
+        handle_init_config(fake_args)
+        return _has_configured_api_key(config_path, workspace=Path.cwd().resolve())
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Chat handler
+# ---------------------------------------------------------------------------
+
+class _InteractiveEventHandler:
+    """Stateful event handler with a two-line rolling progress window.
+
+    At most two lines are visible during tool execution:
+      Line 1 (done):  ✔ web_search  3 results
+      Line 2 (doing): ⠹ web_fetch: https://example.com…
+
+    When a tool finishes and a new one starts, line 2 slides up to
+    line 1 and the new tool takes line 2.  The display is erased before
+    assistant text begins streaming.
+    """
+
+    def __init__(self, *, streaming: bool = True) -> None:
+        self.streaming = streaming
+        self._progress = ProgressDisplay()
+        self._stream = StreamingTextDisplay()
+        self._turn_start: float = 0
+        self._current_iteration = 0
+        self._text_started = False
+        self._in_coordinator: bool = False
+        self._tool_calls_this_turn: bool = False  # any tool call in current turn
+        self._text_buf: str = ""                  # buffered assistant text, pending flush
+        self._worker_label_prefix: str = ""       # set per worker for step-progress label
+
+    def __call__(self, event: dict[str, Any]) -> None:
+        etype = event.get("type", "")
+        if etype == "provider_info":
+            pass
+        elif etype == "phase_started":
+            self._in_coordinator = True
+            phase = event.get("phase", "")
+            attempt = event.get("attempt")
+            label = phase.replace("_", " ").title()
+            if attempt:
+                label += f" (attempt {attempt})"
+            self._progress.set_thinking(f"Phase: {label}")
+        elif etype == "worker_spawned":
+            role = event.get("role", "?")
+            task = event.get("task", "")[:60]
+            idx = event.get("task_index", 0) + 1
+            total = event.get("total_tasks", 1)
+            counter = f" {idx}/{total}" if total > 1 else ""
+            self._worker_label_prefix = f"Worker [{role}{counter}]"
+            self._progress.set_thinking(f"{self._worker_label_prefix}: {task}")
+        elif etype == "validation_result":
+            self._progress.stop()
+            passed = event.get("passed", False)
+            attempt = event.get("attempt", "?")
+            if passed:
+                print(render_success(f"Validation passed (attempt {attempt})"))
+            else:
+                feedback = event.get("feedback", "")[:120]
+                print(render_warning(f"Validation failed (attempt {attempt}): {feedback}"))
+        elif etype == "retry_started":
+            attempt = event.get("attempt", "?")
+            self._progress.set_thinking(f"Retrying (attempt {attempt})")
+        elif etype == "iteration_started":
+            self._current_iteration = event.get("iteration", 1)
+            if self._current_iteration == 1 and not self._in_coordinator:
+                # Only reset turn state at the top level; inside a coordinator
+                # worker this would wrongly clear _text_started and cause the
+                # agent label to be printed mid-worker output.
+                self._turn_start = time.monotonic()
+                self._text_started = False
+                self._tool_calls_this_turn = False
+                self._text_buf = ""
+            if not self._in_coordinator:
+                self._progress.set_thinking("Thinking")
+            elif getattr(self, "_worker_label_prefix", None):
+                # Surface step progress inside a worker so the user can see the
+                # worker is alive and on which iteration, not a frozen spinner.
+                self._progress.set_thinking(
+                    f"{self._worker_label_prefix} — step {self._current_iteration}"
+                )
+        elif etype == "tool_call":
+            # Close any in-flight streamed text so the spinner has a clean line.
+            self._stream.finalize()
+            name = event.get("name", "?")
+            arguments = event.get("arguments", "{}")
+            label = compact_tool_start_label(name, arguments)
+            # Discard any text buffered before this tool call (intermediate reasoning).
+            # The final response will be printed by the chat loop from summary.final_text.
+            self._tool_calls_this_turn = True
+            self._text_buf = ""
+            self._text_started = False
+            self._progress.start_tool(label)
+        elif etype == "tool_result":
+            name = event.get("name", "?")
+            content = event.get("content", "")
+            _s = content.lstrip()
+            is_err = _s.startswith('{\n  "error"') or _s.startswith('{"error"')
+            result_line = compact_tool_result_line(name, content, is_error=is_err)
+            self._progress.finish_tool(result_line)
+        elif etype == "assistant_delta":
+            delta = event.get("delta", "")
+            if not delta:
+                pass
+            elif self._in_coordinator or self._tool_calls_this_turn:
+                # Stream intermediate reasoning visibly (was previously dropped).
+                # Visually distinct (dim 💭 prefix) so it's not confused with
+                # the final polished answer printed at end-of-turn.
+                self._progress.stop()
+                self._stream.feed(delta)
+            else:
+                # Buffer text until we know whether tool calls will follow.
+                # Flushed in the `completed` handler if no tool calls occurred.
+                self._text_buf += delta
+        elif etype == "dedup_limit":
+            self._progress.stop()
+            tool = event.get("tool", "?")
+            blocks = event.get("blocks_this_turn", 1)
+            msg = f"Repeated call blocked: {tool}"
+            if blocks > 1:
+                msg += f" ({blocks}× this turn — agent may be stuck)"
+            print(render_warning(msg), file=sys.stderr)
+        elif etype == "stuck_exit":
+            self._progress.stop()
+            tool = event.get("tool", "?")
+            blocks = event.get("blocks", 0)
+            print(render_warning(
+                f"Agent stuck on `{tool}` ({blocks}× blocked) — force-stopped.\n"
+                "  Tip: rephrase your request, use /clear to reset, or break the task into smaller steps."
+            ), file=sys.stderr)
+            print()
+        elif etype == "compaction":
+            self._progress.stop()
+            removed = event.get("removed", 0)
+            print(render_info(f"Compacted {removed} messages to free context"))
+        elif etype == "auto_compaction":
+            self._progress.stop()
+            removed = event.get("removed", 0)
+            tokens = event.get("trigger_input_tokens", 0)
+            print(render_info(f"Auto-compacted {removed} messages ({tokens:,} input tokens)"))
+        elif etype == "usage":
+            pass
+        elif etype == "completed":
+            self._stream.finalize()
+            self._progress.stop()
+            was_coordinator = self._in_coordinator
+            self._in_coordinator = False
+            self._worker_label_prefix = ""
+            # Flush buffered text — only present when no tool calls occurred this turn.
+            if self._text_buf and not was_coordinator:
+                print(agent_label(), end="")
+                print(format_assistant_text(self._text_buf))
+                self._text_started = True
+                self._text_buf = ""
+            print()
+
+
+def _cli_event_callback(event: dict[str, Any]) -> None:
+    """Single-turn event callback — same two-line rolling display."""
+    progress = _cli_event_callback._progress  # type: ignore[attr-defined]
+    etype = event.get("type", "")
+    if etype == "phase_started":
+        phase = event.get("phase", "")
+        attempt = event.get("attempt")
+        label = phase.replace("_", " ").title()
+        if attempt:
+            label += f" (attempt {attempt})"
+        progress.set_thinking(f"Phase: {label}")
+    elif etype == "worker_spawned":
+        role = event.get("role", "?")
+        task = event.get("task", "")[:60]
+        idx = event.get("task_index", 0) + 1
+        total = event.get("total_tasks", 1)
+        counter = f" {idx}/{total}" if total > 1 else ""
+        progress.set_thinking(f"Worker [{role}{counter}]: {task}")
+    elif etype == "validation_result":
+        progress.stop()
+        passed = event.get("passed", False)
+        attempt = event.get("attempt", "?")
+        if passed:
+            print(render_success(f"Validation passed (attempt {attempt})"))
+        else:
+            feedback = event.get("feedback", "")[:120]
+            print(render_warning(f"Validation failed (attempt {attempt}): {feedback}"))
+    elif etype == "retry_started":
+        attempt = event.get("attempt", "?")
+        progress.set_thinking(f"Retrying (attempt {attempt})")
+    elif etype == "iteration_started":
+        # Show "Thinking" spinner between tool results and the next LLM response
+        # so the user knows the agent is still active (not hung).
+        progress.set_thinking("Thinking")
+    elif etype == "tool_call":
+        # Finalize any in-flight streaming text so it doesn't bleed into spinner.
+        _cli_event_callback._stream.finalize()  # type: ignore[attr-defined]
+        name = event.get("name", "?")
+        arguments = event.get("arguments", "{}")
+        label = compact_tool_start_label(name, arguments)
+        progress.start_tool(label)
+    elif etype == "dedup_limit":
+        progress.stop()
+        tool = event.get("tool", "?")
+        blocks = event.get("blocks_this_turn", 1)
+        msg = f"Repeated call blocked: {tool}"
+        if blocks > 1:
+            msg += f" ({blocks}× this turn)"
+        print(render_warning(msg), file=sys.stderr)
+    elif etype == "stuck_exit":
+        progress.stop()
+        tool = event.get("tool", "?")
+        blocks = event.get("blocks", 0)
+        print(render_warning(
+            f"Agent stuck on `{tool}` ({blocks}× blocked) — force-stopped.\n"
+            "  Tip: rephrase your request or break the task into smaller steps."
+        ), file=sys.stderr)
+        print()
+    elif etype == "tool_result":
+        name = event.get("name", "?")
+        content = event.get("content", "")
+        _s = content.lstrip()
+        is_err = _s.startswith('{\n  "error"') or _s.startswith('{"error"')
+        result_line = compact_tool_result_line(name, content, is_error=is_err)
+        progress.finish_tool(result_line)
+    elif etype == "auto_compaction":
+        progress.stop()
+        removed = event.get("removed", 0)
+        tokens = event.get("trigger_input_tokens", 0)
+        print(render_info(f"Auto-compacted {removed} messages ({tokens:,} input tokens)"))
+    elif etype == "assistant_delta":
+        # Stream the model's intermediate text so users can see reasoning, not
+        # just tool-call labels. Stops the spinner so the text isn't clobbered.
+        delta = event.get("delta", "")
+        if delta:
+            progress.stop()
+            _cli_event_callback._stream.feed(delta)  # type: ignore[attr-defined]
+    elif etype == "completed":
+        _cli_event_callback._stream.finalize()  # type: ignore[attr-defined]
+        progress.stop()
+        print()
+
+_cli_event_callback._progress = ProgressDisplay()  # type: ignore[attr-defined]
+_cli_event_callback._stream = StreamingTextDisplay()  # type: ignore[attr-defined]
+
+
+def handle_eval(args: argparse.Namespace) -> int:
+    from .eval import run as _eval_run
+    argv = [
+        "--suite", str(args.suite),
+        "--out", str(args.out),
+        "--workspace", str(args.workspace),
+    ]
+    if getattr(args, "only", None):
+        argv += ["--only", str(args.only)]
+    if getattr(args, "label", None):
+        argv += ["--label", str(args.label)]
+    if getattr(args, "config_path", None):
+        argv += ["--config-path", str(args.config_path)]
+    return _eval_run(argv)
+
+
+def handle_default(args: argparse.Namespace) -> int:
+    """Entry point for bare `yucode` with no subcommand — start interactive mode."""
+    if not _ensure_api_key(args.config_path):
+        return 1
+    import argparse as _ap
+    interactive_args = _ap.Namespace(
+        workspace=getattr(args, "workspace", "."),
+        config_path=args.config_path,
+        resume=None,
+        model=getattr(args, "model", None),
+        allowed_tools=None,
+        permission_mode=getattr(args, "permission_mode", None),
+    )
+    return _run_interactive(interactive_args)
+
+
+def handle_chat(args: argparse.Namespace) -> int:
+    if not _ensure_api_key(args.config_path):
+        return 1
+    if args.prompt is None:
+        # Matches the chat subcommand's own help text ("... or start
+        # interactive mode with no prompt") — same setup as bare `yucode`.
+        return handle_default(args)
+    return _run_single_turn(args)
+
+
+def _apply_cli_overrides(config: Any, args: argparse.Namespace) -> Any:
+    from ..config import ToolOptions
+    changes: dict[str, Any] = {}
+    if getattr(args, "model", None):
+        # dataclasses.replace (not a manual field-by-field copy) so a --model
+        # override can never silently drop a ProviderConfig field it doesn't
+        # know about (e.g. omit_params/api_version — the workbench gateway
+        # setup breaks silently if either is lost on a model override).
+        changes["provider"] = dataclasses.replace(config.provider, model=args.model)
+    if getattr(args, "permission_mode", None):
+        # dataclasses.replace (not a manual field-by-field copy) so this can
+        # never silently drop a RuntimeOptions field it doesn't enumerate --
+        # the previous manual reconstruction here had already dropped
+        # compact_strategy/error_strategy on any --permission-mode override.
+        changes["runtime"] = dataclasses.replace(
+            config.runtime, permission_mode=args.permission_mode,
+        )
+    if getattr(args, "allowed_tools", None) is not None:
+        changes["tools"] = ToolOptions(
+            allowed=list(args.allowed_tools),
+            disabled=list(config.tools.disabled),
+        )
+    if not changes:
+        return config
+    return AppConfig(
+        provider=changes.get("provider", config.provider),
+        runtime=changes.get("runtime", config.runtime),
+        tools=changes.get("tools", config.tools),
+        mcp=config.mcp, vscode=config.vscode,
+        instruction_files=config.instruction_files,
+        hooks=config.hooks, plugins=config.plugins, sandbox=config.sandbox,
+    )
+
+
+def _try_auto_resume(workspace: Path, config: Any) -> Any:
+    """Load the latest session if auto_resume_latest is enabled."""
+    if not config.runtime.auto_resume_latest:
+        return None
+    from ..core.session import Session
+    latest_path = Session.sessions_dir(workspace) / "latest.json"
+    if not latest_path.is_file():
+        return None
+    try:
+        return Session.load(latest_path)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _auto_save(runtime: AgentRuntime) -> None:
+    """Save the current session as 'latest' for cross-chat continuity."""
+    if not runtime.config.runtime.auto_save_session:
+        return
+    with suppress(Exception):
+        runtime.save_session("latest")
+
+
+# TurnSummary carries no stop reason, so the only in-band signal a caller has
+# is the marker `run_turn` writes into the final text on each abnormal exit
+# (core/runtime.py: provider error / dedup-stuck force-exit / budget or
+# iteration exhaustion).
+#
+# Position matters, not mere presence. `run_turn` writes the provider-error
+# marker as the WHOLE final text and the other three as the LAST paragraph;
+# a substring search anywhere in the text turned any answer that merely talks
+# about those messages -- "what does `Reached the maximum number of iterations`
+# mean?" -- into a non-zero exit code, i.e. a false CI failure on a run that
+# succeeded. Anchoring costs nothing and removes the whole class.
+#
+# `[INCOMPLETE:` is a prefix too: the coordinator prepends it to the composed
+# answer (core/coordinator.py) and agent_tool writes the same prefix for a
+# sub-agent that hit its step limit. Anchoring it here rather than in the
+# last-paragraph group is what makes it visible at all -- it is the FIRST
+# paragraph, so the trailing-paragraph check never saw it and headless exited 0
+# on output the harness had itself labelled partial.
+_STOP_REASON_PREFIX_MARKERS = (
+    ("[Provider error:", "provider_error"),
+    ("[INCOMPLETE:", "incomplete"),
+)
+_STOP_REASON_LAST_PARAGRAPH_MARKERS = (
+    ("[Stopped:", "stuck"),
+    ("[Note: Reached the maximum number of tool call budget", "max_tool_calls"),
+    ("[Note: Reached the maximum number of iterations", "max_iterations"),
+)
+
+# Stop reasons that mean "this run did not finish the job" — headless callers
+# (CI) must see a non-zero exit for these.
+_FAILURE_STOP_REASONS = frozenset({
+    "provider_error", "stuck", "max_tool_calls", "max_iterations", "empty_response",
+    "incomplete",
+})
+
+
+def _stop_reason(summary: Any) -> str:
+    """Why the turn ended. `end_turn` = the model stopped on its own."""
+    text = summary.final_text or ""
+    for marker, reason in _STOP_REASON_PREFIX_MARKERS:
+        if text.startswith(marker):
+            return reason
+    # run_turn appends its stop marker as a trailing `\n\n[...]` paragraph.
+    last_paragraph = text.rstrip().rpartition("\n\n")[2].lstrip()
+    if last_paragraph.endswith("]"):
+        for marker, reason in _STOP_REASON_LAST_PARAGRAPH_MARKERS:
+            if last_paragraph.startswith(marker):
+                return reason
+    if not text.strip() and summary.usage.total_tokens() == 0:
+        return "empty_response"
+    return "end_turn"
+
+
+def _run_single_turn(args: argparse.Namespace) -> int:
+    from .commands import InputKind, parse_input
+
+    parsed = parse_input(args.prompt, Path(args.workspace).resolve())
+    if parsed.kind != InputKind.CHAT:
+        return _dispatch_slash(parsed, args)
+
+    workspace = Path(args.workspace).resolve()
+    config = load_app_config(args.config_path, workspace=workspace)
+    config = _apply_cli_overrides(config, args)
+
+    session = None
+    if getattr(args, "resume", None):
+        from ..core.session import Session
+        try:
+            session = Session.load_from_workspace(workspace, args.resume)
+        except FileNotFoundError:
+            print(render_error(f"Session `{args.resume}` not found."), file=sys.stderr)
+            return 1
+    elif config.runtime.auto_resume_latest:
+        session = _try_auto_resume(workspace, config)
+
+    prompter = InteractivePermissionPrompter() if config.runtime.permission_mode == "prompt" else None
+    runtime = AgentRuntime(workspace, config, session=session, permission_prompter=prompter)
+
+    use_json = getattr(args, "json_output", False) or getattr(args, "output_format", "text") == "json"
+    if use_json:
+        events: list[dict[str, object]] = []
+        summary = runtime.orchestrate(parsed.effective_prompt, event_callback=events.append)
+        _auto_save(runtime)
+        stop_reason = _stop_reason(summary)
+        usage = summary.usage.to_dict()
+        print(json.dumps({
+            "final_text": summary.final_text,
+            "stop_reason": stop_reason,
+            "session_id": runtime.session.session_id,
+            "iterations": summary.iterations,
+            "usage": {**usage, "total_tokens": summary.usage.total_tokens()},
+            # No cost model exists in this codebase, so no total_cost_usd is
+            # emitted rather than a made-up 0.0. This flag says the token
+            # counts themselves are untrustworthy (provider reported none).
+            "usage_is_incomplete": summary.usage.total_tokens() == 0,
+            "events": events,
+        }, indent=2))
+    else:
+        _cli_event_callback._progress = ProgressDisplay()  # type: ignore[attr-defined]
+        summary = runtime.orchestrate(parsed.effective_prompt, event_callback=_cli_event_callback)
+        _cli_event_callback._progress.stop()  # type: ignore[attr-defined]
+        _auto_save(runtime)
+        stop_reason = _stop_reason(summary)
+        if stop_reason == "empty_response":
+            print(render_warning(
+                "The provider returned an empty response with 0 tokens.\n"
+                "  This usually means your provider configuration is wrong.\n"
+                "  Checklist:\n"
+                "    - Is YUCODE_API_KEY set (or api_key in settings.yml)?\n"
+                "    - Is provider.base_url correct?\n"
+                "    - Is provider.append_chat_path correct for your endpoint?\n"
+                "    - Does this environment need provider.verify_tls: false?\n"
+                "    - Is provider.model a valid model name for your provider?\n"
+                "    - Does your provider support streaming? (try setting provider.stream: false)\n"
+                "  Run `yucode doctor --workspace .` for diagnostics."
+            ), file=sys.stderr)
+        print(format_assistant_text(summary.final_text))
+        print()
+        print(format_cost_summary(summary.usage.to_dict()))
+    return 1 if stop_reason in _FAILURE_STOP_REASONS else 0
+
+
+_SLASH_COMMANDS = [
+    "/help", "/status", "/config", "/tools", "/mcp", "/skills",
+    "/clear", "/exit", "/quit", "/compact", "/diff", "/memory",
+    "/resume", "/permissions", "/branch", "/commit", "/plugins",
+    "/agents", "/save", "/metrics", "/cost", "/pr", "/log",
+    "/worktree", "/stash", "/export", "/model", "/version",
+]
+
+
+_AT_HIDDEN = frozenset({"__pycache__", ".git", ".DS_Store", ".mypy_cache", ".ruff_cache", ".pytest_cache"})
+
+
+# Module constant (not an inline os.name check) so tests can flip it without
+# monkeypatching the global os module — patching os.name to "nt" on POSIX
+# breaks pathlib itself (Path() would try to build WindowsPath).
+_IS_WINDOWS = os.name == "nt"
+
+
+def _normalize_pasted_text(text: str) -> str:
+    """Clipboard text arrives with \\r\\n on Windows; buffers want \\n."""
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _read_windows_clipboard() -> str:
+    """Read CF_UNICODETEXT from the Windows clipboard via ctypes — stdlib
+    only, no pyperclip/pywin32 (locked-down boxes can't install them).
+    Returns "" on any failure; pasting nothing beats crashing the REPL."""
+    import ctypes
+    CF_UNICODETEXT = 13
+    try:
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        if not user32.OpenClipboard(None):
+            return ""
+        try:
+            handle = user32.GetClipboardData(CF_UNICODETEXT)
+            if not handle:
+                return ""
+            pointer = kernel32.GlobalLock(handle)
+            if not pointer:
+                return ""
+            try:
+                return ctypes.wstring_at(pointer)
+            finally:
+                kernel32.GlobalUnlock(handle)
+        finally:
+            user32.CloseClipboard()
+    except Exception:  # noqa: BLE001 — clipboard access must never kill the REPL
+        return ""
+
+
+def _make_pt_session(workspace: Path) -> Any:
+    """Build the interactive PromptSession, or None if prompt_toolkit isn't installed.
+
+    prompt_toolkit is a pure-Python dependency but some locked-down deployments
+    (no admin, pip may be fully blocked) won't have it on the box. Callers
+    must fall back to plain input() when this returns None — see _run_interactive.
+    """
+    try:
+        from prompt_toolkit import PromptSession
+        from prompt_toolkit.completion import Completer, Completion
+        from prompt_toolkit.history import FileHistory
+        from prompt_toolkit.key_binding import KeyBindings
+    except ImportError:
+        return None
+
+    class _YuCompleter(Completer):
+        def get_completions(self, document, complete_event):
+            text = document.text_before_cursor
+            # Slash commands — only valid on the first line
+            first_line = text.split("\n")[0]
+            if first_line.startswith("/") and "\n" not in text:
+                for cmd in _SLASH_COMMANDS:
+                    if cmd.startswith(first_line):
+                        yield Completion(cmd[len(first_line):], display=cmd)
+                return
+            # @file paths — complete the most recent @-token
+            at_idx = text.rfind("@")
+            if at_idx == -1:
+                return
+            partial = text[at_idx + 1:]
+            if "/" in partial:
+                sub_dir = partial.rsplit("/", 1)[0]
+                parent = workspace / sub_dir
+                prefix_used = sub_dir + "/"
+            else:
+                parent = workspace
+                prefix_used = ""
+            try:
+                entries = sorted(parent.iterdir()) if parent.is_dir() else []
+            except OSError:
+                return
+            stem = partial[len(prefix_used):]
+            for entry in entries:
+                # Skip hidden/noise entries unless the user explicitly typed a dot prefix
+                if entry.name in _AT_HIDDEN or (entry.name.startswith(".") and not stem.startswith(".")):
+                    continue
+                name = entry.name + ("/" if entry.is_dir() else "")
+                if name.startswith(stem):
+                    yield Completion(name[len(stem):], display="@" + prefix_used + name)
+
+    kb = KeyBindings()
+
+    @kb.add("enter", eager=True)
+    def _enter_submit(event):
+        # A genuinely successful bracketed paste never reaches this handler
+        # at all -- prompt_toolkit's own built-in binding for Keys.BracketedPaste
+        # (registered separately, merged in by PromptSession) inserts the
+        # whole pasted blob as one atomic operation. This handler only sees
+        # individual "enter" keys, which is exactly what happens when a
+        # paste's embedded newlines leak through as standalone keystrokes
+        # instead of being bundled into that one atomic event.
+        #
+        # That leak is common on Windows: prompt_toolkit's Win32 console
+        # reader has no native bracketed-paste signal to work with (unlike
+        # POSIX terminals, which get real \x1b[200~/\x1b[201~ markers), so it
+        # guesses by reading a whole batch of console input events in one
+        # non-blocking call and heuristically deciding "this batch looks like
+        # a paste" only if that SAME batch contains at least one newline AND
+        # at least one other character (see prompt_toolkit's
+        # ConsoleInputReader._is_paste). If the OS/terminal happens to
+        # deliver the paste split across multiple such batches -- plausible
+        # for a large paste, slow terminal, or redirected console -- any
+        # sub-batch containing just an isolated newline fails that check and
+        # arrives as a bare "enter" KeyPress instead. (An earlier attempt to
+        # fix this checked `in_paste_mode`, but that filter reflects
+        # Application.paste_mode -- a static per-session flag nobody here
+        # ever sets to True, not a live "currently receiving a paste" signal
+        # -- so it never actually took effect.)
+        #
+        # The robust, protocol-independent signal: a real standalone Enter
+        # keypress has nothing else queued up behind it. A leaked paste
+        # newline arrives back-to-back with the rest of that same input
+        # batch, which is fed into the key processor's queue before being
+        # handled one key at a time -- so if more keys are already waiting
+        # here, this "enter" is almost certainly mid-paste, not a submit.
+        buf = event.current_buffer
+        if buf.complete_state:
+            # Accept the selected completion but don't submit yet
+            buf.complete_state = None
+            return
+        if event.key_processor.input_queue:
+            buf.insert_text("\n")
+            return
+        buf.validate_and_handle()
+
+    @kb.add("escape", "enter")
+    def _alt_enter_newline(event):
+        event.current_buffer.insert_text("\n")
+
+    if _IS_WINDOWS:
+        # In raw console mode (which prompt_toolkit switches the Windows
+        # console into), conhost's own Ctrl+V paste handling is OFF — the
+        # keystroke arrives here as a bare c-v keypress and, unbound, does
+        # NOTHING. That's why paste "just stops working" the moment the
+        # REPL opens even though it works fine at the cmd prompt. Windows
+        # Terminal intercepts Ctrl+V itself, so this binding only fires
+        # where it's needed (classic conhost) and is harmless elsewhere.
+        @kb.add("c-v")
+        def _windows_clipboard_paste(event):
+            text = _read_windows_clipboard()
+            if text:
+                event.current_buffer.insert_text(_normalize_pasted_text(text))
+
+    @kb.add("c-c")
+    def _ctrl_c(event):
+        buf = event.current_buffer
+        if buf.text:
+            buf.reset()
+        else:
+            raise KeyboardInterrupt()
+
+    history_file = Path.home() / ".yucode" / "history"
+    history_file.parent.mkdir(parents=True, exist_ok=True)
+
+    return PromptSession(
+        completer=_YuCompleter(),
+        complete_while_typing=False,
+        multiline=True,
+        enable_open_in_editor=True,
+        prompt_continuation=lambda width, line_number, wrap_count: " " * (width - 1) + "·",
+        history=FileHistory(str(history_file)),
+        key_bindings=kb,
+    )
+
+
+def _format_session_resume_info(session: Any) -> str:
+    """Build a human-readable resume label from a session object."""
+    msg_count = len(session.messages)
+    # Find first user message for context
+    first_user = ""
+    for m in session.messages:
+        if m.role == "user":
+            raw = (m.content or "").strip()
+            first_user = raw[:50] + ("…" if len(raw) > 50 else "")
+            break
+    age = ""
+    if hasattr(session, "created_at") and session.created_at:
+        import time as _time
+        secs = _time.time() - session.created_at
+        if secs < 3600:
+            age = f"{int(secs // 60)}m ago"
+        elif secs < 86400:
+            age = f"{int(secs // 3600)}h ago"
+        else:
+            age = f"{int(secs // 86400)}d ago"
+    parts = [f"{msg_count} msgs"]
+    if age:
+        parts.append(age)
+    if first_user:
+        parts.append(f'"{first_user}"')
+    return "resumed: " + " · ".join(parts)
+
+
+def _read_prompt_line(pt_session: Any) -> str:
+    """Read one line of interactive input.
+
+    Uses the prompt_toolkit session when available (history, completion,
+    multi-line paste); falls back to plain input() when pt_session is None
+    (prompt_toolkit not installed — see _make_pt_session). Both paths raise
+    EOFError/KeyboardInterrupt the same way on Ctrl+D / Ctrl+C.
+    """
+    if pt_session is not None:
+        from prompt_toolkit.formatted_text import ANSI as _ANSI
+        return pt_session.prompt(_ANSI(user_prompt())).strip()
+    return input(user_prompt()).strip()
+
+
+def _run_interactive(args: argparse.Namespace) -> int:
+    from .commands import InputKind, parse_input
+
+    workspace = Path(args.workspace).resolve()
+    config = load_app_config(args.config_path, workspace=workspace)
+    config = _apply_cli_overrides(config, args)
+
+    from ..config.trust import describe_untrusted_repo_local_config
+    _trust_warning = describe_untrusted_repo_local_config(workspace)
+    if _trust_warning:
+        print(render_warning(_trust_warning))
+
+    session = None
+    session_info = ""
+    if getattr(args, "resume", None):
+        from ..core.session import Session
+        try:
+            session = Session.load_from_workspace(workspace, args.resume)
+            session_info = f"resumed `{args.resume}` ({len(session.messages)} msgs)"
+        except FileNotFoundError:
+            print(render_error(f"Session `{args.resume}` not found."), file=sys.stderr)
+            return 1
+    elif config.runtime.auto_resume_latest:
+        session = _try_auto_resume(workspace, config)
+        if session:
+            session_info = _format_session_resume_info(session)
+
+    prompter = InteractivePermissionPrompter() if config.runtime.permission_mode == "prompt" else None
+    runtime = AgentRuntime(workspace, config, session=session, permission_prompter=prompter)
+
+    pt_session = _make_pt_session(workspace)
+    if pt_session is None:
+        print(render_info(
+            "prompt_toolkit not found — using plain input (no history/completion/multi-line paste). "
+            "Install it for the full interactive experience: pip install prompt_toolkit"
+        ))
+
+    from ..memory.prompting import MAX_INSTRUCTION_FILE_CHARS, MAX_TOTAL_INSTRUCTION_CHARS, discover_instruction_files
+    _ifiles = discover_instruction_files(workspace, config.instruction_files or [])
+    _remaining = MAX_TOTAL_INSTRUCTION_CHARS
+    _ifile_labels: list[str] = []
+    for _f in _ifiles:
+        _cap = min(MAX_INSTRUCTION_FILE_CHARS, _remaining)
+        _name = _f.path.name
+        if _cap <= 0:
+            _ifile_labels.append(f"{_name}[dropped]")
+        elif len(_f.content) > _cap:
+            _ifile_labels.append(f"{_name}[truncated]")
+        else:
+            _ifile_labels.append(_name)
+        _remaining -= min(_cap, len(_f.content))
+    print(startup_banner(
+        workspace,
+        model=config.provider.model or "(not set)",
+        provider=config.provider.name or config.provider.type,
+        permission_mode=config.runtime.permission_mode,
+        session_info=session_info,
+        instruction_files=_ifile_labels or None,
+    ))
+
+    handler = _InteractiveEventHandler(streaming=config.provider.streaming_mode != "no_stream")
+
+    while True:
+        try:
+            line = _read_prompt_line(pt_session)
+        except (EOFError, KeyboardInterrupt):
+            _auto_save(runtime)
+            print(f"\n{render_info('Bye.')}")
+            return 0
+        if not line:
+            continue
+        if line.lower() in ("exit", "quit", "bye"):
+            _auto_save(runtime)
+            print(render_info("Bye."))
+            return 0
+        parsed = parse_input(line, workspace)
+        if parsed.kind == InputKind.SLASH:
+            _dispatch_slash_interactive(parsed, config, workspace, runtime)
+            continue
+        # Visible confirmation of @file references so the user knows which
+        # files were attached as context (otherwise the resolution is silent).
+        if parsed.file_references:
+            for ref in parsed.file_references:
+                try:
+                    rel = ref.resolved.relative_to(workspace)
+                except ValueError:
+                    rel = ref.resolved
+                size = len(ref.content.encode("utf-8"))
+                size_str = f"{size // 1024}K" if size >= 1024 else f"{size}B"
+                print(f"  {DIM}📎 attached: {rel} ({size_str}){RESET}", file=sys.stderr)
+        try:
+            summary = runtime.orchestrate(parsed.effective_prompt, event_callback=handler)
+            if not summary.final_text.strip() and summary.usage.total_tokens() == 0:
+                print(render_warning(
+                    "Provider returned an empty response with 0 tokens. "
+                    "Check your provider config or run `yucode doctor`."
+                ), file=sys.stderr)
+            if not handler._text_started:
+                print(agent_label(), end="")
+                print(format_assistant_text(summary.final_text))
+            print()
+            _auto_save(runtime)
+        except AgentError as exc:
+            handler._progress.stop()
+            print(render_error(str(exc)))
+        except Exception as exc:
+            handler._progress.stop()
+            print(render_error(f"Unexpected error: {exc}"))
+        except KeyboardInterrupt:
+            runtime.cancel()
+            handler._progress.stop()
+            print(f"\n{render_warning('Interrupted.')}")
+
+
+def _dispatch_slash(parsed: Any, args: argparse.Namespace) -> int:
+    from .commands import InputKind
+    if parsed.kind != InputKind.SLASH:
+        return 1
+    return _handle_slash_command(parsed.command, parsed.arguments, args)
+
+
+def _dispatch_slash_interactive(parsed: Any, config: Any, workspace: Path, runtime: Any) -> None:
+    from .commands import InputKind
+    if parsed.kind != InputKind.SLASH:
+        return
+    _handle_slash_command_interactive(parsed.command, parsed.arguments, config, workspace, runtime)
+
+
+def _handle_slash_command(command: str, arguments: str, args: argparse.Namespace) -> int:
+    if command == "help":
+        _print_slash_help()
+    elif command == "status":
+        _print_status(args.config_path)
+    elif command == "config":
+        path = resolve_config_path(args.config_path)
+        print(path.read_text(encoding="utf-8"), end="")
+    elif command == "tools":
+        config = load_app_config(args.config_path)
+        workspace = Path(args.workspace).resolve()
+        rt = AgentRuntime(workspace, config)
+        for name in rt.tools.list_names():
+            print(f"  {name}")
+    elif command == "mcp":
+        _print_mcp_list(args.config_path)
+    elif command == "skills":
+        workspace = Path(args.workspace).resolve()
+        for skill in list_skills(workspace):
+            print(f"  {skill.name}: {skill.description}")
+    else:
+        print(f"Unknown command: /{command}")
+        return 1
+    return 0
+
+
+def _handle_slash_command_interactive(command: str, arguments: str, config: Any, workspace: Path, runtime: Any) -> None:
+    from .commands import (
+        export_session,
+        list_instruction_files,
+        run_git_branch,
+        run_git_commit,
+        run_git_diff,
+        run_git_log,
+        run_git_pr,
+        run_git_stash,
+        run_git_worktree,
+    )
+
+    if command == "help":
+        _print_slash_help()
+    elif command == "status":
+        print(section_header("Status"))
+        usage = runtime.session.usage
+        print(f"  {DIM}provider{RESET}     {config.provider.name}/{config.provider.model}")
+        print(f"  {DIM}workspace{RESET}    {workspace}")
+        print(f"  {DIM}permissions{RESET}  {config.runtime.permission_mode}")
+        print(f"  {DIM}streaming{RESET}    {config.provider.streaming_mode}")
+        print(f"  {DIM}tools{RESET}        {len(runtime.tools.list_names())}")
+        print(f"  {DIM}mcp servers{RESET}  {len(config.mcp)}")
+        print(f"  {DIM}messages{RESET}     {len(runtime.session.messages)}")
+        print(f"  {DIM}est. tokens{RESET}  {runtime.estimated_tokens():,}")
+        print()
+        print(format_cost_summary(usage.to_dict()))
+    elif command == "config":
+        print(section_header("Config"))
+        path = resolve_config_path()
+        print(f"  {DIM}path: {path}{RESET}\n")
+        print(path.read_text(encoding="utf-8"), end="")
+    elif command == "tools":
+        print(section_header("Tools"))
+        tools = runtime.tools.list_names()
+        for name in tools:
+            risk = runtime.tools.risk_level_for(name).value
+            risk_color = THEME.success if risk == "low" else (THEME.warning if risk == "medium" else THEME.error)
+            print(f"  ⚡ {name} {risk_color}[{risk}]{RESET}")
+        print(f"\n  {DIM}{len(tools)} tools registered{RESET}")
+    elif command == "mcp":
+        print(section_header("MCP Servers"))
+        if config.mcp:
+            for server in config.mcp:
+                transport_note = f" {DIM}[{server.transport}]{RESET}" if server.transport != "stdio" else ""
+                print(f"  🔌 {BOLD}{server.name}{RESET}{transport_note}: {server.command} {' '.join(server.args)}")
+        else:
+            print(f"  {DIM}No MCP servers configured.{RESET}")
+            print(f"  {DIM}Run: yucode mcp-add <name> <command>{RESET}")
+    elif command == "skills":
+        print(section_header("Skills"))
+        found = list_skills(workspace)
+        if found:
+            for skill in found:
+                desc = f" — {skill.description}" if skill.description else ""
+                print(f"  📚 {skill.name}{desc}")
+        else:
+            print(f"  {DIM}No skills found.{RESET}")
+    elif command == "compact":
+        result = runtime.compact()
+        if result.removed_message_count > 0:
+            print(render_success(f"Compacted {result.removed_message_count} messages"))
+            print(render_info(f"Estimated tokens now: {runtime.estimated_tokens():,}"))
+        else:
+            print(render_info("Nothing to compact."))
+    elif command == "diff":
+        print(section_header("Git Diff"))
+        print(run_git_diff(workspace))
+    elif command == "memory":
+        files = list_instruction_files(workspace)
+        from ..core.session import Session
+        from ..memory.store import MemoryStore
+        sessions = Session.list_sessions(workspace)
+        found_skills = list_skills(workspace)
+        persistent = MemoryStore(workspace).list()
+        print(format_memory_display(
+            workspace=workspace,
+            instruction_files=files,
+            sessions=sessions,
+            skills=found_skills,
+            estimated_tokens=runtime.estimated_tokens(),
+            session_messages=len(runtime.session.messages),
+            metrics=runtime.metrics.to_dict() if hasattr(runtime, "metrics") else None,
+            persistent_memories=persistent,
+        ))
+    elif command == "remember":
+        _handle_remember_command(workspace, arguments)
+    elif command == "forget":
+        _handle_forget_command(workspace, arguments)
+    elif command == "init":
+        _handle_init_slash(workspace, arguments)
+    elif command == "resume":
+        from ..core.session import Session
+        sessions = Session.list_sessions(workspace)
+        if not sessions:
+            print(render_info("No saved sessions found."))
+        else:
+            print(section_header("Saved Sessions"))
+            for s in sessions[:10]:
+                secs = time.time() - float(s.get("created_at") or 0)
+                if secs < 3600:
+                    age = f"{int(secs // 60)}m ago"
+                elif secs < 86400:
+                    age = f"{int(secs // 3600)}h ago"
+                else:
+                    age = f"{int(secs // 86400)}d ago"
+                title = s.get("title", "")
+                title_part = f'  "{title[:40]}"' if title else ""
+                print(f"  💾 {s['id']:12s}  {DIM}{age:8s}  {s['message_count']} msgs{title_part}{RESET}")
+            if arguments.strip():
+                sid = arguments.strip()
+                try:
+                    loaded = Session.load_from_workspace(workspace, sid)
+                    runtime.session = loaded
+                    print(render_success(f"Resumed session `{sid}` ({len(loaded.messages)} messages)"))
+                except FileNotFoundError:
+                    print(render_error(f"Session `{sid}` not found."))
+    elif command == "permissions":
+        print(render_info(f"Current mode: {BOLD}{config.runtime.permission_mode}{RESET}"))
+    elif command == "branch":
+        print(section_header("Git Branches"))
+        print(run_git_branch(workspace))
+    elif command == "commit":
+        result = run_git_commit(workspace, arguments)
+        if "error" in result.lower() or "fatal" in result.lower():
+            print(render_error(result))
+        else:
+            print(render_success(result))
+    elif command == "plugins":
+        from ..plugins import PluginManager
+        print(section_header("Plugins"))
+        pm = PluginManager(workspace)
+        installed = pm.list_installed()
+        if installed:
+            for p in installed:
+                status_icon = THEME.success + "●" if p.get("enabled") else THEME.muted + "○"
+                desc = p.get("description", "")
+                print(f"  {status_icon}{RESET} {p['name']} {DIM}{desc}{RESET}")
+        else:
+            print(f"  {DIM}No plugins installed.{RESET}")
+    elif command == "agents":
+        print(render_info("Sub-agent tool is available as `agent` in the tool list."))
+        print(render_info("Use it in your prompt to delegate tasks."))
+    elif command == "save":
+        path = runtime.save_session(arguments.strip() or None)
+        print(render_success(f"Session saved to {path}"))
+    elif command == "clear":
+        # Non-destructive: park the old conversation under its own session id
+        # and swap in a fresh Session, rather than emptying the live one.
+        # A new session_id matters beyond politeness — save_session() defaults
+        # to session.session_id, so keeping the id would let the next /save or
+        # auto-save overwrite the file we just wrote with the emptied history.
+        # Swapping runtime.session is the same move /resume already makes.
+        from ..core.session import Session
+        old = runtime.session
+        if old.messages:
+            try:
+                saved_path = runtime.save_session()
+            except OSError as exc:
+                print(render_error(
+                    f"Not clearing: could not save the current session ({exc}). "
+                    "Use /export or /save to preserve it first."
+                ))
+                return
+            print(render_info(
+                f"Previous session saved to {saved_path} "
+                f"— reopen it with /resume {old.session_id}"
+            ))
+        # `runtime.config`, not the loop's `config`: /model rebinds
+        # runtime.config to a new AppConfig and leaves the caller's copy on the
+        # old model, so reading `config` here pinned every post-/model /clear
+        # to the model the user had already switched away from.
+        runtime.session = Session(model=runtime.config.provider.model)
+        print(render_success(f"Cleared. New session `{runtime.session.session_id}`."))
+    elif command in ("exit", "quit"):
+        raise EOFError
+    elif command == "metrics":
+        _show_metrics(runtime)
+    elif command == "cost":
+        print(format_cost_summary(runtime.session.usage.to_dict()))
+    elif command == "log":
+        print(section_header("Git Log"))
+        count = int(arguments.strip()) if arguments.strip().isdigit() else 10
+        print(run_git_log(workspace, count))
+    elif command == "stash":
+        action = arguments.strip() or "list"
+        result = run_git_stash(workspace, action)
+        print(render_info(result) if "error" not in result.lower() else render_error(result))
+    elif command == "pr":
+        print(section_header("Pull Request"))
+        print(run_git_pr(workspace))
+    elif command == "worktree":
+        print(section_header("Worktrees"))
+        print(run_git_worktree(workspace, arguments.strip()))
+    elif command == "export":
+        fmt = arguments.strip() or "md"
+        path = export_session(workspace, runtime.session.messages, fmt)
+        print(render_success(f"Session exported to {path}"))
+    elif command == "model":
+        if arguments.strip():
+            new_model = arguments.strip()
+            old_model = config.provider.model
+            from ..config import AppConfig
+            new_provider = dataclasses.replace(config.provider, model=new_model)
+            new_config = AppConfig(
+                provider=new_provider, runtime=config.runtime,
+                tools=config.tools, mcp=config.mcp, vscode=config.vscode,
+                instruction_files=config.instruction_files,
+                hooks=config.hooks, plugins=config.plugins, sandbox=config.sandbox,
+            )
+            runtime.config = new_config
+            from ..core.providers import OpenAICompatibleProvider
+            runtime.provider = OpenAICompatibleProvider(new_provider)
+            print(render_success(f"Model switched: {old_model} → {new_model}"))
+        else:
+            print(render_info(f"Current model: {BOLD}{config.provider.model}{RESET}"))
+            print(f"  {DIM}provider{RESET}        {config.provider.name}")
+            print(f"  {DIM}base_url{RESET}        {config.provider.base_url}")
+            print(f"  {DIM}chat_path{RESET}       {config.provider.chat_path}")
+            print(f"  {DIM}append_path{RESET}     {config.provider.append_chat_path}")
+            print(f"  {DIM}verify_tls{RESET}      {config.provider.verify_tls}")
+            print(f"  {DIM}stream{RESET}          {config.provider.stream}")
+            print(f"  {DIM}streaming_mode{RESET}  {config.provider.streaming_mode}")
+            print(f"\n  {DIM}Usage: /model <model-name> to switch{RESET}")
+    elif command == "version":
+        from .. import __version__
+        print(render_info(f"YuCode v{__version__}"))
+    else:
+        print(render_error(f"Unknown command: /{command}"))
+
+
+def _show_metrics(runtime: Any) -> None:
+    """Display tool usage and session metrics."""
+    print(section_header("Metrics"))
+    metrics = runtime.metrics.to_dict()
+    tools = metrics.get("tools", {})
+    if tools:
+        print(f"\n  {BOLD}Tool Usage{RESET}")
+        for name, m in sorted(tools.items(), key=lambda x: x[1].get("call_count", 0), reverse=True):
+            count = m.get("call_count", 0)
+            avg = m.get("avg_duration_ms", 0)
+            errs = m.get("error_count", 0)
+            err_note = f" {THEME.error}({errs} errors){RESET}" if errs else ""
+            print(f"    ⚡ {name}: {count}× avg {avg:.0f}ms{err_note}")
+    session = metrics.get("session", {})
+    print(f"\n  {BOLD}Session{RESET}")
+    print(f"    iterations:    {session.get('iterations', 0)}")
+    print(f"    input tokens:  {session.get('total_input_tokens', 0):,}")
+    print(f"    output tokens: {session.get('total_output_tokens', 0):,}")
+    security = metrics.get("security_events", [])
+    if security:
+        print(f"\n  {BOLD}Security Events{RESET}")
+        for ev in security:
+            print(f"    🛡️  {ev['event_type']} → {ev['tool_name']}: {ev.get('detail', '')[:60]}")
+
+
+def _handle_init_slash(workspace: Path, arguments: str) -> None:
+    """`/init [--force]` — generate a starter AGENTS.md for the current workspace."""
+    from .init_workspace import detect_profile, write_agents_md
+
+    force = "--force" in arguments.split()
+    try:
+        path, _ = write_agents_md(workspace, force=force)
+    except FileExistsError as exc:
+        print(render_warning(str(exc)))
+        return
+    profile = detect_profile(workspace)
+    print(render_success(f"Wrote {path}"))
+    if profile.languages:
+        print(f"  Detected: {', '.join(profile.languages)}"
+              + (f"  +{', '.join(profile.frameworks)}" if profile.frameworks else ""))
+    if profile.test_command:
+        print(f"  Test command:  {profile.test_command}")
+    if profile.build_command:
+        print(f"  Build command: {profile.build_command}")
+
+
+def _handle_remember_command(workspace: Path, arguments: str) -> None:
+    """`/remember [-w] [--type=TYPE] <body>` — save a persistent memory.
+
+    Flags:
+      -w / --workspace    save into <workspace>/.yucode/memory (default: ~/.yucode/memory)
+      --type=TYPE         user|feedback|project|reference (default: user)
+    The name is derived from the first ~5 words of the body; the description
+    is the first sentence (or first 120 chars).
+    """
+    from ..memory.store import MemoryStore, slugify
+
+    tokens = arguments.split()
+    scope = "user"
+    mem_type = "user"
+    rest: list[str] = []
+    for tok in tokens:
+        if tok in ("-w", "--workspace"):
+            scope = "workspace"
+        elif tok.startswith("--type="):
+            mem_type = tok.split("=", 1)[1].strip().lower()
+        else:
+            rest.append(tok)
+    body = " ".join(rest).strip()
+    if not body:
+        print(render_info("Usage: /remember [-w] [--type=user|feedback|project|reference] <text>"))
+        return
+    if mem_type not in ("user", "feedback", "project", "reference"):
+        print(render_warning(f"Invalid --type=`{mem_type}` (must be user|feedback|project|reference)"))
+        return
+
+    # Derive name from first words; cap to ~5 tokens to keep slug short
+    name_words = body.split()[:5]
+    name = slugify(" ".join(name_words))
+    # First sentence (period/。/!/？) or first 120 chars, whichever is shorter
+    end = min(
+        [i for i in (body.find("."), body.find("。"), body.find("!"), body.find("？"), body.find("?")) if i > 0]
+        + [120, len(body)]
+    )
+    description = body[:end].strip()
+
+    entry = MemoryStore(workspace).save(name, description, mem_type, body, scope)  # type: ignore[arg-type]
+    try:
+        rel = f"~/{entry.path.relative_to(Path.home())}"
+    except ValueError:
+        rel = str(entry.path)
+    print(render_success(f"Saved memory `{entry.name}` ({entry.scope}/{entry.type}) → {rel}"))
+
+
+def _handle_forget_command(workspace: Path, arguments: str) -> None:
+    from ..memory.store import MemoryStore
+
+    name = arguments.strip()
+    if not name:
+        print(render_info("Usage: /forget <name>   (use /memory to list names)"))
+        return
+    if MemoryStore(workspace).delete(name):
+        print(render_success(f"Deleted memory `{name}`."))
+    else:
+        print(render_warning(f"No memory named `{name}` found."))
+
+
+def _print_slash_help() -> None:
+    print(section_header("Commands"))
+    _cmds = [
+        ("/help",        "Show this help message"),
+        ("/status",      "Runtime status — model, tokens, messages"),
+        ("/model [name]","Show or switch model in-session"),
+        ("/memory",      "Show all memory & context info"),
+        ("/remember TXT","Save a persistent memory (cross-session)"),
+        ("/forget NAME", "Delete a persistent memory by name"),
+        ("/init [--force]","Scan workspace and write a starter AGENTS.md"),
+        ("/tools",       "List available tools with risk levels"),
+        ("/compact",     "Compact conversation to free context"),
+        ("/metrics",     "Show tool usage and session metrics"),
+        ("/cost",        "Show token usage breakdown"),
+        ("/diff",        "Show git diff"),
+        ("/log [N]",     "Show git log (last N commits)"),
+        ("/branch",      "Show git branches"),
+        ("/commit MSG",  "Git add -A and commit"),
+        ("/pr",          "Show PR readiness (unpushed commits)"),
+        ("/stash",       "Git stash list/push/pop"),
+        ("/worktree",    "Git worktree list/add/remove"),
+        ("/config",      "Show current configuration"),
+        ("/mcp",         "List MCP servers"),
+        ("/skills",      "List discovered skills"),
+        ("/plugins",     "List installed plugins"),
+        ("/permissions", "Show current permission mode"),
+        ("/resume [ID]", "List or resume a saved session"),
+        ("/save [ID]",   "Save current session"),
+        ("/export [md]", "Export session to file (md or json)"),
+        ("/doctor",      "Run preflight diagnostics"),
+        ("/agents",      "Show sub-agent tool info"),
+        ("/version",     "Show YuCode version"),
+        ("/clear",       "Save this session and start a fresh one"),
+        ("/exit",        "Exit interactive mode"),
+    ]
+    for cmd, desc in _cmds:
+        print(f"  {THEME.prompt_you}{cmd:16s}{RESET} {DIM}{desc}{RESET}")
+    print(f"\n  {DIM}Use @path to include workspace files as context.{RESET}")
+
+
+def _print_status(config_path: str | None) -> None:
+    config = load_app_config(config_path)
+    print(section_header("Status"))
+    print(f"  {DIM}provider{RESET}     {config.provider.name}/{config.provider.model}")
+    print(f"  {DIM}permissions{RESET}  {config.runtime.permission_mode}")
+    print(f"  {DIM}max_iters{RESET}    {config.runtime.max_iterations}")
+    print(f"  {DIM}mcp servers{RESET}  {len(config.mcp)}")
+
+
+# ---------------------------------------------------------------------------
+# MCP CLI handlers
+# ---------------------------------------------------------------------------
+
+def handle_mcp_list(args: argparse.Namespace) -> int:
+    workspace = Path(args.workspace).resolve()
+    _print_mcp_list(args.config_path, workspace)
+    return 0
+
+
+def _print_mcp_list(config_path: str | None, workspace: Path | None = None) -> None:
+    config = load_app_config(config_path, workspace=workspace)
+    if not config.mcp:
+        print("No MCP servers configured.")
+        print("Add one with: yucode mcp-add <name> <command> [args...]")
+        return
+    print(f"MCP servers ({len(config.mcp)}):")
+    for server in config.mcp:
+        transport_note = f" [{server.transport}]" if server.transport != "stdio" else ""
+        cmd = f"{server.command} {' '.join(server.args)}".strip()
+        print(f"  {server.name}{transport_note}: {cmd}")
+
+
+def handle_mcp_add(args: argparse.Namespace) -> int:
+    server = McpServerConfig(
+        name=args.name,
+        transport=args.transport,
+        command=args.mcp_command,
+        args=args.args,
+    )
+    workspace = Path(args.workspace).resolve()
+    try:
+        path = add_mcp_server_to_config(server, args.config_path, workspace=workspace)
+        print(f"Added MCP server `{args.name}` to {path}")
+    except ConfigError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def handle_mcp_remove(args: argparse.Namespace) -> int:
+    workspace = Path(args.workspace).resolve()
+    try:
+        path = remove_mcp_server_from_config(args.name, args.config_path, workspace=workspace)
+        print(f"Removed MCP server `{args.name}` from {path}")
+    except ConfigError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def handle_mcp_validate(args: argparse.Namespace) -> int:
+    workspace = Path(args.workspace).resolve()
+    config = load_app_config(args.config_path, workspace=workspace)
+    if not config.mcp:
+        print("No MCP servers configured.")
+        return 0
+    from ..plugins.mcp import StdioMcpClient
+    errors = 0
+    for server_config in config.mcp:
+        print(f"  {server_config.name}...", end="", flush=True)
+        if server_config.transport != "stdio":
+            print(f" SKIP (transport `{server_config.transport}` not implemented)")
+            continue
+        try:
+            client = StdioMcpClient(server_config)
+            tools = client.list_tools()
+            print(f" OK ({len(tools)} tools)")
+        except Exception as exc:  # noqa: BLE001
+            print(f" FAIL: {exc}")
+            errors += 1
+    return 1 if errors else 0
+
+
+# ---------------------------------------------------------------------------
+# MCP preset catalog
+# ---------------------------------------------------------------------------
+
+_PYTHON_BIN = sys.executable or "python3"
+
+MCP_PRESETS: dict[str, dict[str, Any]] = {
+    # One entry where there were three. `excel`, `word` and `pdf` each pointed
+    # at a standalone server that reimplemented a thinner version of what
+    # tools/office.py already does -- generic reads and writes, none of the
+    # databook or template work. office_mcp exposes office_tools() itself, so
+    # the MCP surface and the agent's own tools are one implementation.
+    "office": {
+        "description": (
+            "Excel, Word, PDF and PowerPoint, including databook stage-column "
+            "location and template-driven deck filling (openpyxl, python-docx, "
+            "python-pptx, pdfplumber)"
+        ),
+        "command": _PYTHON_BIN,
+        "args": ["-m", "coding_agent.plugins.mcp_servers.office_mcp"],
+        "deps": ["openpyxl", "docx", "pptx", "pdfplumber"],
+        "pip_extra": "office",
+        # Writes the served directory into the config rather than letting the
+        # server fall back to whatever the launcher's working directory turns
+        # out to be. The root is what bounds every path argument, so it should
+        # be a recorded decision, readable in mcp.yml, not an accident of how
+        # the process was started.
+        "needs_path_arg": True,
+    },
+    "finance": {
+        "description": "Stock quotes, financials, history (yfinance + pandas)",
+        "command": _PYTHON_BIN,
+        "args": ["-m", "coding_agent.plugins.mcp_servers.finance_mcp"],
+        "deps": ["yfinance", "pandas"],
+        "pip_extra": "finance",
+    },
+}
+
+
+def _check_python_dep(module_name: str) -> bool:
+    try:
+        __import__(module_name)
+        return True
+    except ImportError:
+        return False
+
+
+def handle_mcp_preset(args: argparse.Namespace) -> int:
+    if args.preset_name is None:
+        print("Available MCP presets:\n")
+        for name, preset in MCP_PRESETS.items():
+            deps = preset.get("deps", [])
+            if deps:
+                status_parts = []
+                for dep in deps:
+                    ok = _check_python_dep(dep)
+                    status_parts.append(f"{dep}:{'ok' if ok else 'missing'}")
+                status = " | ".join(status_parts)
+            else:
+                status = "ready"
+            extra = f"  (pip install yucode-agent[{preset['pip_extra']}])" if preset.get("pip_extra") else ""
+            print(f"  {name:20s} {preset['description']:50s} [{status}]{extra}")
+        print("\nUsage: yucode mcp-preset <name> [args...]")
+        return 0
+
+    name = args.preset_name
+    if name not in MCP_PRESETS:
+        print(f"Error: Unknown preset `{name}`. Run `yucode mcp-preset` to see all.", file=sys.stderr)
+        return 1
+
+    preset = MCP_PRESETS[name]
+    missing = [d for d in preset.get("deps", []) if not _check_python_dep(d)]
+    if missing:
+        extra = preset.get("pip_extra", "")
+        install_cmd = f"pip install yucode-agent[{extra}]" if extra else f"pip install {' '.join(missing)}"
+        print(f"Missing dependencies: {', '.join(missing)}")
+        print(f"Install with: {install_cmd}")
+        return 1
+
+    server_args = list(preset["args"])
+    if preset.get("needs_path_arg"):
+        if args.preset_args:
+            server_args.extend(args.preset_args)
+        else:
+            workspace = Path(args.workspace).resolve()
+            server_args.append(str(workspace))
+
+    server = McpServerConfig(
+        name=name,
+        transport="stdio",
+        command=preset["command"],
+        args=server_args,
+    )
+    workspace = Path(args.workspace).resolve()
+    try:
+        path = add_mcp_server_to_config(server, args.config_path, workspace=workspace)
+        print(f"Added MCP preset `{name}` to {path}")
+    except ConfigError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Skills handler
+# ---------------------------------------------------------------------------
+
+def handle_skills(args: argparse.Namespace) -> int:
+    workspace = Path(args.workspace).resolve()
+    found = list_skills(workspace)
+    output_json = getattr(args, "output_format", "text") == "json"
+    if output_json:
+        print(json.dumps({"skills": [{"name": s.name, "description": s.description, "path": str(s.path)} for s in found]}, indent=2))
+        return 0
+    if not found:
+        print("No skills found.")
+        print("Create skills in .yucode/skills/<name>/SKILL.md or .claw/skills/<name>/SKILL.md")
+        return 0
+    print(f"Skills ({len(found)}):")
+    for skill in found:
+        print(f"  {skill.name}: {skill.description}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Status handler
+# ---------------------------------------------------------------------------
+
+def handle_status(args: argparse.Namespace) -> int:
+    output_json = getattr(args, "output_format", "text") == "json"
+    config = load_app_config(args.config_path)
+    if output_json:
+        data = {
+            "provider": config.provider.name,
+            "model": config.provider.model,
+            "permission_mode": config.runtime.permission_mode,
+            "max_iterations": config.runtime.max_iterations,
+            "max_coordinator_retries": config.runtime.max_coordinator_retries,
+            "orchestration_mode": config.runtime.orchestration_mode,
+            "mcp_server_count": len(config.mcp),
+            "tools_allowed": list(config.tools.allowed) if config.tools.allowed else None,
+            "tools_disabled": list(config.tools.disabled) if config.tools.disabled else None,
+        }
+        print(json.dumps(data, indent=2))
+    else:
+        _print_status(args.config_path)
+    return 0
+
+
+def handle_system_prompt(args: argparse.Namespace) -> int:
+    from datetime import datetime
+
+    from ..memory.prompting import PromptAssembler, discover_project_context
+
+    workspace = Path(args.cwd).resolve()
+    config = load_app_config(args.config_path, workspace=workspace)
+    date_text = args.date or datetime.now().strftime("%Y-%m-%d")
+    project_context = discover_project_context(
+        workspace, current_date=date_text,
+        include_git_context=config.runtime.include_git_context,
+        explicit_instruction_files=config.instruction_files,
+    )
+    prompt = PromptAssembler(config, project_context).render()
+
+    output_json = getattr(args, "output_format", "text") == "json"
+    if output_json:
+        print(json.dumps({"system_prompt": prompt, "workspace": str(workspace), "date": date_text}))
+    else:
+        print(prompt)
+    return 0
+
+
+def handle_version(args: argparse.Namespace) -> int:
+    from .. import __version__
+    output_json = getattr(args, "output_format", "text") == "json"
+    if output_json:
+        print(json.dumps({"version": __version__}))
+    else:
+        print(f"YuCode v{__version__}")
+    return 0
+
+
+def handle_doctor(args: argparse.Namespace) -> int:
+    """Run preflight diagnostics -- ported from claw-code-main ``claw doctor``."""
+    import shutil
+    workspace = Path(args.workspace).resolve()
+    output_json = getattr(args, "output_format", "text") == "json"
+
+    checks: list[dict[str, Any]] = []
+
+    rg_path = shutil.which("rg")
+    checks.append({
+        "name": "ripgrep",
+        "status": "ok" if rg_path else "missing",
+        "summary": f"Found at {rg_path}" if rg_path else "ripgrep (rg) not found on PATH; grep_search tool will not work",
+    })
+
+    config_path = resolve_config_path(getattr(args, "config_path", None))
+    config_ok = config_path.is_file()
+    checks.append({
+        "name": "config_file",
+        "status": "ok" if config_ok else "missing",
+        "summary": f"Config at {config_path}" if config_ok else f"No config file at {config_path}",
+    })
+
+    try:
+        config = load_app_config(getattr(args, "config_path", None), workspace=workspace)
+        api_key_ok = bool(config.provider.api_key)
+    except Exception as exc:
+        api_key_ok = False
+        checks.append({
+            "name": "config_parse",
+            "status": "error",
+            "summary": f"Config parse error: {exc}",
+        })
+        config = None
+
+    checks.append({
+        "name": "api_key",
+        "status": "ok" if api_key_ok else "missing",
+        "summary": "API key configured" if api_key_ok else "No API key found (set YUCODE_API_KEY or configure in settings)",
+    })
+
+    from ..config.settings import state_dir
+    yucode_state = state_dir(workspace)
+    checks.append({
+        "name": "state_dir",
+        "status": "ok" if yucode_state.is_dir() else "info",
+        "summary": f"State directory at {yucode_state}" if yucode_state.is_dir() else f"State directory will be created at {yucode_state}",
+    })
+
+    if config and config.mcp:
+        mcp_names = [s.name for s in config.mcp]
+        checks.append({
+            "name": "mcp_servers",
+            "status": "ok",
+            "summary": f"MCP servers configured: {', '.join(mcp_names)}",
+        })
+
+    if config:
+        probe_ok, probe_status, probe_message = _probe_provider_connection(
+            getattr(args, "config_path", None),
+            workspace=workspace,
+            stream=False,
+        )
+        checks.append({
+            "name": "provider_non_streaming",
+            "status": "ok" if probe_ok and probe_status == "ok" else probe_status,
+            "summary": probe_message,
+        })
+        if config.provider.stream:
+            stream_ok, stream_status, stream_message = _probe_provider_connection(
+                getattr(args, "config_path", None),
+                workspace=workspace,
+                stream=True,
+            )
+            checks.append({
+                "name": "provider_streaming",
+                "status": "ok" if stream_ok and stream_status == "ok" else stream_status,
+                "summary": stream_message,
+            })
+        else:
+            checks.append({
+                "name": "provider_streaming",
+                "status": "info",
+                "summary": "Streaming is disabled in config (`provider.stream: false`).",
+            })
+        # Only worth spending a request on once the plain one works: if basic
+        # connectivity is broken this would just report the same failure twice.
+        if probe_ok:
+            tools_ok, tools_status, tools_message = probe_tool_calling(config)
+            checks.append({
+                # Same mapping as the two probes above: a request can succeed
+                # and still deserve a warning (tools accepted only because
+                # reasoning got switched off), so `ok` alone must not win.
+                "name": "provider_tool_calling",
+                "status": "ok" if tools_ok and tools_status == "ok" else tools_status,
+                "summary": tools_message,
+            })
+
+    sandbox_info: dict[str, Any] = {"name": "sandbox", "status": "info"}
+    try:
+        from ..security.sandbox import SandboxStatus
+        status = SandboxStatus.detect()
+        sandbox_info["summary"] = f"In container: {status.in_container}"
+        sandbox_info["details"] = {"in_container": status.in_container, "markers": status.markers}
+    except Exception:
+        sandbox_info["summary"] = "Sandbox detection unavailable"
+    checks.append(sandbox_info)
+
+    # Workspace Python-project check: yucode works in any directory, but running
+    # `pip install .` here will fail if there is no pyproject.toml / setup.py.
+    has_pyproject = (workspace / "pyproject.toml").is_file()
+    has_setup = (workspace / "setup.py").is_file() or (workspace / "setup.cfg").is_file()
+    if has_pyproject or has_setup:
+        checks.append({
+            "name": "workspace_python_project",
+            "status": "ok",
+            "summary": "Python project detected (pyproject.toml / setup.py present).",
+        })
+    else:
+        checks.append({
+            "name": "workspace_python_project",
+            "status": "info",
+            "summary": (
+                "No pyproject.toml or setup.py in workspace — yucode works fine here. "
+                "Do NOT run `pip install .` from this directory; "
+                "install yucode itself with `pip install yucode-agent` from any other directory."
+            ),
+        })
+
+    all_ok = all(c["status"] in ("ok", "info") for c in checks)
+
+    if output_json:
+        report = {
+            "overall": "healthy" if all_ok else "degraded",
+            "checks": checks,
+            "workspace": str(workspace),
+        }
+        print(json.dumps(report, indent=2))
+    else:
+        print(f"\n  YuCode Doctor — {workspace}\n")
+        for c in checks:
+            icon = "✓" if c["status"] == "ok" else ("⚠" if c["status"] in ("warning", "missing") else "✗" if c["status"] == "error" else "·")
+            print(f"  {icon}  {c['name']}: {c['summary']}")
+        print()
+        if all_ok:
+            print("  All checks passed.\n")
+        else:
+            print("  Some checks need attention.\n")
+    return 0 if all_ok else 1
+
+
+def handle_serve(args: argparse.Namespace) -> int:
+    from .server import run_server
+    workspace = Path(args.workspace).resolve()
+    print(f"Starting server on {args.host}:{args.port} (workspace: {workspace})")
+    run_server(host=args.host, port=args.port, workspace_root=workspace)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Interactive permission prompter
+# ---------------------------------------------------------------------------
+
+class InteractivePermissionPrompter:
+    """Terminal-based permission prompter for ``prompt`` mode."""
+
+    def decide(self, request: Any) -> Any:
+        from ..security.permissions import PermissionDecision
+        print(f"\n  Permission required: {request.tool_name}")
+        print(f"  Requires: {request.required_mode} (current: {request.current_mode})")
+        if request.reason:
+            print(f"  Reason: {request.reason}")
+        try:
+            answer = input("  Allow? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return PermissionDecision(False, "User cancelled")
+        if answer in ("y", "yes"):
+            return PermissionDecision(True)
+        return PermissionDecision(False, "User denied")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main() -> int:
+    # On Windows, redirected stdout/stderr (logging a run to a file, piping)
+    # default to the locale codepage (cp936/cp1252) with errors=strict — any
+    # CJK character in model output then crashes the process mid-run with
+    # UnicodeEncodeError. The interactive console itself is safe (WriteConsoleW),
+    # so this only changes behavior where it would otherwise crash.
+    for _stream in (sys.stdout, sys.stderr):
+        if hasattr(_stream, "reconfigure"):
+            with suppress(Exception):
+                _stream.reconfigure(encoding="utf-8", errors="replace")
+    parser = build_parser()
+    args = parser.parse_args()
+    return args.handler(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

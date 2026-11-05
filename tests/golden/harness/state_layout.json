@@ -1,0 +1,33 @@
+{
+  "note": "workspace_key = sha256(str(Path(p).resolve()))[:12]. These entries hash the literal string, bypassing resolve(), so the expectation is machine-independent; the Windows sample is the one a port is most likely to get wrong.",
+  "keys": {
+    "/Users/example/Desktop/Github/yucode": "0eb4ff3c6993",
+    "/home/example/src/yucode": "df0866882bd6",
+    "C:\\Users\\example\\Desktop\\Github\\yucode": "d97e77db7f1b",
+    "/tmp/ws": "b011ea26cc73"
+  },
+  "layout": {
+    "root": "$YUCODE_HOME|~/.yucode/projects/<workspace_key>",
+    "subdirs": [
+      "sessions",
+      "archives",
+      "checkpoints",
+      "audit",
+      "metrics",
+      "tool_output",
+      "bash_output",
+      "exports",
+      "plugins"
+    ],
+    "files": [
+      "todos.json",
+      "mcp.yml"
+    ],
+    "legacy_fallback": "<workspace>/.yucode when it exists and the home dir does not"
+  },
+  "live_check": {
+    "workspace": "<WS>",
+    "key": "66df4d0260e1",
+    "state_dir_ends_with": "<YUCODE_HOME>/projects/66df4d0260e1"
+  }
+}

@@ -1,0 +1,399 @@
+from __future__ import annotations
+
+import json
+import logging
+import time
+import uuid
+from dataclasses import dataclass, field, replace
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Literal
+
+if TYPE_CHECKING:
+    from ..config.settings import RuntimeOptions
+
+_log = logging.getLogger("yucode.session")
+
+Role = Literal["system", "user", "assistant", "tool"]
+SESSION_VERSION = 1
+
+# Placeholder for a tool result cleared because it's old enough to be
+# unlikely to matter anymore (parity with grok-build's HARD_CLEAR_PLACEHOLDER).
+_HARD_CLEAR_PLACEHOLDER = "[Tool result omitted — too old]"
+# Separator inserted between head and tail in soft-trimmed tool results.
+_SOFT_TRIM_SEPARATOR = "\n\n[...trimmed...]\n\n"
+
+
+def _new_session_id() -> str:
+    """Short random id for a conversation.
+
+    Same shape as the id `runtime.save_session()` generates when the caller
+    doesn't supply one, so session files, compaction archives and audit-log
+    lines all key off identifiers that look alike.
+    """
+    return str(uuid.uuid4())[:8]
+
+
+def _prune_tool_results(messages: list[Message], runtime: RuntimeOptions) -> list[Message]:
+    """Shrink old tool results by turn age, without mutating *messages*.
+
+    Walking backward from the end, `turn_from_end` counts how many `user`
+    messages have been passed — 0 for tool results after the last user
+    message (the in-flight turn), 1 for results between the 2nd-to-last and
+    last user message, and so on. Tool results within `prune_keep_last_turns`
+    are left untouched; results at or beyond `prune_hard_clear_turns` are
+    replaced outright; results in between are soft-trimmed (head + tail)
+    only if they exceed the threshold.
+
+    Returns a new list — messages that aren't changed are the same objects,
+    changed ones are shallow copies, so the caller's stored history (and any
+    other reference to the original `Message` objects) is never touched.
+    """
+    result = list(messages)
+    turn_from_end = 0
+    for i in range(len(result) - 1, -1, -1):
+        msg = result[i]
+        if msg.role == "user":
+            turn_from_end += 1
+            continue
+        if msg.role != "tool":
+            continue
+        if turn_from_end < runtime.prune_keep_last_turns:
+            continue
+        content = msg.content or ""
+        if turn_from_end >= runtime.prune_hard_clear_turns:
+            if content != _HARD_CLEAR_PLACEHOLDER:
+                result[i] = replace(msg, content=_HARD_CLEAR_PLACEHOLDER)
+            continue
+        keep = runtime.prune_soft_trim_head + runtime.prune_soft_trim_tail
+        if len(content) > runtime.prune_soft_trim_threshold and len(content) > keep:
+            head = content[: runtime.prune_soft_trim_head]
+            tail = content[-runtime.prune_soft_trim_tail :] if runtime.prune_soft_trim_tail else ""
+            result[i] = replace(msg, content=f"{head}{_SOFT_TRIM_SEPARATOR}{tail}")
+    return result
+
+
+@dataclass
+class ToolCall:
+    id: str
+    name: str
+    arguments: str
+
+
+def _safe_tool_args(raw: str) -> str:
+    """Return *raw* if it parses as JSON, else "{}".
+
+    Some models occasionally produce truncated or malformed JSON in tool_call
+    arguments. The provider gateway rejects the WHOLE request with Bad Request
+    when this happens, killing the turn. Replacing with "{}" lets the assistant
+    message replay safely; the model already received the parse error in the
+    tool_result and can retry with valid arguments on the next iteration.
+    """
+    if not raw:
+        return "{}"
+    try:
+        json.loads(raw)
+        return raw
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return "{}"
+
+
+@dataclass
+class Message:
+    role: Role
+    content: str
+    tool_call_id: str | None = None
+    tool_calls: list[ToolCall] = field(default_factory=list)
+
+    def to_provider_message(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {"role": self.role, "content": self.content}
+        if self.role == "assistant" and self.tool_calls:
+            payload["tool_calls"] = [
+                {
+                    "id": tool_call.id,
+                    "type": "function",
+                    "function": {
+                        "name": tool_call.name,
+                        # Sanitize: providers reject the WHOLE request with
+                        # Bad Request when any tool_call has malformed JSON in
+                        # arguments. Replace with "{}" so the call replays as
+                        # a no-arg invocation; the model already saw the error
+                        # in the tool_result and can retry with valid args.
+                        "arguments": _safe_tool_args(tool_call.arguments),
+                    },
+                }
+                for tool_call in self.tool_calls
+            ]
+        if self.role == "tool" and self.tool_call_id:
+            payload["tool_call_id"] = self.tool_call_id
+        return payload
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {"role": self.role, "content": self.content}
+        if self.tool_call_id:
+            d["tool_call_id"] = self.tool_call_id
+        if self.tool_calls:
+            d["tool_calls"] = [
+                {"id": tc.id, "name": tc.name, "arguments": tc.arguments}
+                for tc in self.tool_calls
+            ]
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> Message:
+        tool_calls = [
+            ToolCall(id=tc["id"], name=tc["name"], arguments=tc["arguments"])
+            for tc in d.get("tool_calls", [])
+        ]
+        return cls(
+            role=d["role"],
+            content=d.get("content", ""),
+            tool_call_id=d.get("tool_call_id"),
+            tool_calls=tool_calls,
+        )
+
+
+@dataclass
+class Usage:
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+    cache_read_input_tokens: int = 0
+
+    def add(self, other: Usage) -> None:
+        self.input_tokens += other.input_tokens
+        self.output_tokens += other.output_tokens
+        self.cache_creation_input_tokens += other.cache_creation_input_tokens
+        self.cache_read_input_tokens += other.cache_read_input_tokens
+
+    def total_tokens(self) -> int:
+        """Total tokens for the request, without double-counting the cache.
+
+        `Usage` carries OpenAI semantics: `input_tokens` is the whole prompt
+        and the two cache counters are a *breakdown* of it, already inside
+        `input_tokens`. Adding them here counted the cached portion twice.
+
+        Anthropic-shaped usage means the opposite — its
+        `cache_creation_input_tokens` / `cache_read_input_tokens` are separate
+        buckets counted alongside `input_tokens` — so
+        `providers._extract_usage` folds those into `input_tokens` on the way
+        in, keeping this invariant true for both gateway vocabularies. Do not
+        make this method shape-aware: by the time usage reaches here it has
+        been summed across turns (see `UsageTracker.record`) and the shape it
+        arrived in is gone.
+        """
+        return self.input_tokens + self.output_tokens
+
+    def to_dict(self) -> dict[str, int]:
+        return {
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "cache_creation_input_tokens": self.cache_creation_input_tokens,
+            "cache_read_input_tokens": self.cache_read_input_tokens,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> Usage:
+        return cls(
+            input_tokens=int(d.get("input_tokens", 0)),
+            output_tokens=int(d.get("output_tokens", 0)),
+            cache_creation_input_tokens=int(d.get("cache_creation_input_tokens", 0)),
+            cache_read_input_tokens=int(d.get("cache_read_input_tokens", 0)),
+        )
+
+
+class UsageTracker:
+    def __init__(self) -> None:
+        self._turns: int = 0
+        self._cumulative: Usage = Usage()
+
+    @classmethod
+    def from_session(cls, session: Session) -> UsageTracker:
+        tracker = cls()
+        tracker._cumulative = Usage(
+            input_tokens=session.usage.input_tokens,
+            output_tokens=session.usage.output_tokens,
+            cache_creation_input_tokens=session.usage.cache_creation_input_tokens,
+            cache_read_input_tokens=session.usage.cache_read_input_tokens,
+        )
+        tracker._turns = sum(1 for m in session.messages if m.role == "assistant")
+        return tracker
+
+    @property
+    def turns(self) -> int:
+        return self._turns
+
+    @property
+    def total_input_tokens(self) -> int:
+        return self._cumulative.input_tokens
+
+    @property
+    def total_output_tokens(self) -> int:
+        return self._cumulative.output_tokens
+
+    def cumulative_usage(self) -> Usage:
+        return self._cumulative
+
+    def cost_summary(self) -> dict[str, Any]:
+        """Structured cost/usage summary for CLI and JSON output."""
+        return {
+            "turns": self._turns,
+            "total_tokens": self._cumulative.total_tokens(),
+            "input_tokens": self._cumulative.input_tokens,
+            "output_tokens": self._cumulative.output_tokens,
+            "cache_creation_input_tokens": self._cumulative.cache_creation_input_tokens,
+            "cache_read_input_tokens": self._cumulative.cache_read_input_tokens,
+        }
+
+    def record(self, usage: Usage) -> None:
+        self._turns += 1
+        self._cumulative.add(usage)
+
+
+@dataclass
+class AssistantResponse:
+    text: str
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    usage: Usage = field(default_factory=Usage)
+    # Chain-of-thought returned by reasoning-model gateways as a separate
+    # `reasoning_content` field (DeepSeek-R1 convention, adopted by several
+    # OpenAI-compatible gateways). Not sent back to the provider on later
+    # turns and not persisted in the session — surfaced via a `reasoning`
+    # event for observability (see runtime.run_turn / diagnose_agent.py).
+    reasoning: str = ""
+    # Why the model stopped: "stop", "tool_calls", "length", "" if the gateway
+    # did not say. Both parse paths read this field off the wire already; until
+    # it was kept, "length" — the model hitting the output cap mid-sentence —
+    # was indistinguishable from a clean finish, so a file written by a
+    # truncated tool call looked like a completed one. See
+    # providers._TRUNCATED_FINISH_REASONS.
+    finish_reason: str = ""
+
+
+@dataclass
+class Session:
+    messages: list[Message] = field(default_factory=list)
+    usage: Usage = field(default_factory=Usage)
+    version: int = SESSION_VERSION
+    created_at: float = field(default_factory=time.time)
+    model: str = ""
+    # Stable id for this conversation. Generated on construction rather than
+    # handed in by the caller so that audit-log lines, compaction archives
+    # and the session file on disk can always be correlated after the fact.
+    session_id: str = field(default_factory=_new_session_id)
+    # The rendered system prompt actually sent to the provider, kept so a
+    # saved session can reproduce what the model saw. Storage only — it is
+    # NOT used when assembling provider messages (see provider_messages,
+    # which takes the prompt as an argument).
+    system_prompt: str = ""
+
+    def add_message(self, message: Message) -> None:
+        self.messages.append(message)
+
+    def provider_messages(
+        self,
+        system_prompt: str,
+        *,
+        pruning: RuntimeOptions | None = None,
+    ) -> list[dict[str, Any]]:
+        """Assemble the message list sent to the provider.
+
+        When *pruning* is given and enabled, tool results are shrunk by turn
+        age (see `_prune_tool_results`) IF estimated context usage already
+        exceeds half of `compact_token_threshold` — this is a request-time-only
+        transformation; `self.messages` (the on-disk session history) is never
+        mutated, so nothing here is a real loss.
+
+        Note that both this pruning and compaction rewrite the front of the
+        request, which is what a prompt cache matches on, so every time either
+        fires the cache starts again from the system prompt. That makes
+        `compact_token_threshold` a cache setting as much as a context one —
+        see §10 of IMPROVEMENT_PLAN_2026-08.md for the measurement.
+        """
+        messages = self.messages
+        if pruning is not None and pruning.prune_tool_results:
+            from ..memory.compact import estimate_session_tokens
+            if estimate_session_tokens(self.messages) > pruning.compact_token_threshold // 2:
+                messages = _prune_tool_results(self.messages, pruning)
+        return [{"role": "system", "content": system_prompt}] + [
+            message.to_provider_message() for message in messages
+        ]
+
+    # ---- persistence -------------------------------------------------------
+
+    def save(self, path: Path) -> None:
+        from .atomic_io import atomic_write_text
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "version": self.version,
+            "session_id": self.session_id,
+            "created_at": self.created_at,
+            "model": self.model,
+            "system_prompt": self.system_prompt,
+            "usage": self.usage.to_dict(),
+            "messages": [m.to_dict() for m in self.messages],
+        }
+        # Atomic so a kill mid-save can't truncate the session file — with
+        # auto_save_session on, this runs after every turn, and a corrupt
+        # file makes the whole session unresumable.
+        atomic_write_text(path, json.dumps(data, indent=2) + "\n")
+
+    @classmethod
+    def load(cls, path: Path) -> Session:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        messages = [Message.from_dict(m) for m in data.get("messages", [])]
+        usage = Usage.from_dict(data.get("usage", {}))
+        return cls(
+            messages=messages,
+            usage=usage,
+            version=data.get("version", SESSION_VERSION),
+            created_at=data.get("created_at", 0.0),
+            model=data.get("model", ""),
+            # Sessions written before these fields existed carry neither key:
+            # mint an id so a resumed old session is correlatable from now on,
+            # and fall back to an empty prompt.
+            session_id=data.get("session_id") or _new_session_id(),
+            system_prompt=data.get("system_prompt") or "",
+        )
+
+    @staticmethod
+    def sessions_dir(workspace: Path) -> Path:
+        from ..config.settings import state_dir
+        return state_dir(workspace) / "sessions"
+
+    def save_to_workspace(self, workspace: Path, session_id: str) -> Path:
+        path = self.sessions_dir(workspace) / f"{session_id}.json"
+        self.save(path)
+        return path
+
+    @classmethod
+    def load_from_workspace(cls, workspace: Path, session_id: str) -> Session:
+        path = cls.sessions_dir(workspace) / f"{session_id}.json"
+        return cls.load(path)
+
+    @classmethod
+    def list_sessions(cls, workspace: Path) -> list[dict[str, Any]]:
+        sessions_dir = cls.sessions_dir(workspace)
+        if not sessions_dir.is_dir():
+            return []
+        entries = []
+        for f in sorted(sessions_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+                messages = data.get("messages", [])
+                title = ""
+                for m in messages:
+                    if isinstance(m, dict) and m.get("role") == "user":
+                        raw = (m.get("content") or "").strip()
+                        title = raw[:80] + ("…" if len(raw) > 80 else "")
+                        break
+                entries.append({
+                    "id": f.stem,
+                    "created_at": data.get("created_at", 0),
+                    "model": data.get("model", ""),
+                    "message_count": len(messages),
+                    "title": title,
+                })
+            except (json.JSONDecodeError, OSError) as exc:
+                _log.warning("Skipping corrupt session file %s: %s", f.name, exc)
+                continue
+        return entries
